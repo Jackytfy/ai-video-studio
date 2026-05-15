@@ -1,0 +1,16 @@
+FROM node:20-alpine
+
+# Install FFmpeg and Python for edge-tts
+RUN apk add --no-cache ffmpeg python3 py3-pip
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY . .
+
+# Generate Prisma client
+RUN npx prisma generate
+
+CMD ["npx", "tsx", "workers/index.ts"]

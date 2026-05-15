@@ -39,3 +39,17 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+/src/generated/prisma
+
+# build outputs
+build-output.txt
+build-stderr.txt
+build-stdout.txt
+
+# cookies and local db
+cookies.txt
+dev.db
+
+# Claude settings
+.claude/

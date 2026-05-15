@@ -1,0 +1,355 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+// ==================== USER & AUTH ====================
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  name         String?
+  avatarUrl    String?
+  passwordHash String?
+  role         UserRole  @default(USER)
+
+  aiProvider  String @default("claude")
+  aiModel     String @default("claude-sonnet-4-20250514")
+  aiBaseUrl   String?
+  aiApiKey    String?
+  ttsProvider String @default("edge-tts")
+  ttsVoice    String @default("zh-CN-YunxiNeural")
+
+  projects  Project[]
+  renderJobs RenderJob[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+// ==================== PROJECT ====================
+
+model Project {
+  id     String        @id @default(cuid())
+  name   String
+  userId String
+  user   User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  status       ProjectStatus @default(DRAFT)
+  sourceText   String
+  sourceType   SourceType    @default(TEXT)
+  audioUploadUrl String?
+
+  aspectRatio  AspectRatio  @default(W_16_9)
+  contentStyle ContentStyle @default(KNOWLEDGE)
+  colorTheme   String?
+
+  aiAnalysis     String?
+  productionPlan String?
+
+  storyboard  Storyboard?
+  messages    ChatMessage[]
+  materials   Material[]
+  renderJobs  RenderJob[]
+  exportJobs  ExportJob[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, status])
+  @@index([updatedAt])
+}
+
+enum ProjectStatus {
+  DRAFT
+  ANALYZING
+  STORYBOARD_GENERATING
+  STORYBOARD_READY
+  PRODUCING
+  EDITING
+  RENDERING
+  COMPLETED
+  FAILED
+}
+
+enum SourceType {
+  TEXT
+  VOICE_UPLOAD
+}
+
+enum AspectRatio {
+  W_16_9
+  W_9_16
+  W_1_1
+}
+
+enum ContentStyle {
+  KNOWLEDGE
+  CULTURE
+  CLASSIC_HISTORY
+  CUSTOM
+}
+
+// ==================== CHAT MESSAGES ====================
+
+model ChatMessage {
+  id        String      @id @default(cuid())
+  projectId String
+  project   Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  role        ChatRole
+  content     String
+  messageType MessageType @default(TEXT)
+  metadata    String?
+
+  createdAt DateTime @default(now())
+
+  @@index([projectId, createdAt])
+}
+
+enum ChatRole {
+  USER
+  ASSISTANT
+  SYSTEM
+}
+
+enum MessageType {
+  TEXT
+  ANALYSIS
+  PLAN_SELECTION
+  STORYBOARD_CARD
+  GENERATION_STATUS
+}
+
+// ==================== STORYBOARD ====================
+
+model Storyboard {
+  id        String  @id @default(cuid())
+  projectId String  @unique
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  title          String?
+  totalScenes    Int     @default(0)
+  totalDuration  Float?
+  totalWords     Int?
+
+  status StoryboardStatus @default(GENERATING)
+  scenes Scene[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum StoryboardStatus {
+  GENERATING
+  READY
+  EDITED
+  CONFIRMED
+}
+
+model Scene {
+  id           String     @id @default(cuid())
+  storyboardId String
+  storyboard   Storyboard @relation(fields: [storyboardId], references: [id], onDelete: Cascade)
+
+  sceneNumber   Int
+  title         String?
+  sceneType     SceneType @default(REAL_FOOTAGE)
+  voiceoverText String
+  visualDesc    String
+  materialQuery String
+  subtitleText  String?
+
+  wordCount          Int?
+  estimatedDuration  Float?
+
+  materialId String?
+  material   Material? @relation(fields: [materialId], references: [id], onDelete: SetNull)
+
+  audioUrl      String?
+  audioDuration Float?
+  thumbnailUrl  String?
+  renderedUrl   String?
+
+  transition TransitionType @default(CROSS_DISSOLVE)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([storyboardId, sceneNumber])
+}
+
+enum SceneType {
+  REAL_FOOTAGE
+  ANIMATION
+  AI_GENERATED
+  CUSTOM
+}
+
+enum TransitionType {
+  CUT
+  CROSS_DISSOLVE
+  FADE_BLACK
+  WIPE
+}
+
+// ==================== MATERIALS ====================
+
+model Material {
+  id        String   @id @default(cuid())
+  projectId String?
+  project   Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+
+  name   String
+  type   MaterialType
+  source MaterialSource
+
+  fileUrl      String
+  thumbnailUrl String?
+  previewUrl   String?
+
+  width    Int?
+  height   Int?
+  duration Float?
+  fileSize Int?
+  format   String?
+
+  externalId    String?
+  externalSource String?
+
+  aiPrompt  String?
+  aiProvider String?
+
+  license      String?
+  attribution  String?
+
+  searchQuery String?
+  matchScore  Float?
+
+  scenes Scene[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([projectId])
+  @@index([externalId])
+}
+
+enum MaterialType {
+  VIDEO
+  IMAGE
+  AUDIO
+  ANIMATION
+}
+
+enum MaterialSource {
+  STOCK_FOOTAGE
+  AI_GENERATED
+  USER_UPLOADED
+  TEMPLATE
+}
+
+// ==================== RENDER JOBS ====================
+
+model RenderJob {
+  id        String  @id @default(cuid())
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User    @relation(fields: [userId], references: [id])
+
+  status   RenderStatus @default(QUEUED)
+  priority Int          @default(0)
+
+  currentStage  String?
+  progress      Float  @default(0)
+  stageProgress String?
+
+  config String
+
+  outputUrl      String?
+  outputFormat   String?
+  outputSize     Int?
+  outputDuration Float?
+
+  errorMessage String?
+  errorStage   String?
+  retryCount   Int       @default(0)
+  maxRetries   Int       @default(3)
+
+  startedAt         DateTime?
+  completedAt       DateTime?
+  estimatedDuration Float?
+  elapsedSeconds    Float?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, status])
+  @@index([projectId])
+  @@index([status, priority, createdAt])
+}
+
+enum RenderStatus {
+  QUEUED
+  PREPARING
+  TTS_GENERATING
+  MATERIALS_LOADING
+  COMPOSITING
+  SUBTITLING
+  POST_PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum RenderStage {
+  TTS
+  MATERIALS
+  COMPOSE
+  SUBTITLES
+  AUDIO_MIX
+  ENCODE
+  THUMBNAILS
+}
+
+// ==================== EXPORT JOBS ====================
+
+model ExportJob {
+  id        String  @id @default(cuid())
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  format ExportFormat @default(MP4_1080P)
+  status ExportStatus @default(PENDING)
+
+  outputUrl String?
+  fileSize  Int?
+
+  createdAt   DateTime @default(now())
+  completedAt DateTime?
+}
+
+enum ExportFormat {
+  MP4_1080P
+  MP4_720P
+  MP4_4K
+  MOV_PRORES
+  GIF
+}
+
+enum ExportStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
