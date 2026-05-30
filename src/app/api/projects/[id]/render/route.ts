@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { requireSession, unauthorized } from "@/lib/auth/session";
-import { createRenderJob } from "@/lib/render/pipeline";
+import { renderProjectInline } from "@/lib/render/pipeline";
 
 export async function POST(
   _req: Request,
@@ -28,18 +28,18 @@ export async function POST(
       );
     }
 
-    const renderJob = await createRenderJob(id, session.user.id);
+    // Inline render - no Redis needed
+    const result = await renderProjectInline(id, session.user.id);
 
-    await prisma.project.update({
-      where: { id },
-      data: { status: "RENDERING" },
+    return NextResponse.json({
+      success: true,
+      outputUrl: result.outputUrl,
+      duration: result.duration,
     });
-
-    return NextResponse.json(renderJob);
   } catch (error) {
     console.error("Render error:", error);
     return NextResponse.json(
-      { error: "创建渲染任务失败" },
+      { error: "渲染失败: " + (error instanceof Error ? error.message : "未知错误") },
       { status: 500 }
     );
   }

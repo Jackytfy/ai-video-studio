@@ -29,12 +29,10 @@ export function StoryboardTimeline({ scenes, onEditScene }: StoryboardTimelinePr
   }
 
   return (
-    <div className="overflow-x-auto pb-4">
-      <div className="flex gap-4 min-w-min">
-        {scenes.map((scene) => (
-          <SceneCard key={scene.id} scene={scene} onEdit={onEditScene} />
-        ))}
-      </div>
+    <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
+      {scenes.map((scene) => (
+        <SceneCard key={scene.id} scene={scene} onEdit={onEditScene} />
+      ))}
     </div>
   );
 }

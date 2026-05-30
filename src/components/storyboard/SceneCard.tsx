@@ -23,7 +23,7 @@ export function SceneCard({ scene, onEdit }: SceneCardProps) {
   const isAnimation = scene.sceneType === "ANIMATION";
 
   return (
-    <div className="bg-card border border-border rounded-xl p-4 min-w-[280px] max-w-[320px] flex-shrink-0 hover:border-purple/30 transition-all group">
+    <div className="bg-card border border-border rounded-xl p-4 hover:border-purple/30 transition-all group">
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-2">
           <span className="bg-purple/10 text-purple text-xs font-medium px-2 py-0.5 rounded-full">

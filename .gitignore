@@ -53,3 +53,15 @@ dev.db
 
 # Claude settings
 .claude/
+
+# logs
+*.log
+*.pid
+
+# temp scripts
+*.bat
+*.cmd
+*.ps1
+
+# uploads
+/uploads

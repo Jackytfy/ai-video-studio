@@ -11,10 +11,18 @@ export interface SceneInput {
   transition?: string;
 }
 
+export interface MusicInput {
+  filePath: string;
+  volume: number;
+  fadeIn: number;
+  fadeOut: number;
+  totalDuration: number;
+}
+
 export async function compositeVideo(
   scenes: SceneInput[],
   outputPath: string,
-  options: { width: number; height: number; fps?: number }
+  options: { width: number; height: number; fps?: number; music?: MusicInput }
 ): Promise<void> {
   const fps = options.fps || 30;
 
@@ -49,9 +57,31 @@ export async function compositeVideo(
     })
     .join("");
 
+  // Concat all scenes
   filterParts.push(
     `${concatInputs}concat=n=${scenes.length}:v=1:a=1[outv][outa]`
   );
+
+  let finalAudioMap = "[outa]";
+
+  // Add background music mixing if provided
+  if (options.music) {
+    inputArgs.push("-i", options.music.filePath);
+    const musicInputIdx = scenes.length * 2;
+
+    const musicFilters = [
+      `[${musicInputIdx}:a]volume=${options.music.volume}`,
+      `afade=t=in:st=0:d=${options.music.fadeIn}`,
+      `afade=t=out:st=${options.music.totalDuration - options.music.fadeOut}:d=${options.music.fadeOut}`,
+      `[bgm]`,
+    ].join(",");
+
+    filterParts.push(musicFilters);
+    filterParts.push(
+      `[outa][bgm]amix=inputs=2:duration=first:dropout_transition=2[finala]`
+    );
+    finalAudioMap = "[finala]";
+  }
 
   const filterComplex = filterParts.join(";");
 
@@ -63,7 +93,7 @@ export async function compositeVideo(
     "-map",
     "[outv]",
     "-map",
-    "[outa]",
+    finalAudioMap,
     "-c:v",
     "libx264",
     "-preset",

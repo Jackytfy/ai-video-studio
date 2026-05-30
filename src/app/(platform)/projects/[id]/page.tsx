@@ -1,9 +1,11 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
-import { useParams } from "next/navigation";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
-import { MessageSquare, Layers, Film, ArrowRight, Loader2, CheckCircle, AlertCircle } from "lucide-react";
+import { MessageSquare, Layers, Film, ArrowRight, Loader2, CheckCircle, AlertCircle, Play, RefreshCw } from "lucide-react";
+
+const POLLING_STATUSES = ["RENDERING"];
 
 const statusMap: Record<string, { label: string; color: string }> = {
   DRAFT: { label: "草稿", color: "text-muted-foreground" },
@@ -19,7 +21,23 @@ const statusMap: Record<string, { label: string; color: string }> = {
 
 export default function ProjectDetailPage() {
   const params = useParams();
+  const router = useRouter();
+  const queryClient = useQueryClient();
   const projectId = params.id as string;
+
+  const renderMutation = useMutation({
+    mutationFn: async () => {
+      const res = await fetch(`/api/projects/${projectId}/render`, { method: "POST" });
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.error || "渲染失败");
+      }
+      return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["project", projectId] });
+    },
+  });
 
   const { data: project, isLoading } = useQuery({
     queryKey: ["project", projectId],
@@ -27,6 +45,13 @@ export default function ProjectDetailPage() {
       const res = await fetch(`/api/projects/${projectId}`);
       if (!res.ok) throw new Error("获取项目失败");
       return res.json();
+    },
+    refetchInterval: (query) => {
+      const state = query.state.data as { status?: string } | undefined;
+      if (!state || !POLLING_STATUSES.includes(state.status ?? "")) return false;
+      const elapsed = Date.now() - (query.state.dataUpdatedAt || Date.now());
+      if (elapsed > 120_000) return false;
+      return 5000;
     },
   });
 
@@ -71,6 +96,28 @@ export default function ProjectDetailPage() {
           {project.sourceText}
         </p>
       </div>
+
+      {/* Video Player */}
+      {project.status === "COMPLETED" && project.renderJobs?.[0]?.outputUrl && (
+        <div className="bg-card border border-border rounded-xl overflow-hidden">
+          <div className="px-6 py-3 border-b border-border">
+            <h2 className="font-semibold">生成的视频</h2>
+          </div>
+          <div className="p-4">
+            <video
+              src={project.renderJobs[0].outputUrl}
+              controls
+              className="w-full rounded-lg bg-black"
+            />
+            {project.renderJobs[0].outputDuration && (
+              <p className="text-xs text-muted-foreground mt-2">
+                时长: {Math.round(project.renderJobs[0].outputDuration)}秒 ·
+                大小: {project.renderJobs[0].outputSize ? `${(project.renderJobs[0].outputSize / 1024 / 1024).toFixed(1)}MB` : "未知"}
+              </p>
+            )}
+          </div>
+        </div>
+      )}
 
       {project.aiAnalysis && (() => {
         const analysis = typeof project.aiAnalysis === "string"
@@ -164,24 +211,31 @@ export default function ProjectDetailPage() {
             </div>
           </div>
         ) : project.status === "COMPLETED" ? (
-          <Link
-            href={`/projects/${projectId}/chat`}
-            className="bg-card border border-green-400/30 rounded-xl p-5 hover:border-green-400/50 transition-all flex items-center gap-3"
-          >
+          <div className="bg-card border border-green-400/30 rounded-xl p-5 flex items-center gap-3">
             <CheckCircle className="w-5 h-5 text-green-400" />
             <div>
               <p className="font-medium text-sm">渲染完成</p>
-              <p className="text-xs text-muted-foreground">查看视频</p>
-            </div>
-          </Link>
-        ) : project.status === "FAILED" ? (
-          <div className="bg-card border border-destructive/30 rounded-xl p-5 flex items-center gap-3">
-            <AlertCircle className="w-5 h-5 text-destructive" />
-            <div>
-              <p className="font-medium text-sm">渲染失败</p>
-              <p className="text-xs text-muted-foreground">请重试</p>
+              <p className="text-xs text-muted-foreground">查看下方视频</p>
             </div>
           </div>
+        ) : project.status === "FAILED" ? (
+          <button
+            onClick={() => renderMutation.mutate()}
+            disabled={renderMutation.isPending}
+            className="bg-card border border-destructive/30 rounded-xl p-5 hover:border-purple/30 transition-all flex items-center gap-3"
+          >
+            {renderMutation.isPending ? (
+              <Loader2 className="w-5 h-5 text-purple animate-spin" />
+            ) : (
+              <RefreshCw className="w-5 h-5 text-destructive" />
+            )}
+            <div>
+              <p className="font-medium text-sm">
+                {renderMutation.isPending ? "重新渲染中..." : "重新渲染"}
+              </p>
+              <p className="text-xs text-muted-foreground">点击重试</p>
+            </div>
+          </button>
         ) : (
           <div className="bg-card border border-border rounded-xl p-5 flex items-center gap-3 opacity-50">
             <Film className="w-5 h-5 text-muted-foreground" />

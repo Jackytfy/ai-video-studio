@@ -2,11 +2,12 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Film, LayoutDashboard, Plus, Settings } from "lucide-react";
+import { Film, LayoutDashboard, Plus, Settings, Shield, Scissors } from "lucide-react";
 
 const navItems = [
   { href: "/dashboard", label: "项目列表", icon: LayoutDashboard },
   { href: "/", label: "新建项目", icon: Plus, isCreate: true },
+  { href: "/projects", label: "视频编辑", icon: Scissors, isDynamic: true },
 ];
 
 export function Sidebar() {
@@ -44,7 +45,18 @@ export function Sidebar() {
         })}
       </nav>
 
-      <div className="p-3 border-t border-border">
+      <div className="p-3 border-t border-border space-y-1">
+        <Link
+          href="/admin"
+          className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
+            pathname === "/admin"
+              ? "bg-purple/10 text-purple"
+              : "text-muted-foreground hover:text-foreground hover:bg-secondary"
+          }`}
+        >
+          <Shield className="w-4 h-4" />
+          后台管理
+        </Link>
         <Link
           href="/settings"
           className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${

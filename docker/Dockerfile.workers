@@ -1,7 +1,7 @@
 FROM node:20-alpine
 
-# Install FFmpeg and Python for edge-tts
-RUN apk add --no-cache ffmpeg python3 py3-pip
+# Install FFmpeg, Python for edge-tts, and Chromium for Puppeteer
+RUN apk add --no-cache ffmpeg python3 py3-pip chromium
 
 WORKDIR /app
 
@@ -12,5 +12,8 @@ COPY . .
 
 # Generate Prisma client
 RUN npx prisma generate
+
+ENV PUPPETEER_SKIP_DOWNLOAD=true \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
 
 CMD ["npx", "tsx", "workers/index.ts"]

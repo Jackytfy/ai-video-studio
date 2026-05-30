@@ -82,6 +82,39 @@ export async function* chatStream(
   yield* ai.chatStream(messages, systemPrompt, options);
 }
 
+export interface GenerateAIOptions {
+  provider?: string;
+  model?: string;
+  baseUrl?: string;
+  apiKey?: string;
+  messages: Array<{ role: "user" | "assistant"; content: string }>;
+  maxTokens?: number;
+}
+
+export async function generateAI(options: GenerateAIOptions): Promise<string> {
+  const config: ProviderConfig = {
+    provider: options.provider || "claude",
+    model: options.model,
+    baseUrl: options.baseUrl,
+    apiKey: options.apiKey,
+  };
+
+  const ai = getAIProvider(config);
+  let result = "";
+
+  // Use chatStream and collect the full response
+  const stream = ai.chatStream(
+    options.messages,
+    "你是一个专业的AI助手，请直接回答问题，只返回要求的内容。"
+  );
+
+  for await (const chunk of stream) {
+    result += chunk;
+  }
+
+  return result;
+}
+
 export function buildProviderConfig(user: {
   aiProvider?: string;
   aiModel?: string;

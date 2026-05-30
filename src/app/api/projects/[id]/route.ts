@@ -27,6 +27,11 @@ export async function GET(
         storyboard: {
           include: { scenes: { orderBy: { sceneNumber: "asc" } } },
         },
+        renderJobs: {
+          orderBy: { createdAt: "desc" },
+          take: 1,
+          select: { id: true, status: true, outputUrl: true, outputDuration: true, outputSize: true },
+        },
         _count: { select: { messages: true, materials: true, renderJobs: true } },
       },
     });

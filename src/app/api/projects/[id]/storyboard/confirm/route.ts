@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { requireSession, unauthorized } from "@/lib/auth/session";
 import { searchVideos } from "@/lib/materials/pexels";
-import { createRenderJob } from "@/lib/render/pipeline";
+import { renderProjectInline } from "@/lib/render/pipeline";
 
 export async function POST(
   _req: Request,
@@ -41,8 +41,13 @@ export async function POST(
     });
 
     // Auto-search and assign materials for each scene
+    const pexelsApiKey = process.env.PEXELS_API_KEY;
+    if (!pexelsApiKey) {
+      console.warn("PEXELS_API_KEY not configured — skipping material search, scenes will use placeholders");
+    }
     for (const scene of storyboard.scenes) {
       if (!scene.materialQuery || scene.materialId) continue;
+      if (!pexelsApiKey) continue;
 
       try {
         const videos = await searchVideos(scene.materialQuery, 3);
@@ -79,13 +84,11 @@ export async function POST(
       }
     }
 
-    // Auto-trigger render pipeline
+    // Auto-trigger render pipeline (inline, no Redis needed)
     let renderStarted = false;
     try {
-      await createRenderJob(id, session.user.id);
-      await prisma.project.update({
-        where: { id },
-        data: { status: "RENDERING" },
+      renderProjectInline(id, session.user.id).catch(err => {
+        console.error("Inline render failed:", err);
       });
       renderStarted = true;
     } catch (renderErr) {

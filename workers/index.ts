@@ -6,6 +6,7 @@ import { PrismaBetterSqlite3 } from "@prisma/adapter-better-sqlite3";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import { readFile, writeFile, unlink, mkdir, rm } from "fs/promises";
+import { fallbackMaterial } from "./fallback";
 import { tmpdir } from "os";
 import { join } from "path";
 import { randomUUID } from "crypto";
@@ -50,9 +51,17 @@ interface SceneData {
   sceneNumber: number;
   voiceoverText: string;
   visualDesc: string;
+  materialQuery: string | null;
   audioUrl: string | null;
   materialId: string | null;
   transition: string;
+}
+
+interface MusicData {
+  fileUrl: string;
+  volume: number;
+  fadeIn: number;
+  fadeOut: number;
 }
 
 interface RenderJobData {
@@ -61,6 +70,7 @@ interface RenderJobData {
   userId: string;
   config: { width: number; height: number; fps: number; format: string };
   scenes: SceneData[];
+  music?: MusicData;
 }
 
 // --- MiMo TTS helper ---
@@ -139,7 +149,7 @@ async function processTTS(job: Job<RenderJobData>) {
 
 // --- Stage: Materials ---
 async function processMaterials(job: Job<RenderJobData>) {
-  const { scenes, jobId, projectId } = job.data;
+  const { scenes, jobId, projectId, config } = job.data;
   await prisma.renderJob.update({ where: { id: jobId }, data: { status: "MATERIALS_LOADING", currentStage: "materials" } });
 
   const workDir = join(tmpdir(), `render-${projectId}`);
@@ -149,26 +159,48 @@ async function processMaterials(job: Job<RenderJobData>) {
     const scene = scenes[i];
     await job.updateProgress({ stage: "MATERIALS_LOADING", progress: ((i + 1) / scenes.length) * 100 });
 
-    if (!scene.materialId) continue;
+    const materialFile = join(workDir, `scene-${i}.mp4`);
 
-    const material = await prisma.material.findUnique({ where: { id: scene.materialId } });
-    if (!material) continue;
+    // Priority 1: Download from Pexels material
+    if (scene.materialId) {
+      const material = await prisma.material.findUnique({ where: { id: scene.materialId } });
+      if (material) {
+        const ext = material.type === "VIDEO" ? "mp4" : "jpg";
+        const localPath = join(workDir, `scene-${i}.${ext}`);
+        try {
+          const res = await fetch(material.fileUrl);
+          if (res.ok) {
+            await writeFile(localPath, Buffer.from(await res.arrayBuffer()));
+            if (ext === "jpg" && materialFile !== localPath) {
+              // Convert still image to video clip
+              await execFileAsync("ffmpeg", [
+                "-y", "-loop", "1", "-i", localPath,
+                "-c:v", "libx264", "-t", "5", "-pix_fmt", "yuv420p",
+                "-vf", `scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,zoompan=z='if(eq(on,1),1.0,min(zoom+0.003,1.15))':d=${config.fps * 5}:fps=${config.fps}`,
+                "-an", materialFile,
+              ], { timeout: 30000 }).catch(() => { });
+              await unlink(localPath).catch(() => { });
+            }
+            continue;
+          }
+        } catch { }
+      }
+    }
 
-    const ext = material.type === "VIDEO" ? "mp4" : "jpg";
-    const localPath = join(workDir, `scene-${i}.${ext}`);
+    // Priority 2: Puppeteer web search fallback
+    const searchQuery = scene.visualDesc || scene.materialQuery || `scene ${scene.sceneNumber}`;
     try {
-      const res = await fetch(material.fileUrl);
-      if (!res.ok) continue;
-      await writeFile(localPath, Buffer.from(await res.arrayBuffer()));
-    } catch {
-      continue;
+      await fallbackMaterial(searchQuery, materialFile, config);
+    } catch (err) {
+      console.error(`Fallback material failed for scene ${scene.sceneNumber}:`, err);
+      // Priority 3: compose stage will generate black placeholder
     }
   }
 }
 
 // --- Stage: Compose ---
 async function processCompose(job: Job<RenderJobData>) {
-  const { scenes, config, jobId, projectId } = job.data;
+  const { scenes, config, jobId, projectId, music } = job.data;
   await prisma.renderJob.update({ where: { id: jobId }, data: { status: "COMPOSITING", currentStage: "compose" } });
 
   const workDir = join(tmpdir(), `render-${projectId}`);
@@ -232,10 +264,42 @@ async function processCompose(job: Job<RenderJobData>) {
     `${concatInputs.join("")}concat=n=${concatInputs.length}:v=1:a=1[outv][outa]`
   );
 
+  let finalAudioMap = "[outa]";
+
+  // Add background music if provided
+  if (music && music.fileUrl) {
+    const musicFile = join(workDir, "bgm.mp3");
+    try {
+      const res = await fetch(music.fileUrl);
+      if (res.ok) {
+        await writeFile(musicFile, Buffer.from(await res.arrayBuffer()));
+
+        // Calculate total duration
+        let totalDuration = 0;
+        for (const scene of scenes) {
+          totalDuration += scene.voiceoverText.length / 4;
+        }
+
+        inputArgs.push("-i", musicFile);
+        const musicIdx = scenes.length * 2;
+
+        filterParts.push(
+          `[${musicIdx}:a]volume=${music.volume},afade=t=in:st=0:d=${music.fadeIn},afade=t=out:st=${totalDuration - music.fadeOut}:d=${music.fadeOut}[bgm]`
+        );
+        filterParts.push(
+          `[outa][bgm]amix=inputs=2:duration=first:dropout_transition=2[finala]`
+        );
+        finalAudioMap = "[finala]";
+      }
+    } catch (err) {
+      console.error("Failed to download music:", err);
+    }
+  }
+
   await execFileAsync("ffmpeg", [
     "-y", ...inputArgs,
     "-filter_complex", filterParts.join(";"),
-    "-map", "[outv]", "-map", "[outa]",
+    "-map", "[outv]", "-map", finalAudioMap,
     "-c:v", "libx264", "-preset", "medium", "-crf", "23",
     "-c:a", "aac", "-b:a", "192k",
     "-r", String(config.fps),

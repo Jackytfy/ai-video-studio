@@ -59,6 +59,8 @@ model Project {
   storyboard  Storyboard?
   messages    ChatMessage[]
   materials   Material[]
+  segments    VideoSegment[]
+  musicTracks MusicTrack[]
   renderJobs  RenderJob[]
   exportJobs  ExportJob[]
 
@@ -352,4 +354,59 @@ enum ExportStatus {
   PROCESSING
   COMPLETED
   FAILED
+}
+
+// ==================== VIDEO SEGMENTS ====================
+
+model VideoSegment {
+  id        String  @id @default(cuid())
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  name      String
+  fileUrl   String
+  thumbnailUrl String?
+
+  duration  Float
+  width     Int?
+  height    Int?
+  fileSize  Int?
+  format    String? @default("mp4")
+
+  trimStart Float?
+  trimEnd   Float?
+
+  sortOrder Int @default(0)
+  sceneId   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([projectId, sortOrder])
+}
+
+// ==================== MUSIC TRACKS ====================
+
+model MusicTrack {
+  id        String  @id @default(cuid())
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  name      String
+  fileUrl   String
+  duration  Float
+  volume    Float   @default(0.3)
+
+  mood      String?
+  genre     String?
+  bpm       Int?
+
+  isBgm     Boolean @default(true)
+  fadeIn    Float   @default(1.0)
+  fadeOut   Float   @default(2.0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([projectId])
 }
