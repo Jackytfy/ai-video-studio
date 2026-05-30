@@ -2,7 +2,7 @@ import "dotenv/config";
 import { Worker, Job } from "bullmq";
 import IORedis from "ioredis";
 import { PrismaClient } from "../src/generated/prisma/client";
-import { PrismaBetterSqlite3 } from "@prisma/adapter-better-sqlite3";
+import { PrismaLibSql } from "@prisma/adapter-libsql";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import { readFile, writeFile, unlink, mkdir, rm } from "fs/promises";
@@ -42,7 +42,7 @@ async function uploadToS3(buffer: Buffer, contentType: string, folder: string): 
 }
 
 // --- Prisma ---
-const adapter = new PrismaBetterSqlite3({
+const adapter = new PrismaLibSql({
   url: process.env.DATABASE_URL || "file:./dev.db",
 });
 const prisma = new PrismaClient({ adapter });

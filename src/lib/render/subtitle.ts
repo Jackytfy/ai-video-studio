@@ -2,7 +2,7 @@
  * Subtitle generation utilities for FFmpeg drawtext.
  *
  * Key improvements:
- * 1. Auto-fontsize based on video height (h/18 ~ h/22)
+ * 1. Auto-fontsize based on video height (h/20)
  * 2. Smart line-breaking with max-chars calculated from video width
  * 3. Punctuation-aware sentence splitting
  * 4. Audio-duration-based timing (instead of fixed chars-per-second guess)
@@ -30,7 +30,6 @@ export interface SubtitleChunk {
 
 /**
  * Calculate maximum characters per line based on video width and font size.
- *
  * CJK characters are roughly square (width ≈ fontsize).
  * We reserve 7.5% horizontal margin on each side (15% total).
  */
@@ -41,49 +40,60 @@ export function calcMaxCharsPerLine(videoWidth: number, fontSize: number): numbe
 
 /**
  * Calculate adaptive font size based on video height.
- * Taller videos (9:16) get slightly larger fonts relative to height.
  */
 export function calcFontSize(videoHeight: number, ratio = 1 / 20): number {
-  return Math.round(videoHeight * ratio);
+  return Math.max(24, Math.round(videoHeight * ratio));
+}
+
+/**
+ * Count speakable characters (excludes punctuation, spaces, etc.)
+ * Used for timing calculations since only spoken characters take time.
+ */
+function speakableChars(text: string): number {
+  return text.replace(/[，。！？、；：,;!?\s\n"'「」『』【】（）\(\)\[\]]/g, "").length;
 }
 
 /**
  * Smart sentence splitting: break by punctuation first, then by max line length.
- * Punctuation marks are treated as "soft breaks" that we try to respect.
+ * Does NOT modify text content - pure splitting only.
  */
 function smartSplit(text: string, maxChars: number): string[] {
   const lines: string[] = [];
+  const trimmed = text.trim();
 
-  // Remove problematic chars for FFmpeg drawtext
-  const cleaned = text
-    .replace(/'/g, "")     // single quotes break drawtext
-    .replace(/:/g, " ")    // colons confuse filter syntax
-    .replace(/\n/g, " ")   // newlines to spaces
-    .replace(/"/g, '\\"')  // escape double quotes for drawtext
-    .trim();
-
-  if (cleaned.length === 0) return lines;
+  if (trimmed.length === 0) return lines;
 
   // Split by Chinese/English punctuation to get natural sentences
-  const sentences = cleaned.split(/(?<=[。！？，；：、,;!?])/);
+  // Use positive lookbehind to keep punctuation attached
+  const sentences = trimmed.split(/(?<=[。！？；,;!?])|(?<=，[^，]{10,})/).filter(s => s.length > 0);
 
   let currentLine = "";
+
   for (const sentence of sentences) {
-    // Check if adding this sentence exceeds the line limit
+    // If adding this sentence fits within maxChars
     if (currentLine.length + sentence.length <= maxChars) {
       currentLine += sentence;
     } else {
-      // Flush current line if not empty
+      // Flush current line
       if (currentLine.length > 0) {
         lines.push(currentLine);
+        currentLine = "";
       }
 
-      // If the sentence itself is longer than maxChars, split it by maxChars
+      // Handle sentence that's longer than maxChars
       if (sentence.length <= maxChars) {
         currentLine = sentence;
       } else {
+        // Split long sentence by maxChars chunks
         for (let i = 0; i < sentence.length; i += maxChars) {
           const chunk = sentence.substring(i, i + maxChars);
+          // If this chunk would leave a tiny remainder, don't split
+          const remaining = sentence.length - (i + maxChars);
+          if (remaining > 0 && remaining < maxChars * 0.3) {
+            // Merge tiny tail with this chunk
+            lines.push(sentence.substring(i));
+            break;
+          }
           if (i + maxChars >= sentence.length) {
             currentLine = chunk;
           } else {
@@ -103,12 +113,19 @@ function smartSplit(text: string, maxChars: number): string[] {
 }
 
 /**
- * Generate subtitle chunks with timing based on text proportion and audio duration.
- *
- * Timing strategy:
- * - If audioDuration is provided, use actual duration for precise sync
- * - Otherwise, estimate from text length (Chinese: ~4 chars/sec, English: ~12 chars/sec)
- * - Each chunk gets time proportional to its character count
+ * Escape text for use in FFmpeg drawtext filter.
+ * Only modifies for FFmpeg compatibility - doesn't change visible content.
+ */
+function escapeDrawtext(text: string): string {
+  return text
+    .replace(/\\/g, "\\\\")   // backslash first
+    .replace(/'/g, "'\\''")   // single quote: close string, escaped quote, reopen
+    .replace(/:/g, "\\:")     // colon escape
+    .replace(/%/g, "\\%");    // percent escape (FFmpeg expansion)
+}
+
+/**
+ * Generate subtitle chunks with timing based on audio/character proportion.
  */
 export function generateSubtitleChunks(
   text: string,
@@ -121,37 +138,50 @@ export function generateSubtitleChunks(
 
   if (lines.length === 0) return [];
 
+  // Total speakable characters for timing proportion
+  const totalSpeakable = speakableChars(text);
+  if (totalSpeakable === 0) return [];
+
   // Determine total duration
-  const textClean = text.replace(/[，。！？、,;!?\s\n]/g, "");
   let totalDuration: number;
   if (config.audioDuration && config.audioDuration > 0) {
     totalDuration = config.audioDuration;
   } else {
-    // Fallback: Chinese ~4 chars/sec, English ~12 chars/sec
-    const hasChinese = /[\u4e00-\u9fff]/.test(text);
-    const rate = hasChinese ? 4 : 12;
-    totalDuration = Math.max(1, textClean.length / rate);
+    const rate = /[\u4e00-\u9fff]/.test(text) ? 4 : 12;
+    totalDuration = Math.max(1, totalSpeakable / rate);
   }
 
-  // Distribute time proportional to line length
+  // Distribute time proportional to each line's speakable character count
   const chunks: SubtitleChunk[] = [];
   let timeCursor = 0;
 
   for (let i = 0; i < lines.length; i++) {
-    const lineLength = lines[i].length;
-    // Slight overlap: each chunk gets 2% bonus to avoid flash gap
-    const chunkDuration = (lineLength / textClean.length) * totalDuration * 1.02;
+    const lineSpeakable = speakableChars(lines[i]);
+    // Proportion: this line's speakable chars / total speakable chars
+    const proportion = lineSpeakable / totalSpeakable;
+    // Add 5% padding to prevent flash gaps, but cap at 0.5s
+    const chunkDuration = Math.min(proportion * totalDuration * 1.05, proportion * totalDuration + 0.5);
 
     const startTime = timeCursor;
-    const endTime = Math.min(timeCursor + chunkDuration, totalDuration);
+    let endTime = timeCursor + chunkDuration;
 
-    // Last chunk should always end at totalDuration
-    const adjustedEnd = i === lines.length - 1 ? totalDuration : endTime;
+    // Last chunk always ends at totalDuration
+    if (i === lines.length - 1) {
+      endTime = totalDuration;
+    }
+
+    // Ensure minimum display time of 0.5s per chunk
+    if (endTime - startTime < 0.5 && lines.length > 1) {
+      endTime = startTime + 0.5;
+    }
+
+    // Clamp to total duration
+    endTime = Math.min(endTime, totalDuration);
 
     chunks.push({
       text: lines[i],
-      startTime: Math.round(startTime * 1000) / 1000,
-      endTime: Math.round(adjustedEnd * 1000) / 1000,
+      startTime: Math.round(startTime * 100) / 100,
+      endTime: Math.round(endTime * 100) / 100,
     });
 
     timeCursor = endTime;
@@ -162,14 +192,6 @@ export function generateSubtitleChunks(
 
 /**
  * Build FFmpeg filter_complex drawtext chain for subtitle chunks.
- *
- * Returns an array of filter parts to be joined with ';' in the filter_complex.
- * Uses `enable=between(t,start,end)` for timed display.
- *
- * @param videoInputLabel - The input video label (e.g. "v0" or "[v0s1]")
- * @param chunks - Generated subtitle chunks
- * @param config - Subtitle configuration
- * @returns Array of filter parts and the final output label
  */
 export function buildSubtitleFilterChain(
   videoInputLabel: string,
@@ -185,11 +207,6 @@ export function buildSubtitleFilterChain(
   }
 
   const filterParts: string[] = [];
-
-  // Build drawtext with subtitle positioning
-  // x position: center horizontally
-  // y position: bottom - margin - text_height (so text doesn't overflow bottom)
-  // box: semi-transparent background for readability
   const yPos = `h-text_h-${bottomMargin + fontSize / 2}`;
   const drawtextBase = [
     `fontfile='${fontPath}'`,
@@ -214,13 +231,14 @@ export function buildSubtitleFilterChain(
     const isLast = i === chunks.length - 1;
     const outLabel = isLast ? `${videoInputLabel}_sub` : `${videoInputLabel}_s${i}`;
 
-    // Escape text for FFmpeg drawtext
-    const escapedText = chunk.text
-      .replace(/\\/g, "\\\\")
-      .replace(/:/g, "\\:");
+    // Remove characters that FFmpeg drawtext can't handle
+    const cleanText = chunk.text
+      .replace(/\n/g, " ")   // newlines to spaces
+      .replace(/\r/g, "");   // remove carriage returns
 
-    // Build filter: [input]drawtext=params:text='...':enable='...' [output]
-    // params are separated by : internally; text/enable are also : separated
+    // Escape for FFmpeg drawtext (must happen AFTER cleaning)
+    const escapedText = escapeDrawtext(cleanText);
+
     const filter = `[${prevLabel}]drawtext=${drawtextBase}:text='${escapedText}':enable='between(t\\,${chunk.startTime}\\,${chunk.endTime})' [${outLabel}]`;
 
     filterParts.push(filter);
@@ -233,11 +251,6 @@ export function buildSubtitleFilterChain(
   };
 }
 
-/**
- * Get the default font path for the current platform.
- * Windows: Microsoft YaHei (微软雅黑)
- * Linux: Noto Sans CJK
- */
 export function getDefaultFontPath(): string {
   if (process.platform === "win32") {
     return "C\\:/Windows/Fonts/msyh.ttc";
@@ -245,30 +258,18 @@ export function getDefaultFontPath(): string {
   return "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc";
 }
 
-/**
- * Estimate audio duration from text length.
- * Chinese: ~4 chars/sec (natural reading speed for subtitles)
- * English: ~12 chars/sec
- * Mixed: weighted average
- */
 export function estimateAudioDuration(text: string): number {
   const chineseCount = (text.match(/[\u4e00-\u9fff]/g) || []).length;
   const otherCount = text.length - chineseCount;
 
   if (text.length === 0) return 1;
 
-  // Chinese speech rate: ~4 chars/sec (slower for readability)
-  // English speech rate: ~12 chars/sec
   const chineseSecs = chineseCount / 4;
   const otherSecs = otherCount / 12;
 
   return Math.max(1, chineseSecs + otherSecs);
 }
 
-/**
- * Get actual audio duration using ffprobe.
- * Falls back to text-based estimation on failure.
- */
 export async function getAudioDuration(filePath: string): Promise<number> {
   try {
     const { execFile } = await import("child_process");
