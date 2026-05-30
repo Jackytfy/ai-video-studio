@@ -28,7 +28,7 @@ export function ProjectGrid({ projects, onDeleteProject }: ProjectGridProps) {
       <div className="text-center py-16">
         <p className="text-muted-foreground mb-4">还没有任何项目</p>
         <a
-          href="/"
+          href="/create"
           className="inline-flex items-center gap-2 bg-purple hover:bg-purple-light text-white px-6 py-2.5 rounded-lg font-medium transition-colors"
         >
           创建第一个项目

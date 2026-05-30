@@ -16,7 +16,7 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-const PROJECT_ID = "cmprr3blf0000ysulze3nrwjd";
+const PROJECT_ID = "cmpsyvo0x000364ul6zx2xpsx";
 const USER_ID = "cmp3v2aqa0000k8ulak8r79d5";
 
 export async function POST() {
@@ -31,11 +31,38 @@ export async function POST() {
       },
     });
 
-    if (!project || !project.storyboard) {
+    if (!project) {
       return NextResponse.json({ error: "Project not found" }, { status: 404 });
     }
 
-    const scenes = project.storyboard.scenes;
+    // Auto-create storyboard & scenes if missing
+    let storyboard = project.storyboard;
+    if (!storyboard || storyboard.scenes.length === 0) {
+      const texts = [
+        "人工智能正在改变我们的世界，从手机助手到自动驾驶。",
+        "深度学习让计算机能够从海量数据中学习规律。",
+        "未来，AI将成为每个人的智能助手和创新工具。",
+      ];
+      storyboard = await prisma.storyboard.create({
+        data: {
+          projectId: PROJECT_ID,
+          status: "CONFIRMED",
+          totalScenes: 3,
+          totalDuration: 15,
+          scenes: {
+            create: texts.map((t, i) => ({
+              sceneNumber: i + 1,
+              voiceoverText: t,
+              visualDesc: "科技场景",
+              duration: 5,
+            })),
+          },
+        },
+        include: { scenes: { orderBy: { sceneNumber: "asc" } } },
+      });
+    }
+
+    const scenes = storyboard.scenes;
     const config = { width: 1920, height: 1080, fps: 30, format: "mp4" };
     const workDir = join(tmpdir(), `render-${PROJECT_ID}`);
     await mkdir(workDir, { recursive: true });
@@ -125,7 +152,7 @@ export async function POST() {
       }
 
       // Fallback
-      await execFileAsync("ffmpeg", ["-y", "-f", "lavfi", "-i", `color=c=black:s=${config.width}x${config.height}:d=5`, "-c:v", "libx264", "-t", "5", "-pix_fmt", "yuv420p", "-an", materialFile], { timeout: 15000 });
+      await execFileAsync("ffmpeg", ["-y", "-f", "lavfi", "-i", `color=c=black:s=${config.width}x${config.height}:d=60`, "-c:v", "libx264", "-t", "60", "-pix_fmt", "yuv420p", "-an", materialFile], { timeout: 15000 });
       console.log(`[TEST-RENDER] Scene ${i} placeholder`);
     }
 
@@ -147,19 +174,19 @@ export async function POST() {
       const videoIdx = i * 2;
       const audioIdx = i * 2 + 1;
 
-      // Scale video
-      filterParts.push(`[${videoIdx}:v]scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,setsar=1[v${i}]`);
-
-      // Normalize audio: boost volume + resample
-      // Get actual audio duration for precise subtitle sync
+      // Get actual audio duration for precise video trim + subtitle sync
       const actualAudioDuration = await getAudioDuration(join(workDir, `tts-${i}.mp3`));
       const audioDuration = actualAudioDuration > 0
         ? actualAudioDuration
         : estimateAudioDuration(scenes[i].voiceoverText);
-      filterParts.push(`[${audioIdx}:a]volume=2.0,aresample=44100,atrim=0:${audioDuration}[a${i}]`);
+
+      // Scale video AND trim to audio duration (prevents gaps/silence)
+      filterParts.push(`[${videoIdx}:v]scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,trim=duration=${audioDuration},setpts=PTS-STARTPTS[v${i}]`);
+
+      // Normalize audio: boost volume + resample, trim to duration, reset PTS
+      filterParts.push(`[${audioIdx}:a]volume=2.0,aresample=44100,atrim=0:${audioDuration},asetpts=PTS-STARTPTS[a${i}]`);
 
       // Subtitles: auto-adapt fontsize, line-break by punctuation, sync with actual audio duration
-      const audioFile = join(workDir, `tts-${i}.mp3`);
       const subtitleConfig: SubtitleConfig = {
         videoWidth: config.width,
         videoHeight: config.height,

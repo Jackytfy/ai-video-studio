@@ -2,7 +2,7 @@ import "dotenv/config";
 import { Worker, Job } from "bullmq";
 import IORedis from "ioredis";
 import { PrismaClient } from "../src/generated/prisma/client";
-import { PrismaLibSql } from "@prisma/adapter-libsql";
+import { PrismaBetterSqlite3 } from "@prisma/adapter-better-sqlite3";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import { readFile, writeFile, unlink, mkdir, rm } from "fs/promises";
@@ -42,7 +42,7 @@ async function uploadToS3(buffer: Buffer, contentType: string, folder: string): 
 }
 
 // --- Prisma ---
-const adapter = new PrismaLibSql({
+const adapter = new PrismaBetterSqlite3({
   url: process.env.DATABASE_URL || "file:./dev.db",
 });
 const prisma = new PrismaClient({ adapter });
@@ -259,16 +259,18 @@ async function processCompose(job: Job<RenderJobData>) {
     const videoIdx = i * 2;
     const audioIdx = i * 2 + 1;
 
-    filterParts.push(
-      `[${videoIdx}:v]scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,setsar=1[v${i}]`
-    );
-
-    // Subtitles: auto-adapt fontsize, line-break by punctuation, sync with actual audio duration
+    // Get actual audio duration for precise video trim + subtitle sync
     const actualAudioDuration = await getAudioDuration(audioFile);
     const audioDuration = actualAudioDuration > 0
       ? actualAudioDuration
       : estimateAudioDuration(scene.voiceoverText);
 
+    // Scale video AND trim to audio duration (prevents gaps/silence)
+    filterParts.push(
+      `[${videoIdx}:v]scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,trim=duration=${audioDuration},setpts=PTS-STARTPTS[v${i}]`
+    );
+
+    // Subtitles
     const subtitleConfig: SubtitleConfig = {
       videoWidth: config.width,
       videoHeight: config.height,
@@ -282,9 +284,9 @@ async function processCompose(job: Job<RenderJobData>) {
     );
     filterParts.push(...subFilters);
 
-    // Normalize audio: trim to actual/estimated duration
+    // Normalize audio: trim to exact duration, reset PTS for clean concat
     filterParts.push(
-      `[${audioIdx}:a]volume=2.0,aresample=44100,atrim=0:${audioDuration}[a${i}]`
+      `[${audioIdx}:a]volume=2.0,aresample=44100,atrim=0:${audioDuration},asetpts=PTS-STARTPTS[a${i}]`
     );
 
     totalDuration += audioDuration;

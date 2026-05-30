@@ -183,11 +183,11 @@ export async function renderProjectInline(
         }
       }
 
-      // Fallback: black placeholder
+      // Fallback: black placeholder (long enough, will be trimmed to audio duration)
       await execFileAsync("ffmpeg", [
         "-y", "-f", "lavfi", "-i",
-        `color=c=black:s=${config.width}x${config.height}:d=5`,
-        "-c:v", "libx264", "-t", "5", "-pix_fmt", "yuv420p",
+        `color=c=black:s=${config.width}x${config.height}:d=60`,
+        "-c:v", "libx264", "-t", "60", "-pix_fmt", "yuv420p",
         "-an", materialFile,
       ], { timeout: 15000 }).catch(() => {});
     }
@@ -238,20 +238,20 @@ export async function renderProjectInline(
       const videoIdx = i * 2;
       const audioIdx = i * 2 + 1;
 
-      // Scale video
-      filterParts.push(
-        `[${videoIdx}:v]scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,setsar=1[v${i}]`
-      );
-
-      // Get actual audio duration for precise subtitle sync & audio trim
+      // Get actual audio duration for precise video trim + subtitle sync
       const actualAudioDuration = await getAudioDuration(audioFile);
       const audioDuration = actualAudioDuration > 0
         ? actualAudioDuration
         : estimateAudioDuration(scenes[i].voiceoverText);
 
+      // Scale video AND trim to audio duration (prevents gaps/silence)
+      filterParts.push(
+        `[${videoIdx}:v]scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,trim=duration=${audioDuration},setpts=PTS-STARTPTS[v${i}]`
+      );
+
       // Normalize audio: boost volume + resample to 44100Hz stereo, trim to actual duration
       filterParts.push(
-        `[${audioIdx}:a]volume=2.0,aresample=44100,atrim=0:${audioDuration}[a${i}]`
+        `[${audioIdx}:a]volume=2.0,aresample=44100,atrim=0:${audioDuration},asetpts=PTS-STARTPTS[a${i}]`
       );
 
       // Subtitles: auto-adapt fontsize, line-break by punctuation, sync with actual audio duration
