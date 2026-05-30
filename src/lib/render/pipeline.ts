@@ -5,6 +5,13 @@ import { readFile, writeFile, unlink, mkdir, rm } from "fs/promises";
 import { join } from "path";
 import { randomUUID } from "crypto";
 import { tmpdir } from "os";
+import {
+  generateSubtitleChunks,
+  buildSubtitleFilterChain,
+  estimateAudioDuration,
+  getAudioDuration,
+  type SubtitleConfig,
+} from "./subtitle";
 
 const execFileAsync = promisify(execFile);
 
@@ -199,6 +206,7 @@ export async function renderProjectInline(
     const inputArgs: string[] = [];
     const filterParts: string[] = [];
     const concatInputs: string[] = [];
+    let totalDuration = 0; // accumulated actual audio durations
 
     for (let i = 0; i < scenes.length; i++) {
       const materialFile = join(workDir, `scene-${i}.mp4`);
@@ -235,29 +243,42 @@ export async function renderProjectInline(
         `[${videoIdx}:v]scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,setsar=1[v${i}]`
       );
 
-      // Normalize audio: boost volume + resample to 44100Hz stereo
+      // Get actual audio duration for precise subtitle sync & audio trim
+      const actualAudioDuration = await getAudioDuration(audioFile);
+      const audioDuration = actualAudioDuration > 0
+        ? actualAudioDuration
+        : estimateAudioDuration(scenes[i].voiceoverText);
+
+      // Normalize audio: boost volume + resample to 44100Hz stereo, trim to actual duration
       filterParts.push(
-        `[${audioIdx}:a]volume=2.0,aresample=44100,atrim=0:${scenes[i].voiceoverText.length / 4}[a${i}]`
+        `[${audioIdx}:a]volume=2.0,aresample=44100,atrim=0:${audioDuration}[a${i}]`
       );
 
-      // Add subtitles with Chinese font
-      // Split long text into multiple lines for readability
-      const fullText = scenes[i].voiceoverText.replace(/'/g, "").replace(/\n/g, " ");
-      const subtitleLines = [];
-      for (let j = 0; j < fullText.length; j += 20) {
-        subtitleLines.push(fullText.substring(j, j + 20));
+      // Subtitles: auto-adapt fontsize, line-break by punctuation, sync with actual audio duration
+      const subtitleConfig: SubtitleConfig = {
+        videoWidth: config.width,
+        videoHeight: config.height,
+        audioDuration,
+      };
+      const subtitleChunks = generateSubtitleChunks(scenes[i].voiceoverText, subtitleConfig);
+      const { filterParts: subFilters, outputLabel: subLabel } = buildSubtitleFilterChain(
+        `v${i}`,
+        subtitleChunks,
+        subtitleConfig
+      );
+      filterParts.push(...subFilters);
+
+      // Update scene with actual audio duration for accuracy
+      if (actualAudioDuration > 0) {
+        await prisma.scene.update({
+          where: { id: scenes[i].id },
+          data: { audioDuration: actualAudioDuration },
+        });
       }
-      const subtitleText = subtitleLines.join("\\n");
-      const fontPath = process.platform === "win32"
-        ? "C\\:/Windows/Fonts/msyh.ttc"
-        : "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc";
-      const voiceDuration = scenes[i].voiceoverText.length / 4;
-      // Bigger font (48), bottom center, with background box, show only during voiceover
-      filterParts.push(
-        `[v${i}]drawtext=fontfile='${fontPath}':text='${subtitleText}':fontsize=48:fontcolor=white:borderw=3:bordercolor=black:shadowcolor=black:shadowx=2:shadowy=2:x=(w-text_w)/2:y=h-text_h-60:box=1:boxcolor=black@0.4:boxborderw=15:enable='between(t,0,${voiceDuration})'[v${i}sub]`
-      );
 
-      concatInputs.push(`[v${i}sub][a${i}]`);
+      totalDuration += audioDuration;
+
+      concatInputs.push(`[${subLabel}][a${i}]`);
     }
 
     if (concatInputs.length === 0) throw new Error("No scenes to compose");
@@ -280,11 +301,8 @@ export async function renderProjectInline(
             inputArgs.push("-i", musicFile);
             const musicIdx = scenes.length * 2;
 
-            let totalDur = 0;
-            for (const s of scenes) totalDur += s.voiceoverText.length / 4;
-
             filterParts.push(
-              `[${musicIdx}:a]volume=${music.volume},afade=t=in:st=0:d=${music.fadeIn},afade=t=out:st=${totalDur - music.fadeOut}:d=${music.fadeOut}[bgm]`
+              `[${musicIdx}:a]volume=${music.volume},afade=t=in:st=0:d=${music.fadeIn},afade=t=out:st=${totalDuration - music.fadeOut}:d=${music.fadeOut}[bgm]`
             );
             filterParts.push(
               `[outa][bgm]amix=inputs=2:duration=first:dropout_transition=2[finala]`

@@ -3,9 +3,10 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
-import { MessageSquare, Layers, Film, ArrowRight, Loader2, CheckCircle, AlertCircle, Play, RefreshCw } from "lucide-react";
+import { useState } from "react";
+import { MessageSquare, Layers, Film, ArrowRight, Loader2, CheckCircle, AlertCircle, Play, RefreshCw, Download, Trash2 } from "lucide-react";
 
-const POLLING_STATUSES = ["RENDERING"];
+const POLLING_STATUSES = ["RENDERING", "COMPOSITING", "TTS_GENERATING", "MATERIALS_LOADING"];
 
 const statusMap: Record<string, { label: string; color: string }> = {
   DRAFT: { label: "草稿", color: "text-muted-foreground" },
@@ -25,6 +26,8 @@ export default function ProjectDetailPage() {
   const queryClient = useQueryClient();
   const projectId = params.id as string;
 
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+
   const renderMutation = useMutation({
     mutationFn: async () => {
       const res = await fetch(`/api/projects/${projectId}/render`, { method: "POST" });
@@ -39,6 +42,18 @@ export default function ProjectDetailPage() {
     },
   });
 
+  const deleteMutation = useMutation({
+    mutationFn: async () => {
+      const res = await fetch(`/api/projects/${projectId}`, { method: "DELETE" });
+      if (!res.ok) throw new Error("删除失败");
+      return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["projects"] });
+      router.push("/dashboard");
+    },
+  });
+
   const { data: project, isLoading } = useQuery({
     queryKey: ["project", projectId],
     queryFn: async () => {
@@ -47,11 +62,15 @@ export default function ProjectDetailPage() {
       return res.json();
     },
     refetchInterval: (query) => {
-      const state = query.state.data as { status?: string } | undefined;
-      if (!state || !POLLING_STATUSES.includes(state.status ?? "")) return false;
+      const state = query.state.data as { status?: string; renderJobs?: Array<{ status: string }> } | undefined;
+      if (!state) return false;
+      // Poll during rendering and also when renderJobs has an active job
+      const isRendering = POLLING_STATUSES.includes(state.status ?? "");
+      const hasActiveRender = state.renderJobs?.[0]?.status && !["COMPLETED", "FAILED"].includes(state.renderJobs[0].status);
+      if (!isRendering && !hasActiveRender) return false;
       const elapsed = Date.now() - (query.state.dataUpdatedAt || Date.now());
-      if (elapsed > 120_000) return false;
-      return 5000;
+      if (elapsed > 300_000) return false; // 5 min timeout
+      return 3000; // Poll every 3 seconds
     },
   });
 
@@ -82,6 +101,13 @@ export default function ProjectDetailPage() {
           <span className={`text-sm font-medium ${status.color}`}>
             {status.label}
           </span>
+          <button
+            onClick={() => setShowDeleteConfirm(true)}
+            className="ml-auto p-2 rounded-lg text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
+            title="删除项目"
+          >
+            <Trash2 className="w-4 h-4" />
+          </button>
         </div>
         <p className="text-muted-foreground text-sm">
           {project.aspectRatio.replace("W_", "").replace("_", ":")} ·{" "}
@@ -90,34 +116,49 @@ export default function ProjectDetailPage() {
         </p>
       </div>
 
+      {/* Video Player - Show prominently at top when completed */}
+      {project.status === "COMPLETED" && project.renderJobs?.[0]?.outputUrl && (
+        <div className="bg-card border-2 border-green-400/40 rounded-xl overflow-hidden shadow-lg shadow-green-400/5">
+          <div className="px-6 py-4 border-b border-border bg-green-400/5 flex items-center justify-between flex-wrap gap-3">
+            <div className="flex items-center gap-2">
+              <CheckCircle className="w-5 h-5 text-green-400" />
+              <h2 className="font-semibold text-lg">视频已生成</h2>
+            </div>
+            <div className="flex items-center gap-3 text-sm text-muted-foreground">
+              {project.renderJobs[0].outputDuration && (
+                <span>{Math.round(project.renderJobs[0].outputDuration)}秒</span>
+              )}
+              {project.renderJobs[0].outputSize && (
+                <span>{(project.renderJobs[0].outputSize / 1024 / 1024).toFixed(1)} MB</span>
+              )}
+              <a
+                href={project.renderJobs[0].outputUrl}
+                download
+                className="flex items-center gap-1 text-purple hover:text-purple-light transition-colors"
+              >
+                <Download className="w-4 h-4" />
+                下载
+              </a>
+            </div>
+          </div>
+          <div className="bg-black">
+            <video
+              src={project.renderJobs[0].outputUrl}
+              controls
+              playsInline
+              preload="metadata"
+              className="w-full max-h-[70vh] object-contain"
+            />
+          </div>
+        </div>
+      )}
+
       <div className="bg-card border border-border rounded-xl p-6">
         <h2 className="font-semibold mb-3">源文稿</h2>
         <p className="text-sm text-muted-foreground whitespace-pre-wrap line-clamp-6">
           {project.sourceText}
         </p>
       </div>
-
-      {/* Video Player */}
-      {project.status === "COMPLETED" && project.renderJobs?.[0]?.outputUrl && (
-        <div className="bg-card border border-border rounded-xl overflow-hidden">
-          <div className="px-6 py-3 border-b border-border">
-            <h2 className="font-semibold">生成的视频</h2>
-          </div>
-          <div className="p-4">
-            <video
-              src={project.renderJobs[0].outputUrl}
-              controls
-              className="w-full rounded-lg bg-black"
-            />
-            {project.renderJobs[0].outputDuration && (
-              <p className="text-xs text-muted-foreground mt-2">
-                时长: {Math.round(project.renderJobs[0].outputDuration)}秒 ·
-                大小: {project.renderJobs[0].outputSize ? `${(project.renderJobs[0].outputSize / 1024 / 1024).toFixed(1)}MB` : "未知"}
-              </p>
-            )}
-          </div>
-        </div>
-      )}
 
       {project.aiAnalysis && (() => {
         const analysis = typeof project.aiAnalysis === "string"
@@ -206,18 +247,24 @@ export default function ProjectDetailPage() {
             <div>
               <p className="font-medium text-sm">渲染中</p>
               <p className="text-xs text-muted-foreground">
-                TTS配音 · 素材合成 · 视频生成
+                {project.renderJobs?.[0]?.currentStage === "tts" ? "TTS配音生成中..."
+                : project.renderJobs?.[0]?.currentStage === "materials" ? "素材下载中..."
+                : project.renderJobs?.[0]?.currentStage === "compose" ? "视频合成中..."
+                : "TTS配音 · 素材合成 · 视频生成"}
               </p>
             </div>
           </div>
         ) : project.status === "COMPLETED" ? (
-          <div className="bg-card border border-green-400/30 rounded-xl p-5 flex items-center gap-3">
-            <CheckCircle className="w-5 h-5 text-green-400" />
+          <button
+            onClick={() => document.querySelector("video")?.scrollIntoView({ behavior: "smooth" })}
+            className="bg-card border border-green-400/30 rounded-xl p-5 hover:border-green-400/60 transition-all flex items-center gap-3"
+          >
+            <Play className="w-5 h-5 text-green-400" />
             <div>
-              <p className="font-medium text-sm">渲染完成</p>
-              <p className="text-xs text-muted-foreground">查看下方视频</p>
+              <p className="font-medium text-sm">预览视频</p>
+              <p className="text-xs text-muted-foreground">点击跳转到视频</p>
             </div>
-          </div>
+          </button>
         ) : project.status === "FAILED" ? (
           <button
             onClick={() => renderMutation.mutate()}
@@ -248,6 +295,49 @@ export default function ProjectDetailPage() {
           </div>
         )}
       </div>
+
+      {/* Delete Confirmation Modal */}
+      {showDeleteConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="bg-card border border-border rounded-xl p-6 max-w-sm w-full mx-4 shadow-2xl animate-in">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="p-2 rounded-full bg-destructive/10">
+                <Trash2 className="w-5 h-5 text-destructive" />
+              </div>
+              <h3 className="font-semibold text-lg">删除项目</h3>
+            </div>
+            <p className="text-sm text-muted-foreground mb-2">
+              确定要删除 <span className="font-medium text-foreground">「{project.name}」</span> 吗？
+            </p>
+            <p className="text-xs text-muted-foreground mb-6">
+              此操作将同时删除所有关联的视频文件、配音、分镜和聊天记录，无法恢复。
+            </p>
+            <div className="flex gap-3 justify-end">
+              <button
+                onClick={() => setShowDeleteConfirm(false)}
+                disabled={deleteMutation.isPending}
+                className="px-4 py-2 text-sm rounded-lg border border-border hover:bg-secondary transition-colors disabled:opacity-50"
+              >
+                取消
+              </button>
+              <button
+                onClick={() => deleteMutation.mutate()}
+                disabled={deleteMutation.isPending}
+                className="px-4 py-2 text-sm rounded-lg bg-destructive text-white hover:bg-destructive/90 transition-colors flex items-center gap-2 disabled:opacity-50"
+              >
+                {deleteMutation.isPending ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    删除中...
+                  </>
+                ) : (
+                  "确认删除"
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

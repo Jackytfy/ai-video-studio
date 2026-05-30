@@ -1,5 +1,11 @@
 import { execFile } from "child_process";
 import { promisify } from "util";
+import {
+  generateSubtitleChunks,
+  buildSubtitleFilterChain,
+  estimateAudioDuration,
+  type SubtitleConfig,
+} from "./subtitle";
 
 const execFileAsync = promisify(execFile);
 
@@ -43,17 +49,27 @@ export async function compositeVideo(
     );
 
     if (scene.subtitleText) {
-      const escapedText = scene.subtitleText.replace(/'/g, "\\'").replace(/:/g, "\\:");
-      filterParts.push(
-        `[v${i}]drawtext=text='${escapedText}':fontsize=24:fontcolor=white:borderw=2:bordercolor=black:x=(w-text_w)/2:y=h-text_h-30[v${i}sub]`
+      const subtitleConfig: SubtitleConfig = {
+        videoWidth: options.width,
+        videoHeight: options.height,
+        audioDuration: scene.duration || estimateAudioDuration(scene.subtitleText),
+      };
+      const chunks = generateSubtitleChunks(scene.subtitleText, subtitleConfig);
+      const { filterParts: subFilters, outputLabel: subLabel } = buildSubtitleFilterChain(
+        `v${i}`,
+        chunks,
+        subtitleConfig
       );
+      filterParts.push(...subFilters);
+      // Mark that this scene has subtitle label for concat
+      (scene as any)._subLabel = subLabel;
     }
   });
 
   const concatInputs = scenes
-    .map((_, i) => {
-      const videoLabel = scenes[i].subtitleText ? `[v${i}sub]` : `[v${i}]`;
-      return `${videoLabel}[${i * 2 + 1}:a]`;
+    .map((scene, i) => {
+      const videoLabel = (scene as any)._subLabel || `v${i}`;
+      return `[${videoLabel}][${i * 2 + 1}:a]`;
     })
     .join("");
 

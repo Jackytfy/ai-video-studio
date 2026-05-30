@@ -1,16 +1,6 @@
-import { withAuth } from "next-auth/middleware";
-
-export default withAuth({
-  pages: {
-    signIn: "/login",
-  },
-});
+// Auth disabled - all routes are public
+export default function middleware() {}
 
 export const config = {
-  matcher: [
-    "/dashboard/:path*",
-    "/projects/:path*",
-    "/settings/:path*",
-    "/admin/:path*",
-  ],
+  matcher: [],
 };

@@ -6,6 +6,13 @@ import { readFile, writeFile, mkdir, rm } from "fs/promises";
 import { join } from "path";
 import { randomUUID } from "crypto";
 import { tmpdir } from "os";
+import {
+  generateSubtitleChunks,
+  buildSubtitleFilterChain,
+  estimateAudioDuration,
+  getAudioDuration,
+  type SubtitleConfig,
+} from "@/lib/render/subtitle";
 
 const execFileAsync = promisify(execFile);
 
@@ -76,7 +83,7 @@ export async function POST() {
           throw new Error(`API ${res.status}`);
         }
       } catch (e) {
-        console.log(`[TEST-RENDER] Scene ${i} TTS fallback: ${e.message}`);
+        console.log(`[TEST-RENDER] Scene ${i} TTS fallback: ${e instanceof Error ? e.message : String(e)}`);
         await execFileAsync("ffmpeg", ["-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", "5", "-c:a", "libmp3lame", "-b:a", "128k", audioFile], { timeout: 10000 });
       }
 
@@ -112,7 +119,7 @@ export async function POST() {
               continue;
             }
           } catch (e) {
-            console.log(`[TEST-RENDER] Scene ${i} material error: ${e.message}`);
+            console.log(`[TEST-RENDER] Scene ${i} material error: ${e instanceof Error ? e.message : String(e)}`);
           }
         }
       }
@@ -144,24 +151,29 @@ export async function POST() {
       filterParts.push(`[${videoIdx}:v]scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,setsar=1[v${i}]`);
 
       // Normalize audio: boost volume + resample
-      filterParts.push(`[${audioIdx}:a]volume=2.0,aresample=44100,atrim=0:${scenes[i].voiceoverText.length / 4}[a${i}]`);
+      // Get actual audio duration for precise subtitle sync
+      const actualAudioDuration = await getAudioDuration(join(workDir, `tts-${i}.mp3`));
+      const audioDuration = actualAudioDuration > 0
+        ? actualAudioDuration
+        : estimateAudioDuration(scenes[i].voiceoverText);
+      filterParts.push(`[${audioIdx}:a]volume=2.0,aresample=44100,atrim=0:${audioDuration}[a${i}]`);
 
-      // Add subtitles with Chinese font (apply to scaled video)
-      // Split long text into multiple lines for readability
-      const fullText = scenes[i].voiceoverText.replace(/'/g, "").replace(/\n/g, " ");
-      const subtitleLines = [];
-      for (let j = 0; j < fullText.length; j += 20) {
-        subtitleLines.push(fullText.substring(j, j + 20));
-      }
-      const subtitleText = subtitleLines.join("\\n");
-      const fontPath = process.platform === "win32"
-        ? "C\\:/Windows/Fonts/msyh.ttc"
-        : "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc";
-      const voiceDuration = scenes[i].voiceoverText.length / 4;
-      // Bigger font (48), bottom center, with background box, show only during voiceover
-      filterParts.push(`[v${i}]drawtext=fontfile='${fontPath}':text='${subtitleText}':fontsize=48:fontcolor=white:borderw=3:bordercolor=black:shadowcolor=black:shadowx=2:shadowy=2:x=(w-text_w)/2:y=h-text_h-60:box=1:boxcolor=black@0.4:boxborderw=15:enable='between(t,0,${voiceDuration})'[v${i}sub]`);
+      // Subtitles: auto-adapt fontsize, line-break by punctuation, sync with actual audio duration
+      const audioFile = join(workDir, `tts-${i}.mp3`);
+      const subtitleConfig: SubtitleConfig = {
+        videoWidth: config.width,
+        videoHeight: config.height,
+        audioDuration,
+      };
+      const subtitleChunks = generateSubtitleChunks(scenes[i].voiceoverText, subtitleConfig);
+      const { filterParts: subFilters, outputLabel: subLabel } = buildSubtitleFilterChain(
+        `v${i}`,
+        subtitleChunks,
+        subtitleConfig
+      );
+      filterParts.push(...subFilters);
 
-      concatInputs.push(`[v${i}sub][a${i}]`);
+      concatInputs.push(`[${subLabel}][a${i}]`);
     }
 
     filterParts.push(`${concatInputs.join("")}concat=n=${scenes.length}:v=1:a=1[outv][outa]`);

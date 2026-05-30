@@ -19,9 +19,10 @@ interface Project {
 
 interface ProjectGridProps {
   projects: Project[];
+  onDeleteProject?: (id: string) => void;
 }
 
-export function ProjectGrid({ projects }: ProjectGridProps) {
+export function ProjectGrid({ projects, onDeleteProject }: ProjectGridProps) {
   if (projects.length === 0) {
     return (
       <div className="text-center py-16">
@@ -39,7 +40,7 @@ export function ProjectGrid({ projects }: ProjectGridProps) {
   return (
     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
       {projects.map((project) => (
-        <ProjectCard key={project.id} project={project} />
+        <ProjectCard key={project.id} project={project} onDelete={onDeleteProject} />
       ))}
     </div>
   );

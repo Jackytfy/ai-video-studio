@@ -1,11 +1,13 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus } from "lucide-react";
 import Link from "next/link";
 import { ProjectGrid } from "@/components/dashboard/ProjectGrid";
 
 export default function DashboardPage() {
+  const queryClient = useQueryClient();
+
   const { data: projects, isLoading } = useQuery({
     queryKey: ["projects"],
     queryFn: async () => {
@@ -15,6 +17,10 @@ export default function DashboardPage() {
     },
   });
 
+  const handleDelete = (id: string) => {
+    queryClient.invalidateQueries({ queryKey: ["projects"] });
+  };
+
   return (
     <div className="p-6 space-y-6">
       <div className="flex items-center justify-between">
@@ -23,7 +29,7 @@ export default function DashboardPage() {
           <p className="text-muted-foreground mt-1">管理你的 AI 视频创作项目</p>
         </div>
         <Link
-          href="/"
+          href="/create"
           className="flex items-center gap-2 bg-purple hover:bg-purple-light text-white px-4 py-2 rounded-lg font-medium transition-colors"
         >
           <Plus className="w-4 h-4" />
@@ -42,7 +48,7 @@ export default function DashboardPage() {
           ))}
         </div>
       ) : (
-        <ProjectGrid projects={projects || []} />
+        <ProjectGrid projects={projects || []} onDeleteProject={handleDelete} />
       )}
     </div>
   );

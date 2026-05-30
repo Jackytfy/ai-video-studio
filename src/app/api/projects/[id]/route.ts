@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { prisma } from "@/lib/db";
 import { requireSession, unauthorized } from "@/lib/auth/session";
+import { rm } from "fs/promises";
+import { join } from "path";
 
 const updateProjectSchema = z.object({
   name: z.string().min(1).optional(),
@@ -30,7 +32,7 @@ export async function GET(
         renderJobs: {
           orderBy: { createdAt: "desc" },
           take: 1,
-          select: { id: true, status: true, outputUrl: true, outputDuration: true, outputSize: true },
+          select: { id: true, status: true, outputUrl: true, outputDuration: true, outputSize: true, currentStage: true, progress: true },
         },
         _count: { select: { messages: true, materials: true, renderJobs: true } },
       },
@@ -97,7 +99,13 @@ export async function DELETE(
       return NextResponse.json({ error: "项目不存在" }, { status: 404 });
     }
 
+    // Delete from database (cascade will remove related records)
     await prisma.project.delete({ where: { id } });
+
+    // Clean up uploaded files and rendered videos
+    const uploadDir = join(process.cwd(), "uploads", id);
+    await rm(uploadDir, { recursive: true, force: true }).catch(() => {});
+
     return NextResponse.json({ success: true });
   } catch (error) {
     return NextResponse.json({ error: "删除项目失败" }, { status: 500 });

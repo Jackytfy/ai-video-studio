@@ -12,6 +12,13 @@ import { join } from "path";
 import { randomUUID } from "crypto";
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import {
+  generateSubtitleChunks,
+  buildSubtitleFilterChain,
+  estimateAudioDuration,
+  getAudioDuration,
+  type SubtitleConfig,
+} from "../src/lib/render/subtitle";
 
 const execFileAsync = promisify(execFile);
 
@@ -209,6 +216,7 @@ async function processCompose(job: Job<RenderJobData>) {
   const filterParts: string[] = [];
   const inputArgs: string[] = [];
   const concatInputs: string[] = [];
+  let totalDuration = 0;
 
   for (let i = 0; i < scenes.length; i++) {
     const scene = scenes[i];
@@ -255,7 +263,33 @@ async function processCompose(job: Job<RenderJobData>) {
       `[${videoIdx}:v]scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,setsar=1[v${i}]`
     );
 
-    concatInputs.push(`[v${i}][${audioIdx}:a]`);
+    // Subtitles: auto-adapt fontsize, line-break by punctuation, sync with actual audio duration
+    const actualAudioDuration = await getAudioDuration(audioFile);
+    const audioDuration = actualAudioDuration > 0
+      ? actualAudioDuration
+      : estimateAudioDuration(scene.voiceoverText);
+
+    const subtitleConfig: SubtitleConfig = {
+      videoWidth: config.width,
+      videoHeight: config.height,
+      audioDuration,
+    };
+    const subtitleChunks = generateSubtitleChunks(scene.voiceoverText, subtitleConfig);
+    const { filterParts: subFilters, outputLabel: subLabel } = buildSubtitleFilterChain(
+      `v${i}`,
+      subtitleChunks,
+      subtitleConfig
+    );
+    filterParts.push(...subFilters);
+
+    // Normalize audio: trim to actual/estimated duration
+    filterParts.push(
+      `[${audioIdx}:a]volume=2.0,aresample=44100,atrim=0:${audioDuration}[a${i}]`
+    );
+
+    totalDuration += audioDuration;
+
+    concatInputs.push(`[${subLabel}][a${i}]`);
   }
 
   if (concatInputs.length === 0) throw new Error("No scenes to compose");
@@ -273,12 +307,6 @@ async function processCompose(job: Job<RenderJobData>) {
       const res = await fetch(music.fileUrl);
       if (res.ok) {
         await writeFile(musicFile, Buffer.from(await res.arrayBuffer()));
-
-        // Calculate total duration
-        let totalDuration = 0;
-        for (const scene of scenes) {
-          totalDuration += scene.voiceoverText.length / 4;
-        }
 
         inputArgs.push("-i", musicFile);
         const musicIdx = scenes.length * 2;
