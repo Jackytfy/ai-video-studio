@@ -1,6 +1,6 @@
 "use client";
 
-import { Film, Wand2, Edit3, ChevronDown, ChevronUp, User, Calendar, Video, Palette } from "lucide-react";
+import { Film, Wand2, Edit3, ChevronDown, ChevronUp, Search, Eye, Mic } from "lucide-react";
 import { useState } from "react";
 
 interface Scene {
@@ -29,6 +29,11 @@ export function SceneCard({ scene, onEdit }: SceneCardProps) {
   if (scene.productionMeta) {
     try { meta = JSON.parse(scene.productionMeta); } catch {}
   }
+
+  // Voiceover scripts: from meta.scripts or split voiceoverText
+  const voiceoverScripts: string[] = meta?.scripts && meta.scripts.length > 0
+    ? meta.scripts
+    : (scene.voiceoverText ? [scene.voiceoverText] : []);
 
   return (
     <div className="bg-card border border-border rounded-xl hover:border-purple/30 transition-all group">
@@ -60,64 +65,62 @@ export function SceneCard({ scene, onEdit }: SceneCardProps) {
           <h3 className="font-semibold text-sm mb-2">{scene.title}</h3>
         )}
 
-        {/* Scripts */}
-        {meta?.scripts && meta.scripts.length > 0 && (
+        {/* Voiceover Scripts (口播脚本) - always visible */}
+        {voiceoverScripts.length > 0 && (
           <div className="space-y-0.5 mb-2">
-            {meta.scripts.slice(0, expanded ? undefined : 3).map((line: string, i: number) => (
-              <p key={i} className="text-xs text-muted-foreground leading-relaxed">
+            <div className="flex items-center gap-1 text-[11px] text-purple/80 mb-0.5">
+              <Mic className="w-3 h-3" />
+              <span>口播脚本</span>
+            </div>
+            {voiceoverScripts.slice(0, expanded ? undefined : 2).map((line: string, i: number) => (
+              <p key={i} className="text-xs text-muted-foreground leading-relaxed pl-4">
                 {line}
               </p>
             ))}
-            {!expanded && meta.scripts.length > 3 && (
-              <p className="text-[11px] text-purple cursor-pointer" onClick={() => setExpanded(true)}>
-                展开全部 {meta.scripts.length} 条脚本...
+            {!expanded && voiceoverScripts.length > 2 && (
+              <p className="text-[11px] text-purple cursor-pointer pl-4" onClick={() => setExpanded(true)}>
+                展开全部 {voiceoverScripts.length} 条脚本...
               </p>
             )}
           </div>
         )}
 
-        {/* Fallback: show voiceoverText if no scripts */}
-        {(!meta?.scripts || meta.scripts.length === 0) && (
-          <p className="text-xs text-muted-foreground line-clamp-3 mb-2">
-            {scene.voiceoverText}
-          </p>
+        {/* Visual Description (画面描述) - always visible */}
+        {scene.visualDesc && (
+          <div className="mb-2">
+            <div className="flex items-center gap-1 text-[11px] text-purple/80 mb-0.5">
+              <Eye className="w-3 h-3" />
+              <span>画面描述</span>
+            </div>
+            <p className={`text-xs text-muted-foreground leading-relaxed pl-4 ${expanded ? "" : "line-clamp-2"}`}>
+              {scene.visualDesc}
+            </p>
+          </div>
         )}
       </div>
 
       {/* Expanded detail section */}
-      {expanded && meta && (
+      {expanded && (
         <div className="px-4 pb-3 space-y-2 border-t border-border/50 pt-2">
-          {/* Proper Nouns */}
-          {meta.properNouns && meta.properNouns.length > 0 && (
+          {/* Material Query (素材检索) */}
+          {scene.materialQuery && (
             <div className="flex items-start gap-1.5 text-[11px]">
-              <User className="w-3 h-3 mt-0.5 text-purple shrink-0" />
-              <span className="text-muted-foreground">
-                {meta.properNouns.map((pn: any) => `${pn.name}（${pn.type}）`).join(" · ")}
-              </span>
+              <Search className="w-3 h-3 mt-0.5 text-purple shrink-0" />
+              <div>
+                <span className="text-purple/80 font-medium">素材检索：</span>
+                <span className="text-muted-foreground">{scene.materialQuery}</span>
+              </div>
             </div>
           )}
 
-          {/* Era */}
-          {meta.era && (
-            <div className="flex items-center gap-1.5 text-[11px]">
-              <Calendar className="w-3 h-3 text-purple shrink-0" />
-              <span className="text-muted-foreground">{meta.era}</span>
-            </div>
-          )}
-
-          {/* Sources */}
-          {meta.sources && meta.sources.length > 0 && (
+          {/* Full voiceover text */}
+          {scene.voiceoverText && voiceoverScripts.length > 1 && (
             <div className="flex items-start gap-1.5 text-[11px]">
-              <Video className="w-3 h-3 mt-0.5 text-purple shrink-0" />
-              <span className="text-muted-foreground">{meta.sources.join("、")}</span>
-            </div>
-          )}
-
-          {/* Preference */}
-          {meta.preference && (
-            <div className="flex items-start gap-1.5 text-[11px]">
-              <Palette className="w-3 h-3 mt-0.5 text-purple shrink-0" />
-              <span className="text-muted-foreground">{meta.preference}</span>
+              <Mic className="w-3 h-3 mt-0.5 text-purple shrink-0" />
+              <div>
+                <span className="text-purple/80 font-medium">完整口播：</span>
+                <span className="text-muted-foreground">{scene.voiceoverText}</span>
+              </div>
             </div>
           )}
 
@@ -132,23 +135,14 @@ export function SceneCard({ scene, onEdit }: SceneCardProps) {
       )}
 
       {/* Expand toggle (collapsed state) */}
-      {!expanded && meta && (
+      {!expanded && (
         <button
           onClick={() => setExpanded(true)}
           className="w-full px-4 pb-3 pt-1 flex items-center justify-center gap-1 text-[11px] text-muted-foreground hover:text-purple transition-colors"
         >
           <ChevronDown className="w-3 h-3" />
-          查看制作详情
+          查看详情
         </button>
-      )}
-
-      {/* Bottom stats (collapsed state) */}
-      {!expanded && (
-        <div className="px-4 pb-3 flex items-center gap-3 text-[11px] text-muted-foreground/60">
-          <span>{scene.wordCount || "—"} 字</span>
-          {meta?.era && <span>{meta.era.split(" / ")[0]}</span>}
-          <span className="ml-auto">{scene.sceneType === "ANIMATION" ? "动画" : "实拍"}</span>
-        </div>
       )}
     </div>
   );

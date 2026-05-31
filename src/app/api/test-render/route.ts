@@ -54,7 +54,7 @@ export async function POST() {
               sceneNumber: i + 1,
               voiceoverText: t,
               visualDesc: "科技场景",
-              duration: 5,
+              materialQuery: "technology AI",
             })),
           },
         },
@@ -62,6 +62,9 @@ export async function POST() {
       });
     }
 
+    if (!storyboard) {
+      return NextResponse.json({ error: "Storyboard creation failed" }, { status: 500 });
+    }
     const scenes = storyboard.scenes;
     const config = { width: 1920, height: 1080, fps: 30, format: "mp4" };
     const workDir = join(tmpdir(), `render-${PROJECT_ID}`);
@@ -114,7 +117,7 @@ export async function POST() {
         await execFileAsync("ffmpeg", ["-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", "5", "-c:a", "libmp3lame", "-b:a", "128k", audioFile], { timeout: 10000 });
       }
 
-      await prisma.scene.update({ where: { id: scene.id }, data: { audioUrl: audioFile, audioDuration: scene.voiceoverText.length / 4 } });
+      await prisma.scene.update({ where: { id: scene.id }, data: { audioUrl: audioFile, audioDuration: estimateAudioDuration(scene.voiceoverText) } });
     }
 
     // Materials stage

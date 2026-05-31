@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { X } from "lucide-react";
+import { estimateAudioDuration } from "@/lib/render/subtitle";
 
 interface Scene {
   id: string;
@@ -40,7 +41,7 @@ export function SceneEditor({ scene, onSave, onClose, isSaving }: SceneEditorPro
       sceneType,
       productionMeta: productionMeta || null,
       wordCount: voiceoverText.length,
-      estimatedDuration: voiceoverText.length / 4,
+      estimatedDuration: estimateAudioDuration(voiceoverText),
     });
   };
 

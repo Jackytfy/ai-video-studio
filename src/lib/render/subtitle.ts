@@ -3,10 +3,11 @@
  *
  * Key improvements:
  * 1. Auto-fontsize based on video height (h/20)
- * 2. Smart line-breaking with max-chars calculated from video width
+ * 2. Smart line-breaking with display-width-aware calculation
  * 3. Punctuation-aware sentence splitting
- * 4. Audio-duration-based timing (instead of fixed chars-per-second guess)
- * 5. Prevents text overflow beyond screen width
+ * 4. Support for per-script chunking via productionMeta.scripts
+ * 5. Audio-duration-based proportional timing
+ * 6. Increased horizontal safety margin to prevent screen-edge clipping
  */
 
 export interface SubtitleConfig {
@@ -18,7 +19,7 @@ export interface SubtitleConfig {
   fontPath?: string;
   /** Bottom margin as fraction of video height, default 0.06 */
   bottomMarginRatio?: number;
-  /** Scale factor for fontsize relative to video height, default 1/20 */
+  /** Scale factor for fontsize relative to video height, default 1/22 (slightly smaller) */
   fontSizeRatio?: number;
 }
 
@@ -30,49 +31,79 @@ export interface SubtitleChunk {
 
 /**
  * Calculate maximum characters per line based on video width and font size.
- * CJK characters are roughly square (width ≈ fontsize).
- * We reserve 7.5% horizontal margin on each side (15% total).
+ * Uses 85% safety margin (was 80%) to prevent edge overflow with box padding.
  */
 export function calcMaxCharsPerLine(videoWidth: number, fontSize: number): number {
   const usableWidth = videoWidth * 0.85;
-  return Math.max(8, Math.floor(usableWidth / (fontSize * 0.95)));
+  // CJK chars are ~fontsize wide, 1.05 safety factor for slight variations
+  return Math.max(6, Math.floor(usableWidth / (fontSize * 1.05)));
 }
 
 /**
  * Calculate adaptive font size based on video height.
+ * Slightly smaller ratio (1/22 vs 1/20) for better readability with box borders.
  */
-export function calcFontSize(videoHeight: number, ratio = 1 / 20): number {
-  return Math.max(24, Math.round(videoHeight * ratio));
+export function calcFontSize(videoHeight: number, ratio = 1 / 22): number {
+  return Math.max(22, Math.round(videoHeight * ratio));
 }
 
 /**
- * Count speakable characters (excludes punctuation, spaces, etc.)
- * Used for timing calculations since only spoken characters take time.
+ * Calculate display width of text (CJK = 1.0, ASCII = 0.55, other = 0.8).
  */
-function speakableChars(text: string): number {
-  return text.replace(/[，。！？、；：,;!?\s\n"'「」『』【】（）\(\)\[\]]/g, "").length;
+function displayWidth(text: string): number {
+  let width = 0;
+  for (const ch of text) {
+    const code = ch.charCodeAt(0);
+    if (code >= 0x4e00 && code <= 0x9fff) {
+      width += 1.0; // CJK
+    } else if (code < 0x80) {
+      width += 0.55; // ASCII
+    } else {
+      width += 0.8; // Other (fullwidth punctuation, etc.)
+    }
+  }
+  return width;
 }
 
 /**
- * Smart sentence splitting: break by punctuation first, then by max line length.
- * Does NOT modify text content - pure splitting only.
+ * Estimate speaking duration for a text segment (Chinese ~4 chars/sec, mixed content).
  */
-function smartSplit(text: string, maxChars: number): string[] {
+function estimateSpeechDuration(text: string): number {
+  const chineseChars = (text.match(/[一-鿿]/g) || []).length;
+  const nonChineseSpeakable = text
+    .replace(/[一-鿿]/g, "")
+    .replace(/[，。！？、；：,;!?\s\n"'「」『』【】（）\(\)\[\]·《》—\-\—]/g, "").length;
+
+  const chineseSecs = chineseChars / 4;
+  const nonChineseSecs = nonChineseSpeakable / 6;
+  return Math.max(0.6, chineseSecs + nonChineseSecs);
+}
+
+/**
+ * Smart sentence splitting: break by punctuation, then by max line width.
+ * Uses display-width aware calculation for mixed CJK/ASCII content.
+ */
+function smartSplit(text: string, maxCharsPerLine: number): string[] {
   const lines: string[] = [];
   const trimmed = text.trim();
-
   if (trimmed.length === 0) return lines;
 
-  // Split by Chinese/English punctuation to get natural sentences
-  // Use positive lookbehind to keep punctuation attached
-  const sentences = trimmed.split(/(?<=[。！？；,;!?])|(?<=，[^，]{10,})/).filter(s => s.length > 0);
+  // Split at natural break points (。！？；,;!?)
+  const sentences = trimmed.split(/(?<=[。！？；,;!?])/).filter(s => s.trim().length > 0);
+
+  // If only one sentence, try splitting by commas too
+  const workSentences = sentences.length <= 1
+    ? trimmed.split(/(?<=[，,])/).filter(s => s.trim().length > 0)
+    : sentences;
 
   let currentLine = "";
 
-  for (const sentence of sentences) {
-    // If adding this sentence fits within maxChars
-    if (currentLine.length + sentence.length <= maxChars) {
-      currentLine += sentence;
+  for (const sentence of workSentences) {
+    const combined = currentLine + sentence;
+    const combinedWidth = displayWidth(combined);
+
+    if (combinedWidth <= maxCharsPerLine) {
+      currentLine = combined;
     } else {
       // Flush current line
       if (currentLine.length > 0) {
@@ -80,31 +111,34 @@ function smartSplit(text: string, maxChars: number): string[] {
         currentLine = "";
       }
 
-      // Handle sentence that's longer than maxChars
-      if (sentence.length <= maxChars) {
+      const sentenceWidth = displayWidth(sentence);
+      if (sentenceWidth <= maxCharsPerLine) {
         currentLine = sentence;
       } else {
-        // Split long sentence by maxChars chunks
-        for (let i = 0; i < sentence.length; i += maxChars) {
-          const chunk = sentence.substring(i, i + maxChars);
-          // If this chunk would leave a tiny remainder, don't split
-          const remaining = sentence.length - (i + maxChars);
-          if (remaining > 0 && remaining < maxChars * 0.3) {
-            // Merge tiny tail with this chunk
-            lines.push(sentence.substring(i));
+        // Force-break long sentence character by character
+        let remaining = sentence;
+        while (remaining.length > 0) {
+          if (displayWidth(remaining) <= maxCharsPerLine) {
+            lines.push(remaining);
             break;
           }
-          if (i + maxChars >= sentence.length) {
-            currentLine = chunk;
-          } else {
-            lines.push(chunk);
+          let splitAt = 0;
+          let width = 0;
+          for (let j = 0; j < remaining.length; j++) {
+            const code = remaining.charCodeAt(j);
+            const chWidth = code >= 0x4e00 && code <= 0x9fff ? 1.0 : code < 0x80 ? 0.55 : 0.8;
+            if (width + chWidth > maxCharsPerLine) break;
+            width += chWidth;
+            splitAt = j + 1;
           }
+          if (splitAt === 0) splitAt = 1;
+          lines.push(remaining.substring(0, splitAt));
+          remaining = remaining.substring(splitAt);
         }
       }
     }
   }
 
-  // Flush remaining
   if (currentLine.length > 0) {
     lines.push(currentLine);
   }
@@ -113,70 +147,114 @@ function smartSplit(text: string, maxChars: number): string[] {
 }
 
 /**
- * Escape text for use in FFmpeg drawtext filter.
- * Only modifies for FFmpeg compatibility - doesn't change visible content.
- */
-function escapeDrawtext(text: string): string {
-  return text
-    .replace(/\\/g, "\\\\")   // backslash first
-    .replace(/'/g, "'\\''")   // single quote: close string, escaped quote, reopen
-    .replace(/:/g, "\\:")     // colon escape
-    .replace(/%/g, "\\%");    // percent escape (FFmpeg expansion)
-}
-
-/**
- * Generate subtitle chunks with timing based on audio/character proportion.
+ * Generate subtitle chunks from a list of individual script lines.
+ * Each script line becomes a timed chunk, with line-breaking for overflow.
  */
 export function generateSubtitleChunks(
   text: string,
-  config: SubtitleConfig
+  config: SubtitleConfig,
+  scripts?: string[],
 ): SubtitleChunk[] {
   const fontSize = calcFontSize(config.videoHeight, config.fontSizeRatio);
   const maxCharsPerLine = calcMaxCharsPerLine(config.videoWidth, fontSize);
 
-  const lines = smartSplit(text, maxCharsPerLine);
+  // If we have individual scripts, chunk by script with per-script timing
+  if (scripts && scripts.length > 0) {
+    return generateScriptChunks(scripts, config, fontSize, maxCharsPerLine);
+  }
 
+  // Fallback: smart-split the full text
+  const lines = smartSplit(text, maxCharsPerLine);
   if (lines.length === 0) return [];
 
-  // Total speakable characters for timing proportion
-  const totalSpeakable = speakableChars(text);
-  if (totalSpeakable === 0) return [];
+  return proportionallyTimeChunks(lines, config);
+}
 
-  // Determine total duration
+/**
+ * Generate chunks from individual script lines, each treated as a separate display unit.
+ * Short adjacent scripts may be merged for better pacing.
+ */
+function generateScriptChunks(
+  scripts: string[],
+  config: SubtitleConfig,
+  _fontSize: number,
+  maxCharsPerLine: number,
+): SubtitleChunk[] {
+  // First, split each script into display lines (handling overflow)
+  const displayLines: { text: string; scriptIndex: number }[] = [];
+
+  for (let i = 0; i < scripts.length; i++) {
+    const scriptText = scripts[i].replace(/^脚本\d+[：:]\s*/, ""); // strip "脚本N：" prefix
+    const lines = smartSplit(scriptText, maxCharsPerLine);
+    for (const line of lines) {
+      displayLines.push({ text: line, scriptIndex: i });
+    }
+  }
+
+  if (displayLines.length === 0) return [];
+
+  // If too many display lines, merge short consecutive ones from the same script
+  const merged: { text: string }[] = [];
+  for (const dl of displayLines) {
+    const last = merged[merged.length - 1];
+    if (last && displayWidth(last.text + dl.text) <= maxCharsPerLine) {
+      merged[merged.length - 1].text += dl.text;
+    } else {
+      merged.push({ text: dl.text });
+    }
+  }
+
+  const texts = merged.map(m => m.text);
+  return proportionallyTimeChunks(texts, config);
+}
+
+/**
+ * Distribute timestamps proportionally across text lines.
+ */
+function proportionallyTimeChunks(
+  lines: string[],
+  config: SubtitleConfig,
+): SubtitleChunk[] {
+  const lineDurations = lines.map(line => estimateSpeechDuration(line));
+  const totalEstimatedDuration = lineDurations.reduce((sum, d) => sum + d, 0);
+  if (totalEstimatedDuration === 0) return [];
+
   let totalDuration: number;
   if (config.audioDuration && config.audioDuration > 0) {
     totalDuration = config.audioDuration;
   } else {
-    const rate = /[\u4e00-\u9fff]/.test(text) ? 4 : 12;
-    totalDuration = Math.max(1, totalSpeakable / rate);
+    totalDuration = Math.max(1, totalEstimatedDuration);
   }
 
-  // Distribute time proportional to each line's speakable character count
   const chunks: SubtitleChunk[] = [];
   let timeCursor = 0;
 
   for (let i = 0; i < lines.length; i++) {
-    const lineSpeakable = speakableChars(lines[i]);
-    // Proportion: this line's speakable chars / total speakable chars
-    const proportion = lineSpeakable / totalSpeakable;
-    // Add 5% padding to prevent flash gaps, but cap at 0.5s
-    const chunkDuration = Math.min(proportion * totalDuration * 1.05, proportion * totalDuration + 0.5);
+    const proportion = lineDurations[i] / totalEstimatedDuration;
+    const chunkDuration = Math.min(
+      proportion * totalDuration * 1.02,
+      proportion * totalDuration + 0.25
+    );
 
-    const startTime = timeCursor;
+    let startTime = timeCursor;
     let endTime = timeCursor + chunkDuration;
 
-    // Last chunk always ends at totalDuration
     if (i === lines.length - 1) {
       endTime = totalDuration;
     }
 
-    // Ensure minimum display time of 0.5s per chunk
-    if (endTime - startTime < 0.5 && lines.length > 1) {
-      endTime = startTime + 0.5;
+    // Ensure minimum display time of 0.7s for readability
+    if (endTime - startTime < 0.7 && lines.length > 1) {
+      endTime = startTime + 0.7;
     }
 
-    // Clamp to total duration
     endTime = Math.min(endTime, totalDuration);
+
+    // Prevent overshoot: if we'd exceed totalDuration, back-calculate startTime
+    if (endTime > totalDuration) {
+      endTime = totalDuration;
+      startTime = Math.max(0, totalDuration - lineDurations[i] / totalEstimatedDuration * totalDuration);
+    }
 
     chunks.push({
       text: lines[i],
@@ -201,6 +279,7 @@ export function buildSubtitleFilterChain(
   const fontSize = calcFontSize(config.videoHeight, config.fontSizeRatio);
   const fontPath = config.fontPath || getDefaultFontPath();
   const bottomMargin = Math.round(config.videoHeight * (config.bottomMarginRatio || 0.06));
+  const boxPadding = Math.round(fontSize * 0.3); // tighter box padding
 
   if (chunks.length === 0) {
     return { filterParts: [], outputLabel: videoInputLabel };
@@ -211,17 +290,18 @@ export function buildSubtitleFilterChain(
   const drawtextBase = [
     `fontfile='${fontPath}'`,
     `fontsize=${fontSize}`,
-    "fontcolor=white",
-    "borderw=3",
-    "bordercolor=black",
-    "shadowcolor=black",
-    "shadowx=2",
-    "shadowy=2",
+    "fontcolor=white@0.95",
+    "borderw=2",
+    "bordercolor=black@0.7",
+    "shadowcolor=black@0.6",
+    "shadowx=1",
+    "shadowy=1",
     "x=(w-text_w)/2",
     `y=${yPos}`,
     "box=1",
-    "boxcolor=black@0.5",
-    "boxborderw=10",
+    "boxcolor=black@0.45",
+    `boxborderw=${boxPadding}`,
+    "line_spacing=4",
   ].join(":");
 
   let prevLabel = videoInputLabel;
@@ -231,14 +311,13 @@ export function buildSubtitleFilterChain(
     const isLast = i === chunks.length - 1;
     const outLabel = isLast ? `${videoInputLabel}_sub` : `${videoInputLabel}_s${i}`;
 
-    // Escape for FFmpeg drawtext: handle single quotes, special chars
     const escapedText = chunk.text
-      .replace(/\\/g, "\\\\")   // backslash first
-      .replace(/'/g, "'\\\\''") // single quote: close string, escaped quote, reopen  
-      .replace(/:/g, "\\:")     // colon escape
-      .replace(/%/g, "\\%")     // percent escape
-      .replace(/\n/g, " ")      // newlines to spaces
-      .replace(/\r/g, "");      // remove carriage returns
+      .replace(/\\/g, "\\\\")
+      .replace(/'/g, "'\\\\''")
+      .replace(/:/g, "\\:")
+      .replace(/%/g, "\\%")
+      .replace(/\n/g, " ")
+      .replace(/\r/g, "");
 
     const filter = `[${prevLabel}]drawtext=${drawtextBase}:text='${escapedText}':enable='between(t\\,${chunk.startTime}\\,${chunk.endTime})' [${outLabel}]`;
 
@@ -254,21 +333,14 @@ export function buildSubtitleFilterChain(
 
 export function getDefaultFontPath(): string {
   if (process.platform === "win32") {
-    return "C\\:/Windows/Fonts/msyh.ttc";
+    return String.fromCharCode(67, 92, 58) + "/Windows/Fonts/msyh.ttc";
   }
   return "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc";
 }
 
 export function estimateAudioDuration(text: string): number {
-  const chineseCount = (text.match(/[\u4e00-\u9fff]/g) || []).length;
-  const otherCount = text.length - chineseCount;
-
   if (text.length === 0) return 1;
-
-  const chineseSecs = chineseCount / 4;
-  const otherSecs = otherCount / 12;
-
-  return Math.max(1, chineseSecs + otherSecs);
+  return estimateSpeechDuration(text);
 }
 
 export async function getAudioDuration(filePath: string): Promise<number> {

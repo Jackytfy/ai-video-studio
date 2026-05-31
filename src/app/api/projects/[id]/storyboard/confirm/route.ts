@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { requireSession, unauthorized } from "@/lib/auth/session";
-import { searchVideos } from "@/lib/materials/pexels";
+import { searchMaterialsForScene, type SceneSearchContext } from "@/lib/materials/search-engine";
 import { renderProjectInline } from "@/lib/render/pipeline";
 
 export async function POST(
@@ -40,38 +40,69 @@ export async function POST(
       data: { status: "PRODUCING" },
     });
 
-    // Auto-search and assign materials for each scene
+    // Auto-search and assign materials for each scene using smart search engine
     const pexelsApiKey = process.env.PEXELS_API_KEY;
     if (!pexelsApiKey) {
       console.warn("PEXELS_API_KEY not configured — skipping material search, scenes will use placeholders");
     }
+
     for (const scene of storyboard.scenes) {
-      if (!scene.materialQuery || scene.materialId) continue;
-      if (!pexelsApiKey) continue;
+      if (scene.materialId) {
+        console.log(`[Confirm] Scene ${scene.sceneNumber}: already has material, skipping`);
+        continue;
+      }
+      if (!scene.materialQuery) {
+        console.warn(`[Confirm] Scene ${scene.sceneNumber}: no materialQuery, skipping`);
+        continue;
+      }
+      if (!pexelsApiKey) {
+        console.warn(`[Confirm] Scene ${scene.sceneNumber}: no PEXELS_API_KEY, skipping`);
+        continue;
+      }
 
       try {
-        const videos = await searchVideos(scene.materialQuery, 3);
-        if (videos.length === 0) continue;
+        // Parse productionMeta to get English keywords
+        let materialQueryEn: string | undefined;
+        if (scene.productionMeta) {
+          try {
+            const meta = JSON.parse(scene.productionMeta);
+            materialQueryEn = meta.materialQueryEn;
+          } catch {}
+        }
 
-        const best = videos[0];
-        const bestFile = best.video_files.find((f) => f.quality === "hd") || best.video_files[0];
-        if (!bestFile) continue;
+        console.log(`[Confirm] Scene ${scene.sceneNumber}: searching material (query="${scene.materialQuery.substring(0, 40)}", en="${materialQueryEn || 'N/A'}")`);
+
+        const searchCtx: SceneSearchContext = {
+          sceneNumber: scene.sceneNumber,
+          materialQuery: scene.materialQuery,
+          materialQueryEn,
+          visualDesc: scene.visualDesc,
+        };
+
+        const results = await searchMaterialsForScene(searchCtx, 3);
+        if (results.length === 0) {
+          console.warn(`[Confirm] Scene ${scene.sceneNumber}: no material found`);
+          continue;
+        }
+
+        const best = results[0];
+        console.log(`[Confirm] Scene ${scene.sceneNumber}: found material from ${best.platform} (${best.type}, ${best.width}x${best.height}, score=${best.matchScore})`);
 
         const material = await prisma.material.create({
           data: {
             projectId: id,
             name: `Scene ${scene.sceneNumber} - ${scene.materialQuery}`,
-            type: "VIDEO",
+            type: best.type,
             source: "STOCK_FOOTAGE",
-            fileUrl: bestFile.link,
-            thumbnailUrl: best.image,
-            width: bestFile.width,
-            height: bestFile.height,
+            fileUrl: best.fileUrl,
+            thumbnailUrl: best.thumbnailUrl,
+            width: best.width,
+            height: best.height,
             duration: best.duration,
-            externalId: String(best.id),
-            externalSource: "pexels",
-            searchQuery: scene.materialQuery,
-            matchScore: 1.0,
+            externalId: best.externalId,
+            externalSource: best.platform,
+            searchQuery: best.searchQuery,
+            matchScore: best.matchScore,
           },
         });
 
@@ -80,7 +111,7 @@ export async function POST(
           data: { materialId: material.id },
         });
       } catch (err) {
-        console.error(`Material search failed for scene ${scene.sceneNumber}:`, err);
+        console.error(`[Confirm] Scene ${scene.sceneNumber} material search failed:`, err);
       }
     }
 

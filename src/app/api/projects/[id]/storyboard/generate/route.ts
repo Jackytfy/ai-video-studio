@@ -3,6 +3,7 @@ import { z } from "zod";
 import { prisma } from "@/lib/db";
 import { requireSession, unauthorized } from "@/lib/auth/session";
 import { generateStoryboard, buildProviderConfig } from "@/lib/ai";
+import { estimateAudioDuration } from "@/lib/render/subtitle";
 
 const generateSchema = z.object({
   plan: z.enum(["A", "B"]),
@@ -50,16 +51,23 @@ export async function POST(
         totalWords: result.totalWords,
         status: "READY",
         scenes: {
-          create: result.scenes.map((s) => ({
-            sceneNumber: s.sceneNumber,
-            title: s.title,
-            sceneType: s.sceneType === "ANIMATION" ? "ANIMATION" : "REAL_FOOTAGE",
-            voiceoverText: s.voiceoverText,
-            visualDesc: s.visualDesc,
-            materialQuery: s.materialQuery,
-            wordCount: s.wordCount,
-            estimatedDuration: s.wordCount / 4,
-          })),
+          create: result.scenes.map((s) => {
+            const meta: Record<string, unknown> = {};
+            if (s.scripts && s.scripts.length > 0) meta.scripts = s.scripts;
+            if (s.materialQueryEn) meta.materialQueryEn = s.materialQueryEn;
+
+            return {
+              sceneNumber: s.sceneNumber,
+              title: s.title,
+              sceneType: s.sceneType === "ANIMATION" ? "ANIMATION" : "REAL_FOOTAGE",
+              voiceoverText: s.voiceoverText,
+              visualDesc: s.visualDesc,
+              materialQuery: s.materialQuery,
+              wordCount: s.wordCount,
+              estimatedDuration: estimateAudioDuration(s.voiceoverText),
+              productionMeta: Object.keys(meta).length > 0 ? JSON.stringify(meta) : null,
+            };
+          }),
         },
       },
       include: { scenes: true },

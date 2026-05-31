@@ -34,7 +34,9 @@ export interface SceneInput {
   voiceoverText: string;
   visualDesc: string;
   materialQuery: string;
+  materialQueryEn?: string;
   wordCount: number;
+  scripts?: string[];
 }
 
 export interface StoryboardResult {

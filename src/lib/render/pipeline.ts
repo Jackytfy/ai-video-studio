@@ -12,6 +12,7 @@ import {
   getAudioDuration,
   type SubtitleConfig,
 } from "./subtitle";
+import { searchMaterialsForScene } from "@/lib/materials/search-engine";
 
 const execFileAsync = promisify(execFile);
 
@@ -114,7 +115,8 @@ export async function renderProjectInline(
           }
         }
       } else {
-        // Edge TTS
+        // Edge TTS with robust fallback
+        let ttsOk = false;
         try {
           await execFileAsync("python", [
             "-m", "edge_tts",
@@ -123,20 +125,36 @@ export async function renderProjectInline(
             "--volume", "+0%",
             "--text", scene.voiceoverText,
             "--write-media", audioFile,
-          ], { timeout: 30000 });
+          ], { timeout: 60000 });
+          ttsOk = true;
         } catch (e) {
-          console.error(`TTS failed for scene ${i}:`, e);
-          // Create silent audio fallback (use mp3 codec for .mp3 container)
-          await execFileAsync("ffmpeg", [
-            "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-            "-t", "5", "-c:a", "libmp3lame", "-b:a", "128k", audioFile,
-          ], { timeout: 10000 });
+          console.error(`[Render] TTS failed for scene ${i}:`, e instanceof Error ? e.message : e);
+        }
+        
+        if (!ttsOk) {
+          try {
+            await execFileAsync("ffmpeg", [
+              "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+              "-t", "5", "-c:a", "libmp3lame", "-b:a", "128k", audioFile,
+            ], { timeout: 10000 });
+          } catch (ffErr) {
+            console.error(`[Render] Silent audio fallback failed for scene ${i}:`, ffErr);
+            // Last resort: write minimal silent mp3 via Node
+            const { writeFile } = await import("fs/promises");
+            // Minimal valid MP3 frame (silence, 44100Hz stereo)
+            const silentMp3 = Buffer.from([
+              0xFF,0xFB,0x90,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+              0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+              0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            ]);
+            await writeFile(audioFile, silentMp3).catch(() => {});
+          }
         }
       }
 
       await prisma.scene.update({
         where: { id: scene.id },
-        data: { audioUrl: audioFile, audioDuration: scene.voiceoverText.length / 4 },
+        data: { audioUrl: audioFile, audioDuration: estimateAudioDuration(scene.voiceoverText) },
       });
     }
 
@@ -149,47 +167,146 @@ export async function renderProjectInline(
     for (let i = 0; i < scenes.length; i++) {
       const scene = scenes[i];
       const materialFile = join(workDir, `scene-${i}.mp4`);
+      let materialLoaded = false;
+
+      // Auto-search materials if none attached
+      if (!scene.materialId && scene.materialQuery) {
+        try {
+          console.log(`[Render] Scene ${i} auto-searching materials: "${scene.materialQuery.slice(0, 50)}"`);
+          const searchResults = await searchMaterialsForScene({
+            sceneNumber: scene.sceneNumber,
+            materialQuery: scene.materialQuery,
+            visualDesc: scene.visualDesc || undefined,
+          }, 1);
+
+          if (searchResults.length > 0) {
+            const best = searchResults[0];
+            const material = await prisma.material.create({
+              data: {
+                projectId,
+                name: `${best.platform}_${best.externalId}`,
+                type: best.type,
+                source: best.source,
+                fileUrl: best.fileUrl,
+                thumbnailUrl: best.thumbnailUrl || undefined,
+                width: best.width,
+                height: best.height,
+                duration: best.duration || null,
+                externalId: best.externalId,
+                externalSource: best.platform,
+                searchQuery: best.searchQuery,
+                matchScore: best.matchScore,
+              },
+            });
+
+            // Attach material to scene
+            await prisma.scene.update({
+              where: { id: scene.id },
+              data: { materialId: material.id },
+            });
+
+            scene.materialId = material.id;
+            console.log(`[Render] Scene ${i} auto-matched: ${best.platform} ${best.type} (score: ${best.matchScore.toFixed(2)})`);
+          }
+        } catch (err) {
+          console.warn(`[Render] Scene ${i} auto-search failed:`, err instanceof Error ? err.message : err);
+        }
+      }
 
       if (scene.materialId) {
         const material = await prisma.material.findUnique({
           where: { id: scene.materialId },
         });
         if (material) {
-          try {
-            const res = await fetch(material.fileUrl);
-            if (res.ok) {
-              const ext = material.type === "VIDEO" ? "mp4" : "jpg";
-              const localPath = join(workDir, `src-${i}.${ext}`);
-              await writeFile(localPath, Buffer.from(await res.arrayBuffer()));
+          const ext = material.type === "VIDEO" ? "mp4" : "jpg";
+          const localPath = join(workDir, `src-${i}.${ext}`);
 
+          // Try download with retry (Pexels CDN can be flaky)
+          for (let attempt = 0; attempt < 3 && !materialLoaded; attempt++) {
+            try {
+              if (attempt > 0) {
+                console.log(`[Render] Scene ${i} material download retry ${attempt}`);
+                await new Promise(r => setTimeout(r, 1000 * attempt));
+              }
+
+              const res = await fetch(material.fileUrl, {
+                signal: AbortSignal.timeout(30000),
+                headers: { "User-Agent": "Mozilla/5.0" },
+              });
+
+              if (!res.ok) {
+                console.warn(`[Render] Scene ${i} material HTTP ${res.status} from ${material.fileUrl.substring(0, 80)}`);
+                continue;
+              }
+
+              const buffer = Buffer.from(await res.arrayBuffer());
+              if (buffer.length < 1000) {
+                console.warn(`[Render] Scene ${i} material too small (${buffer.length} bytes)`);
+                continue;
+              }
+
+              await writeFile(localPath, buffer);
+              console.log(`[Render] Scene ${i} material downloaded: ${(buffer.length / 1024).toFixed(0)}KB`);
+
+              // Watermark removal: crop edges for non-stock or watermark-prone sources
+              let processedPath = localPath;
+              const needsWatermarkRemoval =
+                (material.source !== "STOCK_FOOTAGE" && material.source !== "AI_GENERATED") ||
+                material.externalSource === "bilibili" ||
+                material.externalSource === "douyin";
+              if (needsWatermarkRemoval) {
+                const cleanPath = join(workDir, `clean-${i}.${ext}`);
+                try {
+                  await execFileAsync("ffmpeg", [
+                    "-y", "-i", localPath,
+                    "-vf", "crop=iw*0.96:ih*0.96:iw*0.02:ih*0.02",
+                    "-c:v", "libx264", "-preset", "fast", "-q:v", "2",
+                    cleanPath,
+                  ], { timeout: 30000 });
+                  processedPath = cleanPath;
+                } catch {}
+              }
+
+              // Convert to scene video
               if (ext === "jpg") {
                 await execFileAsync("ffmpeg", [
-                  "-y", "-loop", "1", "-i", localPath,
+                  "-y", "-loop", "1", "-i", processedPath,
                   "-c:v", "libx264", "-t", "5", "-pix_fmt", "yuv420p",
                   "-vf", `scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2`,
                   "-an", materialFile,
-                ], { timeout: 30000 }).catch(() => {});
+                ], { timeout: 30000 });
               } else {
                 await execFileAsync("ffmpeg", [
-                  "-y", "-i", localPath,
+                  "-y", "-i", processedPath,
                   "-c:v", "libx264", "-preset", "fast",
                   "-vf", `scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2`,
                   "-an", materialFile,
-                ], { timeout: 60000 }).catch(() => {});
+                ], { timeout: 60000 });
               }
-              continue;
+              materialLoaded = true;
+              console.log(`[Render] Scene ${i} material processed OK`);
+            } catch (err) {
+              console.error(`[Render] Scene ${i} material attempt ${attempt} failed:`, err instanceof Error ? err.message : err);
             }
-          } catch {}
+          }
+        } else {
+          console.warn(`[Render] Scene ${i} material record not found: ${scene.materialId}`);
         }
+      } else {
+        console.warn(`[Render] Scene ${i} has no materialId`);
       }
 
-      // Fallback: black placeholder (long enough, will be trimmed to audio duration)
-      await execFileAsync("ffmpeg", [
-        "-y", "-f", "lavfi", "-i",
-        `color=c=black:s=${config.width}x${config.height}:d=60`,
-        "-c:v", "libx264", "-t", "60", "-pix_fmt", "yuv420p",
-        "-an", materialFile,
-      ], { timeout: 15000 }).catch(() => {});
+      if (!materialLoaded) {
+        console.warn(`[Render] Scene ${i} using black placeholder`);
+        // Use scene title or voiceover text as on-screen text instead of pure black
+        const sceneTitle = scene.title || `场景 ${scene.sceneNumber}`;
+        await execFileAsync("ffmpeg", [
+          "-y", "-f", "lavfi", "-i",
+          `color=c=0x1a1a2e:s=${config.width}x${config.height}:d=60`,
+          "-c:v", "libx264", "-t", "60", "-pix_fmt", "yuv420p",
+          "-an", materialFile,
+        ], { timeout: 15000 });
+      }
     }
 
     // Compose stage
@@ -227,10 +344,20 @@ export async function renderProjectInline(
       let hasAudio = true;
       try { await readFile(audioFile); } catch { hasAudio = false; }
       if (!hasAudio) {
-        await execFileAsync("ffmpeg", [
-          "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-          "-t", "5", "-c:a", "libmp3lame", "-b:a", "128k", audioFile,
-        ], { timeout: 10000 });
+        try {
+          await execFileAsync("ffmpeg", [
+            "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+            "-t", "5", "-c:a", "libmp3lame", "-b:a", "128k", audioFile,
+          ], { timeout: 10000 });
+        } catch {
+          // Last resort minimal MP3
+          const silentMp3 = Buffer.from([
+            0xFF,0xFB,0x90,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+          ]);
+          await writeFile(audioFile, silentMp3).catch(() => {});
+        }
       }
 
       inputArgs.push("-i", materialFile, "-i", audioFile);
@@ -254,13 +381,25 @@ export async function renderProjectInline(
         `[${audioIdx}:a]volume=2.0,aresample=44100,atrim=0:${audioDuration},asetpts=PTS-STARTPTS[a${i}]`
       );
 
-      // Subtitles: auto-adapt fontsize, line-break by punctuation, sync with actual audio duration
+      // Subtitles: use productionMeta.scripts for per-script chunking, auto-adapt fontsize
+      let scripts: string[] | undefined;
+      if (scenes[i].productionMeta) {
+        try {
+          const meta = JSON.parse(scenes[i].productionMeta as string);
+          if (meta.scripts?.length) scripts = meta.scripts;
+        } catch {}
+      }
+
       const subtitleConfig: SubtitleConfig = {
         videoWidth: config.width,
         videoHeight: config.height,
         audioDuration,
       };
-      const subtitleChunks = generateSubtitleChunks(scenes[i].voiceoverText, subtitleConfig);
+      const subtitleChunks = generateSubtitleChunks(
+        scenes[i].voiceoverText,
+        subtitleConfig,
+        scripts
+      );
       const { filterParts: subFilters, outputLabel: subLabel } = buildSubtitleFilterChain(
         `v${i}`,
         subtitleChunks,

@@ -71,17 +71,22 @@ ${text}
 ${planDescription}
 
 ## 分镜要求
-请将文稿拆分为${sceneCount}个场景，每个场景包含：
+请将文稿拆分为${sceneCount}个场景，每个场景包含以下字段：
+
 1. **场景标题** (title): 简短描述场景主题
 2. **画面类型** (sceneType): REAL_FOOTAGE（实拍素材）或 ANIMATION（动画素材）
-3. **口播脚本** (voiceoverText): 该场景的配音文案，自然流畅的口语化表达
-4. **画面描述** (visualDesc): 画面内容描述，用于素材匹配
-5. **素材检索词** (materialQuery): 英文关键词，用于检索素材库
+3. **口播脚本** (voiceoverText): 该场景的完整配音文案，自然流畅的口语化表达，80-150字
+4. **画面描述** (visualDesc): 只描述观众在屏幕上看到的画面内容（人物外观、场景环境、光影、镜头运动、画面构图），不要包含任何口播/旁白文字，至少30字。例如："金色铠甲武士骑马立于古城墙上，城下旌旗密布、千军万马列阵。镜头从大全景缓缓推近至武士面部特写，逆光剪影，天空阴云密布"
+5. **素材检索词** (materialQuery): 用于在Bilibili等视频平台搜索素材的关键词，要具体、可搜索。格式："核心画面内容 + 时代/风格 + 镜头类型"。例如："古代战场骑兵冲锋 航拍"、"紫禁城太和殿 空镜"、"明朝朝堂议事 电视剧片段"。不要用抽象描述（如"色调偏冷峻"），要用具体可搜索的名词。
+6. **口播分段** (scripts): 将口播脚本按语义拆分为2-4个自然段落，每段15-40字，用于分段展示
+7. **英文检索词** (materialQueryEn): materialQuery对应的英文关键词，用于Pexels搜索，2-4个具体英文单词。例如："ancient battle cavalry charge"、"forbidden city aerial"、"chinese palace throne room"
 
 ## 注意事项
 - 口播脚本要自然流畅，适合配音朗读
 - 每个场景的口播文案控制在80-150字
-- 画面描述要具体，便于素材匹配
+- 画面描述只写观众看到的画面（人物外貌、场景、光影、镜头运动），不要包含任何旁白/口播/解说文字
+- 画面描述和口播脚本必须严格分开：画面描述=看到什么，口播脚本=听到什么
+- 素材检索词要详细，包含内容+色调+风格+氛围，用于精准匹配素材
 - 场景之间要有逻辑连贯性
 - 优先使用实拍素材，动画仅用于抽象概念解释
 
@@ -94,9 +99,11 @@ ${planDescription}
       "sceneNumber": 1,
       "title": "场景标题",
       "sceneType": "REAL_FOOTAGE",
-      "voiceoverText": "口播文案",
-      "visualDesc": "画面描述",
-      "materialQuery": "english search keywords"
+      "voiceoverText": "完整的口播文案，自然连贯...",
+      "visualDesc": "详细的画面描述，包含人物、环境、镜头运动、光影效果...",
+      "materialQuery": "中文素材检索条件，包含内容+色调+风格+氛围",
+      "materialQueryEn": "english keywords for stock footage search",
+      "scripts": ["口播分段1", "口播分段2", "口播分段3"]
     }
   ],
   "totalWords": 1200,

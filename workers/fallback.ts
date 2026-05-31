@@ -1,7 +1,7 @@
 import puppeteer from "puppeteer-core";
 import { execFile } from "child_process";
 import { promisify } from "util";
-import { writeFile, unlink, access } from "fs/promises";
+import { writeFile, unlink, access, readFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { randomUUID } from "crypto";
@@ -79,6 +79,22 @@ export async function fallbackMaterial(
 
     tmpImage = join(tmpdir(), `fallback-${randomUUID()}.jpg`);
     await writeFile(tmpImage, imageBuffer);
+
+    // Watermark removal: crop 2% from each edge to remove potential watermarks
+    const croppedImage = join(tmpdir(), `fallback-crop-${randomUUID()}.jpg`);
+    try {
+      await execFileAsync("ffmpeg", [
+        "-y", "-i", tmpImage,
+        "-vf", "crop=iw*0.96:ih*0.96:iw*0.02:ih*0.02",
+        "-q:v", "2", croppedImage,
+      ], { timeout: 10000 });
+      // Use cropped image if successful
+      await unlink(tmpImage).catch(() => {});
+      tmpImage = croppedImage;
+    } catch {
+      // If crop fails, use original
+      await unlink(croppedImage).catch(() => {});
+    }
 
     await execFileAsync("ffmpeg", [
       "-y",

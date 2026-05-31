@@ -14,6 +14,7 @@ const envSchema = z.object({
   AZURE_TTS_KEY: z.string().optional(),
   AZURE_TTS_REGION: z.string().optional(),
   PEXELS_API_KEY: z.string().optional(),
+  PIXABAY_API_KEY: z.string().optional(),
   NEXTAUTH_SECRET: z.string(),
   NEXTAUTH_URL: z.string().url(),
 });

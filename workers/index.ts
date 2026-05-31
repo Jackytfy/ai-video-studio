@@ -126,7 +126,7 @@ async function processTTS(job: Job<RenderJobData>) {
       scene.audioUrl = url;
       await prisma.scene.update({
         where: { id: scene.id },
-        data: { audioUrl: url, audioDuration: scene.voiceoverText.length / 4 },
+        data: { audioUrl: url, audioDuration: estimateAudioDuration(scene.voiceoverText) },
       });
     } else {
       const tmpFile = join(tmpdir(), `tts-${randomUUID()}.mp3`);
@@ -145,7 +145,7 @@ async function processTTS(job: Job<RenderJobData>) {
         scene.audioUrl = url;
         await prisma.scene.update({
           where: { id: scene.id },
-          data: { audioUrl: url, audioDuration: scene.voiceoverText.length / 4 },
+          data: { audioUrl: url, audioDuration: estimateAudioDuration(scene.voiceoverText) },
         });
       } finally {
         await unlink(tmpFile).catch(() => {});
@@ -167,6 +167,7 @@ async function processMaterials(job: Job<RenderJobData>) {
     await job.updateProgress({ stage: "MATERIALS_LOADING", progress: ((i + 1) / scenes.length) * 100 });
 
     const materialFile = join(workDir, `scene-${i}.mp4`);
+    let materialLoaded = false;
 
     // Priority 1: Download from Pexels material
     if (scene.materialId) {
@@ -174,33 +175,77 @@ async function processMaterials(job: Job<RenderJobData>) {
       if (material) {
         const ext = material.type === "VIDEO" ? "mp4" : "jpg";
         const localPath = join(workDir, `scene-${i}.${ext}`);
-        try {
-          const res = await fetch(material.fileUrl);
-          if (res.ok) {
-            await writeFile(localPath, Buffer.from(await res.arrayBuffer()));
+
+        for (let attempt = 0; attempt < 3 && !materialLoaded; attempt++) {
+          try {
+            if (attempt > 0) {
+              console.log(`[Worker] Scene ${i} download retry ${attempt}`);
+              await new Promise(r => setTimeout(r, 1000 * attempt));
+            }
+
+            const res = await fetch(material.fileUrl, {
+              signal: AbortSignal.timeout(30000),
+              headers: { "User-Agent": "Mozilla/5.0" },
+            });
+
+            if (!res.ok) {
+              console.warn(`[Worker] Scene ${i} HTTP ${res.status} from ${material.fileUrl.substring(0, 80)}`);
+              continue;
+            }
+
+            const buffer = Buffer.from(await res.arrayBuffer());
+            if (buffer.length < 1000) {
+              console.warn(`[Worker] Scene ${i} too small (${buffer.length} bytes)`);
+              continue;
+            }
+
+            await writeFile(localPath, buffer);
+            console.log(`[Worker] Scene ${i} downloaded: ${(buffer.length / 1024).toFixed(0)}KB`);
+
             if (ext === "jpg" && materialFile !== localPath) {
-              // Convert still image to video clip
               await execFileAsync("ffmpeg", [
                 "-y", "-loop", "1", "-i", localPath,
                 "-c:v", "libx264", "-t", "5", "-pix_fmt", "yuv420p",
                 "-vf", `scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,zoompan=z='if(eq(on,1),1.0,min(zoom+0.003,1.15))':d=${config.fps * 5}:fps=${config.fps}`,
                 "-an", materialFile,
-              ], { timeout: 30000 }).catch(() => { });
-              await unlink(localPath).catch(() => { });
+              ], { timeout: 30000 });
+              await unlink(localPath).catch(() => {});
+            } else {
+              await execFileAsync("ffmpeg", [
+                "-y", "-i", localPath,
+                "-c:v", "libx264", "-preset", "fast",
+                "-vf", `scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2`,
+                "-an", materialFile,
+              ], { timeout: 60000 });
             }
-            continue;
+            materialLoaded = true;
+            console.log(`[Worker] Scene ${i} material processed OK`);
+          } catch (err) {
+            console.error(`[Worker] Scene ${i} attempt ${attempt} failed:`, err instanceof Error ? err.message : err);
           }
-        } catch { }
+        }
+      } else {
+        console.warn(`[Worker] Scene ${i} material record not found: ${scene.materialId}`);
+      }
+    } else {
+      console.warn(`[Worker] Scene ${i} has no materialId`);
+    }
+
+    if (!materialLoaded) {
+      // Priority 2: Puppeteer web search fallback
+      const searchQuery = scene.visualDesc || scene.materialQuery || `scene ${scene.sceneNumber}`;
+      console.log(`[Worker] Scene ${i} trying fallback search: "${searchQuery.substring(0, 40)}"`);
+      try {
+        await fallbackMaterial(searchQuery, materialFile, config);
+        materialLoaded = true;
+        console.log(`[Worker] Scene ${i} fallback material OK`);
+      } catch (err) {
+        console.error(`[Worker] Scene ${i} fallback failed:`, err instanceof Error ? err.message : err);
       }
     }
 
-    // Priority 2: Puppeteer web search fallback
-    const searchQuery = scene.visualDesc || scene.materialQuery || `scene ${scene.sceneNumber}`;
-    try {
-      await fallbackMaterial(searchQuery, materialFile, config);
-    } catch (err) {
-      console.error(`Fallback material failed for scene ${scene.sceneNumber}:`, err);
-      // Priority 3: compose stage will generate black placeholder
+    if (!materialLoaded) {
+      console.warn(`[Worker] Scene ${i} using black placeholder`);
     }
   }
 }

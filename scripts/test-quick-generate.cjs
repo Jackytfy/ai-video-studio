@@ -5,7 +5,7 @@
  * 使用方法：node scripts/test-quick-generate.cjs
  */
 
-const BASE = process.env.TEST_PORT ? `http://localhost:${process.env.TEST_PORT}` : "http://localhost:3002";
+const BASE = process.env.TEST_PORT ? `http://localhost:${process.env.TEST_PORT}` : "http://localhost:3001";
 
 const TEST_TEXT = `人工智能正在改变我们的生活方式。从智能手机到自动驾驶，AI技术已经渗透到日常的方方面面。语音助手可以帮我们设置闹钟、播放音乐，甚至控制家电。这些便利让我们的生活更加高效。
 
