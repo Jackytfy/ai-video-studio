@@ -66,7 +66,8 @@ function displayWidth(text: string): number {
 }
 
 /**
- * Estimate speaking duration for a text segment (Chinese ~4 chars/sec, mixed content).
+ * Estimate speaking duration for a text segment (Chinese ~3.5 chars/sec, mixed content).
+ * Slightly slower rate for better subtitle readability.
  */
 function estimateSpeechDuration(text: string): number {
   const chineseChars = (text.match(/[一-鿿]/g) || []).length;
@@ -74,9 +75,9 @@ function estimateSpeechDuration(text: string): number {
     .replace(/[一-鿿]/g, "")
     .replace(/[，。！？、；：,;!?\s\n"'「」『』【】（）\(\)\[\]·《》—\-\—]/g, "").length;
 
-  const chineseSecs = chineseChars / 4;
-  const nonChineseSecs = nonChineseSpeakable / 6;
-  return Math.max(0.6, chineseSecs + nonChineseSecs);
+  const chineseSecs = chineseChars / 3.5;  // slower: 3.5 chars/sec for better reading
+  const nonChineseSecs = nonChineseSpeakable / 5;
+  return Math.max(0.8, chineseSecs + nonChineseSecs);
 }
 
 /**
@@ -226,15 +227,23 @@ function proportionallyTimeChunks(
     totalDuration = Math.max(1, totalEstimatedDuration);
   }
 
+  // Ensure minimum readable duration: if audio is too fast, stretch
+  const minReadableTotal = lines.length * 1.5; // at least 1.5s per subtitle line
+  if (totalDuration < minReadableTotal) {
+    totalDuration = minReadableTotal;
+  }
+
   const chunks: SubtitleChunk[] = [];
   let timeCursor = 0;
 
   for (let i = 0; i < lines.length; i++) {
     const proportion = lineDurations[i] / totalEstimatedDuration;
-    const chunkDuration = Math.min(
-      proportion * totalDuration * 1.02,
-      proportion * totalDuration + 0.25
-    );
+    let chunkDuration = proportion * totalDuration * 1.02;
+
+    // Minimum per-line: 1.5s or 0.12s per character, whichever is larger
+    const charCount = lines[i].replace(/[^一-鿿a-zA-Z0-9]/g, "").length;
+    const minByLength = Math.max(1.2, charCount * 0.12);
+    chunkDuration = Math.max(chunkDuration, minByLength);
 
     let startTime = timeCursor;
     let endTime = timeCursor + chunkDuration;
@@ -243,17 +252,11 @@ function proportionallyTimeChunks(
       endTime = totalDuration;
     }
 
-    // Ensure minimum display time of 0.7s for readability
-    if (endTime - startTime < 0.7 && lines.length > 1) {
-      endTime = startTime + 0.7;
-    }
-
     endTime = Math.min(endTime, totalDuration);
 
-    // Prevent overshoot: if we'd exceed totalDuration, back-calculate startTime
     if (endTime > totalDuration) {
       endTime = totalDuration;
-      startTime = Math.max(0, totalDuration - lineDurations[i] / totalEstimatedDuration * totalDuration);
+      startTime = Math.max(0, totalDuration - chunkDuration);
     }
 
     chunks.push({

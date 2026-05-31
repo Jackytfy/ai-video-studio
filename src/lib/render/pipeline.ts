@@ -12,7 +12,6 @@ import {
   getAudioDuration,
   type SubtitleConfig,
 } from "./subtitle";
-import { searchMaterialsForScene } from "@/lib/materials/search-engine";
 
 const execFileAsync = promisify(execFile);
 
@@ -164,6 +163,9 @@ export async function renderProjectInline(
       data: { status: "MATERIALS_LOADING", currentStage: "materials" },
     });
 
+    // Pre-resolve Pexels key for speed
+    const pexelsKey = process.env.PEXELS_API_KEY || "";
+
     for (let i = 0; i < scenes.length; i++) {
       const scene = scenes[i];
       const materialFile = join(workDir, `scene-${i}.mp4`);
@@ -172,41 +174,51 @@ export async function renderProjectInline(
       // Auto-search materials if none attached
       if (!scene.materialId && scene.materialQuery) {
         try {
-          console.log(`[Render] Scene ${i} auto-searching materials: "${scene.materialQuery.slice(0, 50)}"`);
-          const searchResults = await searchMaterialsForScene({
-            sceneNumber: scene.sceneNumber,
-            materialQuery: scene.materialQuery,
-            visualDesc: scene.visualDesc || undefined,
-          }, 1);
+          console.log(`[Render] Scene ${i} auto-searching: "${scene.materialQuery.slice(0, 50)}"`);
 
-          if (searchResults.length > 0) {
-            const best = searchResults[0];
-            const material = await prisma.material.create({
-              data: {
-                projectId,
-                name: `${best.platform}_${best.externalId}`,
-                type: best.type,
-                source: best.source,
-                fileUrl: best.fileUrl,
-                thumbnailUrl: best.thumbnailUrl || undefined,
-                width: best.width,
-                height: best.height,
-                duration: best.duration || null,
-                externalId: best.externalId,
-                externalSource: best.platform,
-                searchQuery: best.searchQuery,
-                matchScore: best.matchScore,
-              },
-            });
+          // Direct Pexels search (Bilibili is blocked)
+          const term = scene.materialQuery.replace(/[，。！？、；：\s]+/g, "+").slice(0, 80);
+          const pexRes = await fetch(
+            `https://api.pexels.com/videos/search?query=${encodeURIComponent(term)}&per_page=3`,
+            { headers: { Authorization: pexelsKey } }
+          );
 
-            // Attach material to scene
-            await prisma.scene.update({
-              where: { id: scene.id },
-              data: { materialId: material.id },
-            });
+          if (pexRes.ok) {
+            const pexData = await pexRes.json();
+            const videos = pexData.videos || [];
+            console.log(`[Render] Scene ${i} Pexels found ${videos.length} videos`);
 
-            scene.materialId = material.id;
-            console.log(`[Render] Scene ${i} auto-matched: ${best.platform} ${best.type} (score: ${best.matchScore.toFixed(2)})`);
+            if (videos.length > 0) {
+              const best = videos[0];
+              const bestFile = best.video_files?.find((f: any) => f.width >= 1280) || best.video_files?.[0];
+              if (bestFile) {
+                const material = await prisma.material.create({
+                  data: {
+                    projectId,
+                    name: `pexels_${best.id}`,
+                    type: "VIDEO",
+                    source: "STOCK_FOOTAGE",
+                    fileUrl: bestFile.link,
+                    thumbnailUrl: best.image || "",
+                    width: bestFile.width || 1920,
+                    height: bestFile.height || 1080,
+                    duration: best.duration || null,
+                    externalId: `pexels-${best.id}`,
+                    externalSource: "pexels",
+                    searchQuery: scene.materialQuery.slice(0, 100),
+                    matchScore: 0.8,
+                  },
+                });
+                await prisma.scene.update({
+                  where: { id: scene.id },
+                  data: { materialId: material.id },
+                });
+                scene.materialId = material.id;
+                console.log(`[Render] Scene ${i} material matched: pexels VIDEO`);
+              }
+            }
+          } else {
+            console.warn(`[Render] Scene ${i} Pexels HTTP ${pexRes.status}`);
           }
         } catch (err) {
           console.warn(`[Render] Scene ${i} auto-search failed:`, err instanceof Error ? err.message : err);
@@ -366,22 +378,13 @@ export async function renderProjectInline(
       const audioIdx = i * 2 + 1;
 
       // Get actual audio duration for precise video trim + subtitle sync
-      const actualAudioDuration = await getAudioDuration(audioFile);
-      const audioDuration = actualAudioDuration > 0
-        ? actualAudioDuration
+      const audioFileDuration = await getAudioDuration(audioFile);
+      const originalAudioDuration = audioFileDuration > 0
+        ? audioFileDuration
         : estimateAudioDuration(scenes[i].voiceoverText);
+      let audioDuration = originalAudioDuration;
 
-      // Scale video AND trim to audio duration (prevents gaps/silence)
-      filterParts.push(
-        `[${videoIdx}:v]scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,trim=duration=${audioDuration},setpts=PTS-STARTPTS[v${i}]`
-      );
-
-      // Normalize audio: boost volume + resample to 44100Hz stereo, trim to actual duration
-      filterParts.push(
-        `[${audioIdx}:a]volume=2.0,aresample=44100,atrim=0:${audioDuration},asetpts=PTS-STARTPTS[a${i}]`
-      );
-
-      // Subtitles: use productionMeta.scripts for per-script chunking, auto-adapt fontsize
+      // Generate subtitles FIRST to calculate required display time
       let scripts: string[] | undefined;
       if (scenes[i].productionMeta) {
         try {
@@ -400,6 +403,37 @@ export async function renderProjectInline(
         subtitleConfig,
         scripts
       );
+
+      // Ensure video lasts at least as long as subtitles need
+      const lastSubEnd = subtitleChunks.length > 0
+        ? subtitleChunks[subtitleChunks.length - 1].endTime
+        : 0;
+      if (lastSubEnd > audioDuration) {
+        audioDuration = lastSubEnd;
+      }
+
+      // Scale video, adjust speed to match target duration, trim
+      const speedRatio = audioDuration > originalAudioDuration
+        ? (originalAudioDuration / audioDuration).toFixed(4)
+        : "1.0";
+
+      filterParts.push(
+        `[${videoIdx}:v]scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,setpts=${speedRatio}*PTS,trim=duration=${audioDuration},setpts=PTS-STARTPTS[v${i}]`
+      );
+
+      // Audio: stretch to match extended subtitle duration
+      if (audioDuration > originalAudioDuration) {
+        const tempo = (originalAudioDuration / audioDuration).toFixed(4);
+        filterParts.push(
+          `[${audioIdx}:a]volume=1.5,aresample=44100,atrim=0:${originalAudioDuration},atempo=${tempo},asetpts=PTS-STARTPTS[a${i}]`
+        );
+      } else {
+        filterParts.push(
+          `[${audioIdx}:a]volume=2.0,aresample=44100,atrim=0:${audioDuration},asetpts=PTS-STARTPTS[a${i}]`
+        );
+      }
+
+      // Build subtitle filter chain from pre-generated chunks
       const { filterParts: subFilters, outputLabel: subLabel } = buildSubtitleFilterChain(
         `v${i}`,
         subtitleChunks,
@@ -407,13 +441,11 @@ export async function renderProjectInline(
       );
       filterParts.push(...subFilters);
 
-      // Update scene with actual audio duration for accuracy
-      if (actualAudioDuration > 0) {
-        await prisma.scene.update({
-          where: { id: scenes[i].id },
-          data: { audioDuration: actualAudioDuration },
-        });
-      }
+      // Update scene with final duration (may be extended for subtitle readability)
+      await prisma.scene.update({
+        where: { id: scenes[i].id },
+        data: { audioDuration },
+      });
 
       totalDuration += audioDuration;
 
