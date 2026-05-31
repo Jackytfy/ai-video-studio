@@ -16,6 +16,7 @@ interface Scene {
   voiceoverText: string;
   visualDesc: string;
   materialQuery: string;
+  productionMeta?: string | null;
   wordCount: number | null;
   estimatedDuration: number | null;
 }

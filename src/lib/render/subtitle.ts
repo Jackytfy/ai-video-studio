@@ -231,13 +231,14 @@ export function buildSubtitleFilterChain(
     const isLast = i === chunks.length - 1;
     const outLabel = isLast ? `${videoInputLabel}_sub` : `${videoInputLabel}_s${i}`;
 
-    // Remove characters that FFmpeg drawtext can't handle
-    const cleanText = chunk.text
-      .replace(/\n/g, " ")   // newlines to spaces
-      .replace(/\r/g, "");   // remove carriage returns
-
-    // Escape for FFmpeg drawtext (must happen AFTER cleaning)
-    const escapedText = escapeDrawtext(cleanText);
+    // Escape for FFmpeg drawtext: handle single quotes, special chars
+    const escapedText = chunk.text
+      .replace(/\\/g, "\\\\")   // backslash first
+      .replace(/'/g, "'\\\\''") // single quote: close string, escaped quote, reopen  
+      .replace(/:/g, "\\:")     // colon escape
+      .replace(/%/g, "\\%")     // percent escape
+      .replace(/\n/g, " ")      // newlines to spaces
+      .replace(/\r/g, "");      // remove carriage returns
 
     const filter = `[${prevLabel}]drawtext=${drawtextBase}:text='${escapedText}':enable='between(t\\,${chunk.startTime}\\,${chunk.endTime})' [${outLabel}]`;
 

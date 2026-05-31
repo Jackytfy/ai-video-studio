@@ -171,6 +171,8 @@ model Scene {
   materialQuery String
   subtitleText  String?
 
+  productionMeta String? // JSON: { scripts[], properNouns[], era, sources[], preference }
+
   wordCount          Int?
   estimatedDuration  Float?
 

@@ -15,9 +15,13 @@ export default function CreatePage() {
   const [voice, setVoice] = useState("yunxi");
   const [contentStyle, setContentStyle] = useState("knowledge");
 
+  const [statusText, setStatusText] = useState("");
+
   const handleSubmit = async (text: string) => {
     setIsLoading(true);
     try {
+      // Step 1: Create project
+      setStatusText("正在创建项目...");
       const response = await fetch("/api/projects", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -30,14 +34,24 @@ export default function CreatePage() {
         }),
       });
 
-      if (response.ok) {
-        const project = await response.json();
-        router.push(`/projects/${project.id}/chat`);
-      }
+      if (!response.ok) throw new Error("创建失败");
+      const project = await response.json();
+
+      // Step 2: Auto-generate storyboard from text (no AI, uses exact user text)
+      setStatusText("正在生成分镜...");
+      const sbRes = await fetch(`/api/projects/${project.id}/quick-generate`, {
+        method: "POST",
+      });
+
+      if (!sbRes.ok) throw new Error("分镜生成失败");
+
+      // Step 3: Auto-redirect to storyboard page
+      setStatusText("完成！跳转中...");
+      router.push(`/projects/${project.id}/storyboard`);
     } catch (error) {
-      console.error("Failed to create project:", error);
-    } finally {
+      console.error("Failed:", error);
       setIsLoading(false);
+      setStatusText("");
     }
   };
 
@@ -62,6 +76,10 @@ export default function CreatePage() {
           />
 
           <TextInputArea onSubmit={handleSubmit} isLoading={isLoading} />
+
+          {statusText && (
+            <p className="text-center text-sm text-purple animate-pulse">{statusText}</p>
+          )}
 
           <ContentTags selected={contentStyle} onSelect={setContentStyle} />
         </div>

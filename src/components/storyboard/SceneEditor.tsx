@@ -11,6 +11,7 @@ interface Scene {
   voiceoverText: string;
   visualDesc: string;
   materialQuery: string;
+  productionMeta?: string | null;
   wordCount: number | null;
   estimatedDuration: number | null;
 }
@@ -28,6 +29,7 @@ export function SceneEditor({ scene, onSave, onClose, isSaving }: SceneEditorPro
   const [visualDesc, setVisualDesc] = useState(scene.visualDesc);
   const [materialQuery, setMaterialQuery] = useState(scene.materialQuery);
   const [sceneType, setSceneType] = useState(scene.sceneType);
+  const [productionMeta, setProductionMeta] = useState(scene.productionMeta || "");
 
   const handleSave = () => {
     onSave(scene.id, {
@@ -36,6 +38,7 @@ export function SceneEditor({ scene, onSave, onClose, isSaving }: SceneEditorPro
       visualDesc,
       materialQuery,
       sceneType,
+      productionMeta: productionMeta || null,
       wordCount: voiceoverText.length,
       estimatedDuration: voiceoverText.length / 4,
     });
@@ -43,19 +46,17 @@ export function SceneEditor({ scene, onSave, onClose, isSaving }: SceneEditorPro
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
-      <div className="bg-card border border-border rounded-xl w-full max-w-2xl max-h-[85vh] overflow-y-auto m-4">
+      <div className="bg-card border border-border rounded-xl w-full max-w-3xl max-h-[92vh] overflow-y-auto m-4">
         <div className="flex items-center justify-between p-5 border-b border-border">
           <h2 className="font-semibold">编辑场景 {scene.sceneNumber}</h2>
-          <button
-            onClick={onClose}
-            className="p-1 hover:bg-secondary rounded transition-colors"
-          >
+          <button onClick={onClose} className="p-1 hover:bg-secondary rounded transition-colors">
             <X className="w-4 h-4" />
           </button>
         </div>
 
         <div className="p-5 space-y-4">
-          <div className="grid grid-cols-2 gap-4">
+          {/* Row 1 */}
+          <div className="grid grid-cols-3 gap-4">
             <div className="space-y-2">
               <label className="text-sm font-medium">场景标题</label>
               <input
@@ -74,23 +75,34 @@ export function SceneEditor({ scene, onSave, onClose, isSaving }: SceneEditorPro
               >
                 <option value="REAL_FOOTAGE">实拍素材</option>
                 <option value="ANIMATION">动画素材</option>
+                <option value="AI_GENERATED">AI 生成</option>
+                <option value="CUSTOM">自定义</option>
               </select>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium">预估时长 (s)</label>
+              <input
+                type="number"
+                value={Math.round(voiceoverText.length / 4)}
+                disabled
+                className="w-full bg-secondary/50 border border-border rounded-lg px-3 py-2 text-sm text-muted-foreground"
+              />
             </div>
           </div>
 
+          {/* 口播脚本 */}
           <div className="space-y-2">
             <label className="text-sm font-medium">口播脚本</label>
             <textarea
               value={voiceoverText}
               onChange={(e) => setVoiceoverText(e.target.value)}
-              rows={4}
+              rows={5}
               className="w-full bg-secondary border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple resize-none"
             />
-            <p className="text-xs text-muted-foreground text-right">
-              {voiceoverText.length} 字
-            </p>
+            <p className="text-xs text-muted-foreground text-right">{voiceoverText.length} 字</p>
           </div>
 
+          {/* 画面描述 */}
           <div className="space-y-2">
             <label className="text-sm font-medium">画面描述</label>
             <textarea
@@ -101,6 +113,7 @@ export function SceneEditor({ scene, onSave, onClose, isSaving }: SceneEditorPro
             />
           </div>
 
+          {/* 素材检索词 */}
           <div className="space-y-2">
             <label className="text-sm font-medium">素材检索词</label>
             <input
@@ -108,6 +121,21 @@ export function SceneEditor({ scene, onSave, onClose, isSaving }: SceneEditorPro
               onChange={(e) => setMaterialQuery(e.target.value)}
               placeholder="English search keywords"
               className="w-full bg-secondary border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple"
+            />
+          </div>
+
+          {/* 制作信息 (JSON) */}
+          <div className="space-y-2">
+            <label className="text-sm font-medium">
+              制作详情 (productionMeta JSON)
+              <span className="text-xs text-muted-foreground ml-2">包含 scripts、properNouns、era、sources、preference</span>
+            </label>
+            <textarea
+              value={productionMeta}
+              onChange={(e) => setProductionMeta(e.target.value)}
+              rows={6}
+              placeholder='{"scripts":[],"properNouns":[],"era":"","sources":[],"preference":""}'
+              className="w-full bg-secondary border border-border rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-purple resize-none"
             />
           </div>
         </div>
