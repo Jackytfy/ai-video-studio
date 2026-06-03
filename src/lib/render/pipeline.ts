@@ -9,11 +9,25 @@ import {
   generateSubtitleChunks,
   buildSubtitleFilterChain,
   estimateAudioDuration,
-  getAudioDuration,
   type SubtitleConfig,
 } from "./subtitle";
 
 const execFileAsync = promisify(execFile);
+
+async function getAudioDuration(filePath: string): Promise<number> {
+  try {
+    const { stdout } = await execFileAsync("ffprobe", [
+      "-v", "error",
+      "-show_entries", "format=duration",
+      "-of", "default=noprint_wrappers=1:nokey=1",
+      filePath,
+    ], { timeout: 5000 });
+    const duration = parseFloat(stdout.trim());
+    return isNaN(duration) ? 0 : duration;
+  } catch {
+    return 0;
+  }
+}
 
 export interface RenderConfig {
   width: number;
@@ -163,65 +177,146 @@ export async function renderProjectInline(
       data: { status: "MATERIALS_LOADING", currentStage: "materials" },
     });
 
-    // Pre-resolve Pexels key for speed
-    const pexelsKey = process.env.PEXELS_API_KEY || "";
-
     for (let i = 0; i < scenes.length; i++) {
       const scene = scenes[i];
       const materialFile = join(workDir, `scene-${i}.mp4`);
       let materialLoaded = false;
 
-      // Auto-search materials if none attached
-      if (!scene.materialId && scene.materialQuery) {
+      // Auto-search materials from Bilibili if none attached
+      if (!scene.materialId) {
         try {
-          console.log(`[Render] Scene ${i} auto-searching: "${scene.materialQuery.slice(0, 50)}"`);
+          // Build multi-tier Chinese keywords for Bilibili search
+          let contentTerms: string[] = [];   // precise: properNouns + title
+          let contextTerms: string[] = [];   // contextual: materialQuery/preference
 
-          // Direct Pexels search (Bilibili is blocked)
-          const term = scene.materialQuery.replace(/[，。！？、；：\s]+/g, "+").slice(0, 80);
-          const pexRes = await fetch(
-            `https://api.pexels.com/videos/search?query=${encodeURIComponent(term)}&per_page=3`,
-            { headers: { Authorization: pexelsKey } }
-          );
+          if (scene.title) contentTerms.push(scene.title);
 
-          if (pexRes.ok) {
-            const pexData = await pexRes.json();
-            const videos = pexData.videos || [];
-            console.log(`[Render] Scene ${i} Pexels found ${videos.length} videos`);
-
-            if (videos.length > 0) {
-              const best = videos[0];
-              const bestFile = best.video_files?.find((f: any) => f.width >= 1280) || best.video_files?.[0];
-              if (bestFile) {
-                const material = await prisma.material.create({
-                  data: {
-                    projectId,
-                    name: `pexels_${best.id}`,
-                    type: "VIDEO",
-                    source: "STOCK_FOOTAGE",
-                    fileUrl: bestFile.link,
-                    thumbnailUrl: best.image || "",
-                    width: bestFile.width || 1920,
-                    height: bestFile.height || 1080,
-                    duration: best.duration || null,
-                    externalId: `pexels-${best.id}`,
-                    externalSource: "pexels",
-                    searchQuery: scene.materialQuery.slice(0, 100),
-                    matchScore: 0.8,
-                  },
-                });
-                await prisma.scene.update({
-                  where: { id: scene.id },
-                  data: { materialId: material.id },
-                });
-                scene.materialId = material.id;
-                console.log(`[Render] Scene ${i} material matched: pexels VIDEO`);
+          if (scene.productionMeta) {
+            const meta = JSON.parse(scene.productionMeta as string);
+            // Content: properNouns names → precise matching
+            if (meta.properNouns?.length) {
+              const names = meta.properNouns.map((pn: any) => pn.name).filter(Boolean);
+              contentTerms.push(...names);
+            }
+            // Context: extract meaningful phrases from preference/materialQuery
+            const contextText = [
+              meta.preference || "",
+              scene.materialQuery || "",
+              meta.era || "",
+            ].join(" ");
+            // Extract substantive phrases (2-6 char Chinese words, exclude pure adjectives)
+            const phrases = contextText.match(/[\u4e00-\u9fff]{2,6}/g) || [];
+            const stopWords = new Set(["色调", "镜头", "风格", "突出", "展现", "场景", "聚焦", "注重",
+              "描述", "画面", "整体", "氛围", "采用", "运用", "使用", "适合", "需要", "可以"]);
+            for (const p of phrases) {
+              if (!stopWords.has(p) && p.length >= 2) {
+                contextTerms.push(p);
               }
             }
-          } else {
-            console.warn(`[Render] Scene ${i} Pexels HTTP ${pexRes.status}`);
+          }
+
+          // Fallback
+          if (contentTerms.length === 0 && contextTerms.length === 0) {
+            contentTerms.push(scene.title || scene.voiceoverText?.slice(0, 30) || "历史");
+          }
+
+          // Build primary query: content terms (most precise)
+          const primaryQuery = [...new Set(contentTerms)].slice(0, 5).join(" ");
+          // Build secondary query: context terms (broad)
+          const secondaryQuery = [...new Set(contextTerms)].slice(0, 5).join(" ");
+
+          console.log(`[Render] Scene ${i} search: primary="${primaryQuery.slice(0, 40)}" context="${secondaryQuery.slice(0, 40)}"`);
+
+          // Search with primary query first, fallback to context query
+          async function bilibiliSearch(query: string): Promise<any[]> {
+            if (!query) return [];
+            const url = `https://api.bilibili.com/x/web-interface/search/type?search_type=video&keyword=${encodeURIComponent(query)}&page=1&page_size=3&order=totalrank`;
+            const res = await fetch(url, {
+              headers: {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": "https://www.bilibili.com/",
+                "Origin": "https://www.bilibili.com",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "zh-CN,zh;q=0.9",
+              },
+              signal: AbortSignal.timeout(10000),
+            });
+            if (!res.ok) return [];
+            const data = await res.json();
+            if (data.code !== 0) return [];
+            return (data.data?.result || []).slice(0, 3);
+          }
+
+          // Try primary query first (most precise)
+          let results = await bilibiliSearch(primaryQuery);
+
+          // Fallback to context query if primary returns nothing
+          if (results.length === 0 && secondaryQuery) {
+            console.log(`[Render] Scene ${i} primary query empty, trying context query`);
+            results = await bilibiliSearch(secondaryQuery);
+          }
+
+          // Last resort: combine both
+          if (results.length === 0 && primaryQuery && secondaryQuery) {
+            results = await bilibiliSearch(`${primaryQuery} ${secondaryQuery}`);
+          }
+
+          console.log(`[Render] Scene ${i} Bilibili found ${results.length} videos`);
+
+          // Find first usable video with stream URL
+          for (const video of results) {
+            if (materialLoaded) break;
+            const bvid = video.bvid;
+            if (!bvid) continue;
+
+            const durParts = (video.duration || "0:00").split(":").map(Number);
+            const durSec = durParts.length === 2 ? durParts[0]*60+durParts[1] : durParts[0]*3600+durParts[1]*60+durParts[2];
+            if (durSec < 5 || durSec > 300) continue;
+
+            let streamUrl: string | null = null;
+            try {
+              const infoRes = await fetch(`https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`, {
+                headers: { "User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/" },
+                signal: AbortSignal.timeout(8000),
+              });
+              if (infoRes.ok) {
+                const infoData = await infoRes.json();
+                const cid = infoData.data?.cid;
+                if (cid) {
+                  const streamRes = await fetch(
+                    `https://api.bilibili.com/x/player/playurl?bvid=${bvid}&cid=${cid}&qn=80&fnval=1`,
+                    { headers: { "User-Agent": "Mozilla/5.0", "Referer": `https://www.bilibili.com/video/${bvid}` } }
+                  );
+                  if (streamRes.ok) {
+                    const streamData = await streamRes.json();
+                    streamUrl = streamData.data?.durl?.[0]?.url || null;
+                  }
+                }
+              }
+            } catch { /* stream fetch failed, try next video */ }
+
+            if (streamUrl) {
+              const title = video.title?.replace(/<[^>]*>/g, "") || primaryQuery;
+              const pic = video.pic?.startsWith("//") ? `https:${video.pic}` : (video.pic || "");
+              const usedQuery = results.length > 0 ? (primaryQuery || secondaryQuery) : "";
+              const material = await prisma.material.create({
+                data: {
+                  projectId, name: title.slice(0, 80),
+                  type: "VIDEO", source: "STOCK_FOOTAGE",
+                  fileUrl: streamUrl, thumbnailUrl: pic,
+                  width: 1920, height: 1080, duration: durSec,
+                  externalId: `bilibili-${bvid}`, externalSource: "bilibili",
+                  searchQuery: usedQuery, matchScore: 0.8,
+                },
+              });
+              await prisma.scene.update({ where: { id: scene.id }, data: { materialId: material.id } });
+              scene.materialId = material.id;
+              materialLoaded = true;
+              console.log(`[Render] Scene ${i} matched: ${title.slice(0, 40)} (${durSec}s)`);
+            }
           }
         } catch (err) {
-          console.warn(`[Render] Scene ${i} auto-search failed:`, err instanceof Error ? err.message : err);
+          console.warn(`[Render] Scene ${i} Bilibili search failed:`, err instanceof Error ? err.message : err);
         }
       }
 
@@ -241,9 +336,18 @@ export async function renderProjectInline(
                 await new Promise(r => setTimeout(r, 1000 * attempt));
               }
 
+              const isBilibili = material.externalSource === "bilibili";
+              const dlHeaders: Record<string, string> = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+              };
+              if (isBilibili) {
+                dlHeaders["Referer"] = "https://www.bilibili.com/";
+                dlHeaders["Origin"] = "https://www.bilibili.com";
+              }
+
               const res = await fetch(material.fileUrl, {
-                signal: AbortSignal.timeout(30000),
-                headers: { "User-Agent": "Mozilla/5.0" },
+                signal: AbortSignal.timeout(60000),
+                headers: dlHeaders,
               });
 
               if (!res.ok) {
@@ -384,7 +488,7 @@ export async function renderProjectInline(
         : estimateAudioDuration(scenes[i].voiceoverText);
       let audioDuration = originalAudioDuration;
 
-      // Generate subtitles FIRST to calculate required display time
+      // Generate subtitles proportional to actual audio duration
       let scripts: string[] | undefined;
       if (scenes[i].productionMeta) {
         try {
@@ -404,34 +508,15 @@ export async function renderProjectInline(
         scripts
       );
 
-      // Ensure video lasts at least as long as subtitles need
-      const lastSubEnd = subtitleChunks.length > 0
-        ? subtitleChunks[subtitleChunks.length - 1].endTime
-        : 0;
-      if (lastSubEnd > audioDuration) {
-        audioDuration = lastSubEnd;
-      }
-
-      // Scale video, adjust speed to match target duration, trim
-      const speedRatio = audioDuration > originalAudioDuration
-        ? (originalAudioDuration / audioDuration).toFixed(4)
-        : "1.0";
-
+      // Scale video and trim to duration
       filterParts.push(
-        `[${videoIdx}:v]scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,setpts=${speedRatio}*PTS,trim=duration=${audioDuration},setpts=PTS-STARTPTS[v${i}]`
+        `[${videoIdx}:v]scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,trim=duration=${audioDuration},setpts=PTS-STARTPTS[v${i}]`
       );
 
-      // Audio: stretch to match extended subtitle duration
-      if (audioDuration > originalAudioDuration) {
-        const tempo = (originalAudioDuration / audioDuration).toFixed(4);
-        filterParts.push(
-          `[${audioIdx}:a]volume=1.5,aresample=44100,atrim=0:${originalAudioDuration},atempo=${tempo},asetpts=PTS-STARTPTS[a${i}]`
-        );
-      } else {
-        filterParts.push(
-          `[${audioIdx}:a]volume=2.0,aresample=44100,atrim=0:${audioDuration},asetpts=PTS-STARTPTS[a${i}]`
-        );
-      }
+      // Audio: boost volume, resample, trim
+      filterParts.push(
+        `[${audioIdx}:a]volume=2.0,aresample=44100,atrim=0:${audioDuration},asetpts=PTS-STARTPTS[a${i}]`
+      );
 
       // Build subtitle filter chain from pre-generated chunks
       const { filterParts: subFilters, outputLabel: subLabel } = buildSubtitleFilterChain(

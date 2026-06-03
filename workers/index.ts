@@ -16,11 +16,25 @@ import {
   generateSubtitleChunks,
   buildSubtitleFilterChain,
   estimateAudioDuration,
-  getAudioDuration,
   type SubtitleConfig,
 } from "../src/lib/render/subtitle";
 
 const execFileAsync = promisify(execFile);
+
+async function getAudioDuration(filePath: string): Promise<number> {
+  try {
+    const { stdout } = await execFileAsync("ffprobe", [
+      "-v", "error",
+      "-show_entries", "format=duration",
+      "-of", "default=noprint_wrappers=1:nokey=1",
+      filePath,
+    ], { timeout: 5000 });
+    const duration = parseFloat(stdout.trim());
+    return isNaN(duration) ? 0 : duration;
+  } catch {
+    return 0;
+  }
+}
 
 // --- S3 client ---
 const s3 = new S3Client({

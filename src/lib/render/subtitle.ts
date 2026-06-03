@@ -345,23 +345,3 @@ export function estimateAudioDuration(text: string): number {
   if (text.length === 0) return 1;
   return estimateSpeechDuration(text);
 }
-
-export async function getAudioDuration(filePath: string): Promise<number> {
-  try {
-    const { execFile } = await import("child_process");
-    const { promisify } = await import("util");
-    const execFileAsync = promisify(execFile);
-
-    const { stdout } = await execFileAsync("ffprobe", [
-      "-v", "error",
-      "-show_entries", "format=duration",
-      "-of", "default=noprint_wrappers=1:nokey=1",
-      filePath,
-    ], { timeout: 5000 });
-
-    const duration = parseFloat(stdout.trim());
-    return isNaN(duration) ? 0 : duration;
-  } catch {
-    return 0;
-  }
-}

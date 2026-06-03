@@ -10,11 +10,25 @@ import {
   generateSubtitleChunks,
   buildSubtitleFilterChain,
   estimateAudioDuration,
-  getAudioDuration,
   type SubtitleConfig,
 } from "@/lib/render/subtitle";
 
 const execFileAsync = promisify(execFile);
+
+async function getAudioDuration(filePath: string): Promise<number> {
+  try {
+    const { stdout } = await execFileAsync("ffprobe", [
+      "-v", "error",
+      "-show_entries", "format=duration",
+      "-of", "default=noprint_wrappers=1:nokey=1",
+      filePath,
+    ], { timeout: 5000 });
+    const duration = parseFloat(stdout.trim());
+    return isNaN(duration) ? 0 : duration;
+  } catch {
+    return 0;
+  }
+}
 
 const PROJECT_ID = "cmpsyvo0x000364ul6zx2xpsx";
 const USER_ID = "cmp3v2aqa0000k8ulak8r79d5";
