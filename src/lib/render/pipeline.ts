@@ -1,5 +1,5 @@
 import { prisma } from "@/lib/db";
-import { execFile } from "child_process";
+import { execFile, exec } from "child_process";
 import { promisify } from "util";
 import { readFile, writeFile, unlink, mkdir, rm } from "fs/promises";
 import { join } from "path";
@@ -13,6 +13,36 @@ import {
 } from "./subtitle";
 
 const execFileAsync = promisify(execFile);
+const execAsync = promisify(exec);
+
+/** Try multiple Python paths for edge_tts, using shell for PATH resolution */
+async function generateTTS(text: string, voice: string, outputFile: string): Promise<boolean> {
+  const pythonPaths = ["python", "python3"];
+  for (const py of pythonPaths) {
+    try {
+      await execAsync(
+        `${py} -m edge_tts --voice "${voice}" --rate "+0%" --text "${text.replace(/"/g, '\\"')}" --write-media "${outputFile}"`,
+        { timeout: 60000, maxBuffer: 1024 * 1024 }
+      );
+      // Verify file was created and has content
+      try {
+        const stat = await import("fs/promises").then(m => m.stat(outputFile));
+        if (stat.size > 100) return true;
+      } catch {}
+    } catch {
+      continue;
+    }
+  }
+  // Fallback: try with spawn + shell as last resort
+  try {
+    await execAsync(
+      `python -m edge_tts --voice "${voice}" --rate "+0%" --text "${text.replace(/"/g, '\\"')}" --write-media "${outputFile}"`,
+      { timeout: 60000, shell: "powershell.exe", maxBuffer: 1024 * 1024 }
+    );
+    try { const stat = await import("fs/promises").then(m => m.stat(outputFile)); if (stat.size > 100) return true; } catch {}
+  } catch {}
+  return false;
+}
 
 async function getAudioDuration(filePath: string): Promise<number> {
   try {
@@ -128,23 +158,10 @@ export async function renderProjectInline(
           }
         }
       } else {
-        // Edge TTS with robust fallback
-        let ttsOk = false;
-        try {
-          await execFileAsync("python", [
-            "-m", "edge_tts",
-            "--voice", edgeVoice,
-            "--rate", "+0%",
-            "--volume", "+0%",
-            "--text", scene.voiceoverText,
-            "--write-media", audioFile,
-          ], { timeout: 60000 });
-          ttsOk = true;
-        } catch (e) {
-          console.error(`[Render] TTS failed for scene ${i}:`, e instanceof Error ? e.message : e);
-        }
-        
+        // Edge TTS with shell-based Python detection
+        const ttsOk = await generateTTS(scene.voiceoverText, edgeVoice, audioFile);
         if (!ttsOk) {
+          console.warn(`[Render] TTS failed for scene ${i}, using silent audio`);
           try {
             await execFileAsync("ffmpeg", [
               "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
@@ -185,74 +202,180 @@ export async function renderProjectInline(
       // Auto-search materials from Bilibili if none attached
       if (!scene.materialId) {
         try {
-          // Build multi-tier Chinese keywords for Bilibili search
-          let contentTerms: string[] = [];   // precise: properNouns + title
-          let contextTerms: string[] = [];   // contextual: materialQuery/preference
-
-          if (scene.title) contentTerms.push(scene.title);
-
+          // Parse production meta
+          let meta: any = null;
           if (scene.productionMeta) {
-            const meta = JSON.parse(scene.productionMeta as string);
-            // Content: properNouns names → precise matching
-            if (meta.properNouns?.length) {
-              const names = meta.properNouns.map((pn: any) => pn.name).filter(Boolean);
-              contentTerms.push(...names);
+            try { meta = JSON.parse(scene.productionMeta as string); } catch {}
+          }
+
+          // Build search queries
+          // Priority: materialQuery (AI-generated) > visualDesc work names > properNouns > voiceover text
+          let primaryQuery = "";
+          let secondaryQuery = "";
+
+          // 1. materialQuery — AI-generated search term, HIGHEST priority
+          const materialQuery = meta?.materialQuery || scene.materialQuery || "";
+          if (materialQuery) {
+            primaryQuery = materialQuery;
+          }
+
+          // 2. visualDesc — extract concrete work names (《xxx》) or historical figures/events
+          const visualDesc = meta?.visualDesc || scene.visualDesc || "";
+          if (!primaryQuery && visualDesc) {
+            // 2a. Extract 影视作品 names from 《书名号》
+            const workMatches = visualDesc.match(/《([^》]+)》/g) || [];
+            const workNames = workMatches.map((m: string) => m.replace(/[《》]/g, ""));
+            if (workNames.length > 0) {
+              primaryQuery = workNames.slice(0, 2).join(" ") + " 纪录片";
             }
-            // Context: extract meaningful phrases from preference/materialQuery
-            const contextText = [
-              meta.preference || "",
-              scene.materialQuery || "",
-              meta.era || "",
-            ].join(" ");
-            // Extract substantive phrases (2-6 char Chinese words, exclude pure adjectives)
-            const phrases = contextText.match(/[\u4e00-\u9fff]{2,6}/g) || [];
-            const stopWords = new Set(["色调", "镜头", "风格", "突出", "展现", "场景", "聚焦", "注重",
-              "描述", "画面", "整体", "氛围", "采用", "运用", "使用", "适合", "需要", "可以"]);
-            for (const p of phrases) {
-              if (!stopWords.has(p) && p.length >= 2) {
-                contextTerms.push(p);
+
+            // 2b. No 书名号 — extract meaningful concrete nouns (people, places, events, eras)
+            if (!primaryQuery) {
+              // Match Chinese words, but filter out abstract/generic terms
+              const allWords = visualDesc.match(/[\u4e00-\u9fff]{2,10}/g) || [];
+              const abstractWords = new Set([
+                "画面", "描述", "展现", "展示", "呈现", "表现", "体现", "反映",
+                "相关", "经典", "场景", "镜头", "光影", "色调", "氛围", "风格",
+                "构图", "缓缓", "慢慢", "特写", "全景", "近景", "远景",
+                "采用", "运用", "使用", "适合", "需要", "可以", "例如",
+                "视频", "片段", "该部", "这部", "相关", "中的",
+              ]);
+              // Keep concrete terms: history figures, dynasties, battles, places
+              const concreteWords = allWords.filter((w: string) => {
+                if (abstractWords.has(w)) return false;
+                if (/^[一二三四五六七八九十百千万亿]+$/.test(w)) return false; // pure numbers
+                if (w.length < 2 || w.length > 8) return false;
+                return true;
+              });
+              if (concreteWords.length > 0) {
+                primaryQuery = [...new Set(concreteWords)].slice(0, 4).join(" ") + " 纪录片";
               }
             }
           }
 
-          // Fallback
-          if (contentTerms.length === 0 && contextTerms.length === 0) {
-            contentTerms.push(scene.title || scene.voiceoverText?.slice(0, 30) || "历史");
+          // 3. properNouns + era — concrete historical entities
+          if (!primaryQuery) {
+            const fallbackTerms: string[] = [];
+            if (meta?.properNouns?.length) {
+              const names = meta.properNouns.map((pn: any) => pn.name).filter(Boolean);
+              fallbackTerms.push(...names);
+            }
+            if (meta?.era) {
+              // Extract dynasty/era like "明朝", "清朝", "清初"
+              const eraWords = meta.era.match(/[\u4e00-\u9fff]{2,6}/g) || [];
+              fallbackTerms.push(...eraWords);
+            }
+            if (fallbackTerms.length > 0) {
+              primaryQuery = [...new Set(fallbackTerms)].slice(0, 4).join(" ") + " 纪录片";
+            }
           }
 
-          // Build primary query: content terms (most precise)
-          const primaryQuery = [...new Set(contentTerms)].slice(0, 5).join(" ");
-          // Build secondary query: context terms (broad)
-          const secondaryQuery = [...new Set(contextTerms)].slice(0, 5).join(" ");
+          // 4. Secondary query from sources + era (concrete sources like "中国通史")
+          const contextText = [
+            meta?.sources?.join(" ") || "",
+            meta?.era || "",
+          ].join(" ");
+          if (contextText) {
+            const phrases = contextText.match(/[\u4e00-\u9fff]{2,8}/g) || [];
+            const stopWords = new Set(["色调", "镜头", "风格", "突出", "展现", "场景", "聚焦", "注重",
+              "描述", "画面", "整体", "氛围", "采用", "运用", "使用", "适合", "需要", "可以",
+              "纪录片", "电视剧", "电影", "视频", "来源"]);
+            const contextTerms = phrases
+              .filter((p: string) => !stopWords.has(p) && p.length >= 2)
+              .slice(0, 4);
+            secondaryQuery = [...new Set(contextTerms)].join(" ");
+          }
 
-          console.log(`[Render] Scene ${i} search: primary="${primaryQuery.slice(0, 40)}" context="${secondaryQuery.slice(0, 40)}"`);
+          // 5. Last resort: voiceover text
+          if (!primaryQuery && !secondaryQuery) {
+            const voiceText = scene.voiceoverText || scene.title || "";
+            // Extract concrete nouns from voiceover (simple approach: take first few 2-4 char words)
+            const voiceWords = voiceText.match(/[\u4e00-\u9fff]{2,6}/g) || [];
+            const voiceStop = new Set(["然后", "为啥", "为什么", "不是", "今天", "肯定", "听过", "不是", "真实", "发生", "所有", "必须", "几乎", "只留", "一点"]);
+            const filteredVoice = voiceWords.filter((w: string) => !voiceStop.has(w)).slice(0, 4);
+            primaryQuery = filteredVoice.join(" ") || voiceText.slice(0, 20) || "历史";
+          }
 
-          // Search with primary query first, fallback to context query
-          async function bilibiliSearch(query: string): Promise<any[]> {
+          console.log(`[Render] Scene ${i} search: primary="${primaryQuery.slice(0, 50)}" secondary="${secondaryQuery.slice(0, 50)}"`);
+
+          // Search with primary query first, fallback to secondary query
+          async function bilibiliSearch(query: string, retries = 2): Promise<any[]> {
             if (!query) return [];
-            const url = `https://api.bilibili.com/x/web-interface/search/type?search_type=video&keyword=${encodeURIComponent(query)}&page=1&page_size=3&order=totalrank`;
-            const res = await fetch(url, {
-              headers: {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Referer": "https://www.bilibili.com/",
-                "Origin": "https://www.bilibili.com",
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "zh-CN,zh;q=0.9",
-              },
-              signal: AbortSignal.timeout(10000),
-            });
-            if (!res.ok) return [];
-            const data = await res.json();
-            if (data.code !== 0) return [];
-            return (data.data?.result || []).slice(0, 3);
+            for (let attempt = 0; attempt <= retries; attempt++) {
+              try {
+                if (attempt > 0) await new Promise(r => setTimeout(r, 1500 + Math.random() * 2000));
+                const url = `https://api.bilibili.com/x/web-interface/search/type?search_type=video&keyword=${encodeURIComponent(query)}&page=1&page_size=20&order=totalrank`;
+                const res = await fetch(url, {
+                  headers: {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Referer": "https://www.bilibili.com/",
+                    "Origin": "https://www.bilibili.com",
+                    "Accept": "application/json, text/plain, */*",
+                    "Accept-Language": "zh-CN,zh;q=0.9",
+                    "Cookie": "buvid3=infoc;",
+                  },
+                  signal: AbortSignal.timeout(10000),
+                });
+                if (!res.ok) continue;
+                const text = await res.text();
+                try {
+                  const data = JSON.parse(text);
+                  if (data.code !== 0) continue;
+                  return (data.data?.result || []).slice(0, 20);
+                } catch {
+                  // Bilibili rate-limited → returned HTML, retry
+                  if (text.startsWith("<")) continue;
+                  return [];
+                }
+              } catch { continue; }
+            }
+            return [];
           }
 
-          // Try primary query first (most precise)
+          // Helper: check video resolution via ffprobe
+          async function probeVideoResolution(path: string): Promise<{width: number, height: number} | null> {
+            try {
+              const { stdout } = await execFileAsync("ffprobe", [
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "json",
+                path,
+              ], { timeout: 15000 });
+              const probe = JSON.parse(stdout);
+              const s = probe.streams?.[0];
+              if (s?.width && s?.height) {
+                return { width: parseInt(s.width), height: parseInt(s.height) };
+              }
+            } catch {}
+            return null;
+          }
+
+          // Helper: quick download head bytes to probe resolution
+          async function quickDownloadHead(url: string, outPath: string, maxBytes: number): Promise<boolean> {
+            try {
+              const res = await fetch(url, {
+                headers: {
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                  "Referer": "https://www.bilibili.com/",
+                  "Range": `bytes=0-${maxBytes}`,
+                },
+                signal: AbortSignal.timeout(15000),
+              });
+              if (!res.ok) return false;
+              const buf = Buffer.from(await res.arrayBuffer());
+              if (buf.length < 5000) return false;
+              await writeFile(outPath, buf);
+              return true;
+            } catch { return false; }
+          }
+
+          // Try primary query first (based on visualDesc)
           let results = await bilibiliSearch(primaryQuery);
 
-          // Fallback to context query if primary returns nothing
+          // Fallback to secondary query if primary returns nothing
           if (results.length === 0 && secondaryQuery) {
-            console.log(`[Render] Scene ${i} primary query empty, trying context query`);
+            console.log(`[Render] Scene ${i} primary query empty, trying secondary context query`);
             results = await bilibiliSearch(secondaryQuery);
           }
 
@@ -261,9 +384,17 @@ export async function renderProjectInline(
             results = await bilibiliSearch(`${primaryQuery} ${secondaryQuery}`);
           }
 
+          // Super-broad fallback: search with just the era + "纪录片"
+          if (results.length === 0 && meta?.era) {
+            const eraWords = meta.era.match(/[\u4e00-\u9fff]{2,6}/g) || [];
+            const broadQuery = eraWords.slice(0, 2).join(" ") + " 历史 纪录片";
+            console.log(`[Render] Scene ${i} all specific queries empty, trying broad: "${broadQuery}"`);
+            results = await bilibiliSearch(broadQuery);
+          }
+
           console.log(`[Render] Scene ${i} Bilibili found ${results.length} videos`);
 
-          // Find first usable video with stream URL
+          // Find first 16:9 usable video
           for (const video of results) {
             if (materialLoaded) break;
             const bvid = video.bvid;
@@ -271,7 +402,7 @@ export async function renderProjectInline(
 
             const durParts = (video.duration || "0:00").split(":").map(Number);
             const durSec = durParts.length === 2 ? durParts[0]*60+durParts[1] : durParts[0]*3600+durParts[1]*60+durParts[2];
-            if (durSec < 5 || durSec > 300) continue;
+            if (durSec < 5 || durSec > 600) continue;
 
             let streamUrl: string | null = null;
             try {
@@ -293,27 +424,57 @@ export async function renderProjectInline(
                   }
                 }
               }
-            } catch { /* stream fetch failed, try next video */ }
+            } catch { continue; }
 
-            if (streamUrl) {
-              const title = video.title?.replace(/<[^>]*>/g, "") || primaryQuery;
-              const pic = video.pic?.startsWith("//") ? `https:${video.pic}` : (video.pic || "");
-              const usedQuery = results.length > 0 ? (primaryQuery || secondaryQuery) : "";
-              const material = await prisma.material.create({
-                data: {
-                  projectId, name: title.slice(0, 80),
-                  type: "VIDEO", source: "STOCK_FOOTAGE",
-                  fileUrl: streamUrl, thumbnailUrl: pic,
-                  width: 1920, height: 1080, duration: durSec,
-                  externalId: `bilibili-${bvid}`, externalSource: "bilibili",
-                  searchQuery: usedQuery, matchScore: 0.8,
-                },
-              });
-              await prisma.scene.update({ where: { id: scene.id }, data: { materialId: material.id } });
-              scene.materialId = material.id;
-              materialLoaded = true;
-              console.log(`[Render] Scene ${i} matched: ${title.slice(0, 40)} (${durSec}s)`);
+            if (!streamUrl) continue;
+
+            // Validate 16:9 aspect ratio before saving
+            const probePath = join(workDir, `probe-${i}-${bvid}.mp4`);
+            let ratio = 1.78; // default: assume 16:9 if probe fails
+            try {
+              const ok = await quickDownloadHead(streamUrl, probePath, 524288); // 512KB head
+              if (ok) {
+                const reso = await probeVideoResolution(probePath);
+                if (reso) {
+                  ratio = reso.width / reso.height;
+                  console.log(`[Render] Scene ${i} candidate [${bvid}] ${reso.width}x${reso.height} ratio=${ratio.toFixed(2)}`);
+                } else {
+                  console.log(`[Render] Scene ${i} candidate [${bvid}] probe failed, assume landscape`);
+                }
+              } else {
+                console.log(`[Render] Scene ${i} candidate [${bvid}] quick download failed`);
+              }
+            } catch (probeErr) {
+              console.warn(`[Render] Scene ${i} candidate [${bvid}] probe error:`, probeErr instanceof Error ? probeErr.message : probeErr);
+            } finally {
+              try { await unlink(probePath); } catch {}
             }
+
+            // Accept landscape or near-landscape videos (ratio >= 1.2, i.e. 4:3 or wider)
+            // Reject extreme portrait (9:16 = 0.56) and square (1:1) which lose too much when padded to 16:9
+            if (ratio < 1.2) {
+              console.log(`[Render] Scene ${i} candidate [${bvid}] skipped (ratio ${ratio.toFixed(2)} too narrow for 16:9 pad)`);
+              continue;
+            }
+
+            // Save validated material
+            const title = video.title?.replace(/<[^>]*>/g, "") || primaryQuery;
+            const pic = video.pic?.startsWith("//") ? `https:${video.pic}` : (video.pic || "");
+            const usedQuery = results.length > 0 ? (primaryQuery || secondaryQuery) : "";
+            const material = await prisma.material.create({
+              data: {
+                projectId, name: title.slice(0, 80),
+                type: "VIDEO", source: "STOCK_FOOTAGE",
+                fileUrl: streamUrl, thumbnailUrl: pic,
+                width: 1920, height: 1080, duration: durSec,
+                externalId: `bilibili-${bvid}`, externalSource: "bilibili",
+                searchQuery: usedQuery, matchScore: 0.8,
+              },
+            });
+            await prisma.scene.update({ where: { id: scene.id }, data: { materialId: material.id } });
+            scene.materialId = material.id;
+            materialLoaded = true;
+            console.log(`[Render] Scene ${i} matched: ${title.slice(0, 40)} (${durSec}s)`);
           }
         } catch (err) {
           console.warn(`[Render] Scene ${i} Bilibili search failed:`, err instanceof Error ? err.message : err);
@@ -345,13 +506,53 @@ export async function renderProjectInline(
                 dlHeaders["Origin"] = "https://www.bilibili.com";
               }
 
-              const res = await fetch(material.fileUrl, {
+              let fileUrl = material.fileUrl;
+
+              // Bilibili stream URLs expire — refresh on first attempt if needed
+              if (isBilibili && attempt > 0) {
+                const bvidMatch = material.externalId?.match(/bilibili-(.+)/);
+                const bvid = bvidMatch?.[1];
+                if (bvid) {
+                  try {
+                    const infoRes = await fetch(`https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`, {
+                      headers: { "User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/" },
+                      signal: AbortSignal.timeout(8000),
+                    });
+                    if (infoRes.ok) {
+                      const infoData = await infoRes.json();
+                      const cid = infoData.data?.cid;
+                      if (cid) {
+                        const streamRes = await fetch(
+                          `https://api.bilibili.com/x/player/playurl?bvid=${bvid}&cid=${cid}&qn=80&fnval=1`,
+                          { headers: { "User-Agent": "Mozilla/5.0", "Referer": `https://www.bilibili.com/video/${bvid}` } }
+                        );
+                        if (streamRes.ok) {
+                          const streamData = await streamRes.json();
+                          const newUrl = streamData.data?.durl?.[0]?.url;
+                          if (newUrl) {
+                            fileUrl = newUrl;
+                            await prisma.material.update({
+                              where: { id: material.id },
+                              data: { fileUrl: newUrl },
+                            });
+                            console.log(`[Render] Scene ${i} refreshed Bilibili stream URL`);
+                          }
+                        }
+                      }
+                    }
+                  } catch (refreshErr) {
+                    console.warn(`[Render] Scene ${i} failed to refresh stream URL:`, refreshErr instanceof Error ? refreshErr.message : refreshErr);
+                  }
+                }
+              }
+
+              const res = await fetch(fileUrl, {
                 signal: AbortSignal.timeout(60000),
                 headers: dlHeaders,
               });
 
               if (!res.ok) {
-                console.warn(`[Render] Scene ${i} material HTTP ${res.status} from ${material.fileUrl.substring(0, 80)}`);
+                console.warn(`[Render] Scene ${i} material HTTP ${res.status} from ${fileUrl.substring(0, 80)}`);
                 continue;
               }
 
@@ -364,7 +565,8 @@ export async function renderProjectInline(
               await writeFile(localPath, buffer);
               console.log(`[Render] Scene ${i} material downloaded: ${(buffer.length / 1024).toFixed(0)}KB`);
 
-              // Watermark removal: crop edges for non-stock or watermark-prone sources
+              // Watermark removal for Bilibili/douyin
+              // Strategy: delogo (position-based) + subtle crop + denoise
               let processedPath = localPath;
               const needsWatermarkRemoval =
                 (material.source !== "STOCK_FOOTAGE" && material.source !== "AI_GENERATED") ||
@@ -373,30 +575,78 @@ export async function renderProjectInline(
               if (needsWatermarkRemoval) {
                 const cleanPath = join(workDir, `clean-${i}.${ext}`);
                 try {
+                  // delogo: masks logo at Bilibili standard positions
+                  // crop: subtle edge trim for corner watermarks
+                  // hqdn3d: light denoise to blur faint watermarks
+                  const watermarkFilter = [
+                    "delogo=x=5:y=5:w=200:h=65:show=0",
+                    "delogo=x=w-200:y=5:w=200:h=65:show=0",
+                    "crop=iw*0.97:ih*0.97:iw*0.015:ih*0.015",
+                  ].join(",");
+
                   await execFileAsync("ffmpeg", [
                     "-y", "-i", localPath,
-                    "-vf", "crop=iw*0.96:ih*0.96:iw*0.02:ih*0.02",
-                    "-c:v", "libx264", "-preset", "fast", "-q:v", "2",
-                    cleanPath,
+                    "-vf", watermarkFilter,
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-an", cleanPath,
                   ], { timeout: 30000 });
                   processedPath = cleanPath;
-                } catch {}
+                } catch {
+                  // Fallback: simple crop if delogo fails
+                  try {
+                    await execFileAsync("ffmpeg", [
+                      "-y", "-i", localPath,
+                      "-vf", "crop=iw*0.95:ih*0.95:iw*0.025:ih*0.025",
+                      "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                      "-an", cleanPath,
+                    ], { timeout: 30000 });
+                    processedPath = cleanPath;
+                  } catch {}
+                }
               }
 
-              // Convert to scene video
+              // Extract 5-7s highlight clip and force 16:9 output
+              const targetW = config.width || 1920;
+              const targetH = config.height || 1080;
+              const scaleFilter = `scale=${targetW}:${targetH}:force_original_aspect_ratio=decrease,pad=${targetW}:${targetH}:(ow-iw)/2:(oh-ih)/2:black`;
+
               if (ext === "jpg") {
                 await execFileAsync("ffmpeg", [
                   "-y", "-loop", "1", "-i", processedPath,
                   "-c:v", "libx264", "-t", "5", "-pix_fmt", "yuv420p",
-                  "-vf", `scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2`,
+                  "-vf", scaleFilter,
                   "-an", materialFile,
                 ], { timeout: 30000 });
               } else {
+                // Get video duration
+                let videoDuration = 0;
+                try {
+                  const { stdout } = await execFileAsync("ffprobe", [
+                    "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    processedPath,
+                  ], { timeout: 10000 });
+                  videoDuration = parseFloat(stdout.trim()) || 0;
+                } catch {}
+
+                let trimArgs: string[] = [];
+                if (videoDuration > 10) {
+                  const clipLength = Math.min(Math.max(videoDuration * 0.15, 5), 7);
+                  const maxStart = videoDuration - clipLength - 2;
+                  const startSec = Math.max(1, Math.min(videoDuration * 0.2, maxStart));
+                  const startTime = startSec.toFixed(2);
+                  trimArgs = ["-ss", startTime, "-t", String(Math.round(clipLength))];
+                  console.log(`[Render] Scene ${i} trimming ${clipLength.toFixed(1)}s from ${startTime}s (total ${videoDuration.toFixed(1)}s)`);
+                } else if (videoDuration > 0) {
+                  console.log(`[Render] Scene ${i} video short (${videoDuration.toFixed(1)}s), using full clip`);
+                }
+
                 await execFileAsync("ffmpeg", [
-                  "-y", "-i", processedPath,
-                  "-c:v", "libx264", "-preset", "fast",
-                  "-vf", `scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2`,
-                  "-an", materialFile,
+                  "-y", ...trimArgs, "-i", processedPath,
+                  "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                  "-vf", scaleFilter,
+                  "-an", "-pix_fmt", "yuv420p", materialFile,
                 ], { timeout: 60000 });
               }
               materialLoaded = true;
@@ -413,12 +663,16 @@ export async function renderProjectInline(
       }
 
       if (!materialLoaded) {
-        console.warn(`[Render] Scene ${i} using black placeholder`);
-        // Use scene title or voiceover text as on-screen text instead of pure black
+        console.warn(`[Render] Scene ${i} all sources failed, using text placeholder`);
+        // Generate a dark gradient-style background with scene title as text
         const sceneTitle = scene.title || `场景 ${scene.sceneNumber}`;
+        const safeTitle = sceneTitle.replace(/['"\\:;%]/g, "");
+        const safeVoice = (scene.voiceoverText || "").slice(0, 40).replace(/['"\\:;%]/g, "");
+        const fontPath = "C\\:/Windows/Fonts/msyh.ttc";
+        const midY = Math.round(config.height / 2);
         await execFileAsync("ffmpeg", [
           "-y", "-f", "lavfi", "-i",
-          `color=c=0x1a1a2e:s=${config.width}x${config.height}:d=60`,
+          `color=c=0x1a1a2e:s=${config.width}x${config.height}:d=60,drawtext=fontfile='${fontPath}':fontsize=48:fontcolor=white@0.8:x=(w-text_w)/2:y=${midY-80}:text='${safeTitle}',drawtext=fontfile='${fontPath}':fontsize=32:fontcolor=white@0.5:x=(w-text_w)/2:y=${midY}:text='${safeVoice}'`,
           "-c:v", "libx264", "-t", "60", "-pix_fmt", "yuv420p",
           "-an", materialFile,
         ], { timeout: 15000 });
@@ -449,9 +703,12 @@ export async function renderProjectInline(
       let hasMaterial = true;
       try { await readFile(materialFile); } catch { hasMaterial = false; }
       if (!hasMaterial) {
+        const sceneTitle = scenes[i].title || `场景 ${scenes[i].sceneNumber}`;
+        const safeTitle = sceneTitle.replace(/['"\\:;%]/g, "");
+        const fontPath = "C\\:/Windows/Fonts/msyh.ttc";
         await execFileAsync("ffmpeg", [
           "-y", "-f", "lavfi", "-i",
-          `color=c=black:s=${config.width}x${config.height}:d=5`,
+          `color=c=0x1a1a2e:s=${config.width}x${config.height}:d=5,drawtext=fontfile='${fontPath}':fontsize=48:fontcolor=white@0.6:x=(w-text_w)/2:y=(h-text_h)/2:text='${safeTitle}'`,
           "-c:v", "libx264", "-t", "5", "-pix_fmt", "yuv420p",
           "-an", materialFile,
         ], { timeout: 15000 });

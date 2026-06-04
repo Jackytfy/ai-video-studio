@@ -18,6 +18,8 @@ interface ProductionMeta {
   era: string;
   sources: string[];
   preference: string;
+  visualDesc: string;
+  materialQuery: string;
 }
 
 /**
@@ -165,13 +167,20 @@ async function generateProductionDetails(
     const prompt = `你是一名专业的影视制片助理。为以下 ${scenes.length} 个分镜场景分别生成详细的制作信息。
 
 每个场景请提供：
+
 1. scripts: 将场景文本拆分为口播脚本行（每句一行，格式"脚本1：xxx"）
 2. properNouns: 提取专名清单 [{name, type}]（type可以取：人物、地名、封号、典籍、群体、年代、事件等）
 3. era: 该场景对应的国家/年代（如"中国 / 明朝洪武年间"）
 4. sources: 推荐素材来源（如"《中国通史》纪录片"、"《大明宫》纪录片"）
 5. preference: 素材风格偏好（场景氛围、色调、镜头风格等）
-6. visualDesc: 详细的画面描述（50-100字）
-7. materialQuery: 英文素材检索关键词
+6. visualDesc: 【画面描述】只描述观众在屏幕上看到的画面内容。核心规则：如果脚本中提到了具体的影视作品（如"大明王朝1566"、"《三国演义》电视剧"、"某纪录片"），画面描述必须指明是该作品的相关画面；如果没有具体作品，则描述该场景应有的典型画面。示例：
+   - 脚本提到"大明王朝1566" → "《大明王朝1566》电视剧画面，展现明朝嘉靖年间严嵩父子专权、海瑞上疏等经典朝堂场景"
+   - 脚本提到朱元璋 → "明朝开国相关历史纪录片画面或古装影视剧画面，展现明太祖朱元璋戎马生涯与开国大典"
+   - 脚本描述战场 → "古代战争影视剧片段，骑兵冲锋、万箭齐发的大场面"
+7. materialQuery: 【素材检索词】中文关键词，用于在Bilibili搜索素材。规则：
+   - 如果脚本明确提到某个影视作品（电视剧/纪录片/电影），优先使用该作品名作为检索词，如"大明王朝1566 电视剧"
+   - 如果没有具体作品，则组合"核心内容 + 影视作品/纪录片"，如"朱棣靖难 电视剧"、"明朝开国 纪录片"
+   - 要具体可搜索，不要抽象形容词
 8. sceneType: 画面类型，取 REAL_FOOTAGE（实拍素材）或 ANIMATION（动画素材）
 
 场景内容：
@@ -187,8 +196,8 @@ ${sceneList}
       "era": "中国 / 明朝洪武年间",
       "sources": ["《中国通史》纪录片"],
       "preference": "北疆战场场景，色调偏冷峻，突出肃杀之气",
-      "visualDesc": "详细的画面描述...",
-      "materialQuery": "ming dynasty northern frontier battlefield",
+      "visualDesc": "《大明王朝1566》电视剧相关画面...",
+      "materialQuery": "大明王朝1566 电视剧",
       "sceneType": "REAL_FOOTAGE"
     }
   ]
@@ -219,6 +228,8 @@ ${sceneList}
         era: detail.era || "",
         sources: detail.sources || [],
         preference: detail.preference || "",
+        visualDesc: detail.visualDesc || "",
+        materialQuery: detail.materialQuery || "",
       };
     }
     console.log(`[quick-generate] Production details generated for ${parsed.scenes.length} scenes`);
@@ -281,8 +292,8 @@ export async function POST(
             sceneNumber: i + 1,
             title: s.title,
             voiceoverText: s.text,
-            visualDesc: s.meta?.scripts?.join("；") || s.text.slice(0, 80),
-            materialQuery: s.meta?.preference || s.text.replace(/[，。！？、]/g, " ").slice(0, 60),
+            visualDesc: s.meta?.visualDesc || s.text.slice(0, 80),
+            materialQuery: s.meta?.materialQuery || s.text.replace(/[，。！？、]/g, " ").slice(0, 60),
             productionMeta: s.meta ? JSON.stringify(s.meta) : null,
             wordCount: s.text.length,
             estimatedDuration: Math.round(s.text.length / CHARS_PER_SECOND),
