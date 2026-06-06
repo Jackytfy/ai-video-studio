@@ -104,6 +104,7 @@ export async function POST() {
       const scene = scenes[i];
       const audioFile = join(workDir, `tts-${i}.mp3`);
 
+      const estimatedDur = estimateAudioDuration(scene.voiceoverText);
       try {
         const res = await fetch(`${mimoBaseUrl}/chat/completions`, {
           method: "POST",
@@ -127,8 +128,8 @@ export async function POST() {
           throw new Error(`API ${res.status}`);
         }
       } catch (e) {
-        console.log(`[TEST-RENDER] Scene ${i} TTS fallback: ${e instanceof Error ? e.message : String(e)}`);
-        await execFileAsync("ffmpeg", ["-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", "5", "-c:a", "libmp3lame", "-b:a", "128k", audioFile], { timeout: 10000 });
+        console.log(`[TEST-RENDER] Scene ${i} TTS fallback (${estimatedDur.toFixed(1)}s): ${e instanceof Error ? e.message : String(e)}`);
+        await execFileAsync("ffmpeg", ["-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", String(estimatedDur), "-c:a", "libmp3lame", "-b:a", "128k", audioFile], { timeout: 10000 });
       }
 
       await prisma.scene.update({ where: { id: scene.id }, data: { audioUrl: audioFile, audioDuration: estimateAudioDuration(scene.voiceoverText) } });

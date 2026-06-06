@@ -124,8 +124,39 @@ function breakIntoLines(text: string, maxCharsPerLine: number): string[] {
 }
 
 /**
+ * Split text into sentences by Chinese/English punctuation.
+ * Short consecutive sentences are merged to avoid too-brief subtitle chunks.
+ */
+function splitIntoSentences(text: string): string[] {
+  // Split on sentence-ending punctuation (Chinese + English)
+  const raw = text.split(/(?<=[。！？；\n.!?;])/).map(s => s.trim()).filter(Boolean);
+  if (raw.length <= 1) return [text.trim()].filter(Boolean);
+
+  // Merge short consecutive sentences (≤4 chars) with neighbors
+  const merged: string[] = [];
+  let buf = "";
+  for (const seg of raw) {
+    buf += seg;
+    // Flush when buffer has enough content or ends with strong punctuation
+    if (buf.length >= 6 || /[。！？.!?]/.test(seg)) {
+      merged.push(buf);
+      buf = "";
+    }
+  }
+  if (buf) {
+    if (merged.length > 0) {
+      merged[merged.length - 1] += buf;
+    } else {
+      merged.push(buf);
+    }
+  }
+  return merged;
+}
+
+/**
  * Generate subtitle chunks. When scripts[] is provided, each script becomes
  * one timed chunk — subtitles stay in sync with voiceover pacing.
+ * Without scripts, auto-splits text by sentence boundaries.
  */
 export function generateSubtitleChunks(
   text: string,
@@ -139,8 +170,9 @@ export function generateSubtitleChunks(
     return generateScriptChunks(scripts, config, maxCharsPerLine);
   }
 
-  // Fallback: treat entire text as one script
-  return generateScriptChunks([text], config, maxCharsPerLine);
+  // Fallback: auto-split by sentence boundaries for better sync
+  const sentences = splitIntoSentences(text);
+  return generateScriptChunks(sentences, config, maxCharsPerLine);
 }
 
 /**
@@ -177,7 +209,22 @@ function generateScriptChunks(
     totalDuration = minReadableTotal;
   }
 
-  // 4. Build chunks
+  // 4. Calculate raw durations with minimum enforcement, then normalize to fit totalDuration
+  const rawDurations: number[] = [];
+  for (let i = 0; i < cleanScripts.length; i++) {
+    const proportion = scriptDurations[i] / totalScriptDuration;
+    let dur = proportion * totalDuration;
+    const charCount = cleanScripts[i].replace(/[^\u4e00-\u9fff\w]/g, "").length;
+    const minByLength = Math.max(1.5, charCount * 0.12);
+    rawDurations.push(Math.max(dur, minByLength));
+  }
+
+  // Normalize: scale all durations so they sum to totalDuration
+  const rawTotal = rawDurations.reduce((sum, d) => sum + d, 0);
+  const scaleFactor = rawTotal > totalDuration ? totalDuration / rawTotal : 1;
+  const normalizedDurations = rawDurations.map(d => d * scaleFactor);
+
+  // 5. Build chunks
   const chunks: SubtitleChunk[] = [];
   let timeCursor = 0;
 
@@ -185,12 +232,7 @@ function generateScriptChunks(
     const allLines = breakIntoLines(cleanScripts[i], maxCharsPerLine);
     if (allLines.length === 0) continue;
 
-    // Base duration for this script
-    const proportion = scriptDurations[i] / totalScriptDuration;
-    let scriptDuration = proportion * totalDuration;
-    const charCount = cleanScripts[i].replace(/[^\u4e00-\u9fff\w]/g, "").length;
-    const minByLength = Math.max(1.5, charCount * 0.12);
-    scriptDuration = Math.max(scriptDuration, minByLength);
+    const scriptDuration = normalizedDurations[i];
 
     const startTime = timeCursor;
     let endTime = timeCursor + scriptDuration;

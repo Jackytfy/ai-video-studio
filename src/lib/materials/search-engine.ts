@@ -104,7 +104,7 @@ function extractSearchKeywords(ctx: SceneSearchContext): string[] {
     "太子": "crown prince imperial court", "皇位": "imperial throne palace",
     "漠北": "mongolia desert grassland", "蒙古": "mongolia steppe nomadic",
     "大都": "ancient beijing imperial capital",
-    "戈壁": "gobi desert wilderness", "沙漠": "desert wasteland",
+    "戈壁": "gobi desert wilderness",
     "戍边": "frontier fortress ancient", "疆": "border frontier fortress",
     "广角": "wide angle landscape epic", "宏大": "epic cinematic grand",
     "压抑": "dark moody atmospheric", "孤绝": "lonely dramatic solitude",

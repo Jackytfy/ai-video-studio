@@ -132,9 +132,19 @@ export async function renderProjectInline(
 
     for (let i = 0; i < scenes.length; i++) {
       const scene = scenes[i];
-      if (scene.audioUrl) continue;
-
       const audioFile = join(workDir, `tts-${i}.mp3`);
+
+      // Skip TTS only if audioUrl exists AND the file is still on disk
+      if (scene.audioUrl) {
+        try {
+          await readFile(audioFile);
+          continue; // File exists, skip TTS
+        } catch {
+          // File was cleaned up, need to regenerate
+          console.warn(`[Render] Scene ${i} audioUrl set but file missing, regenerating TTS`);
+        }
+      }
+      const estimatedDuration = estimateAudioDuration(scene.voiceoverText);
 
       if (isMiMo) {
         // MiMo TTS
@@ -150,34 +160,91 @@ export async function renderProjectInline(
             audio: { format: "wav", voice: mimoVoice },
           }),
         });
+        let mimoOk = false;
         if (res.ok) {
           const data = await res.json();
           const audioData = data.choices?.[0]?.message?.audio?.data;
           if (audioData) {
             await writeFile(audioFile, Buffer.from(audioData, "base64"));
+            mimoOk = true;
+          }
+        }
+        if (!mimoOk) {
+          console.warn(`[Render] MiMo TTS failed for scene ${i}, using silent audio (${estimatedDuration.toFixed(1)}s)`);
+          try {
+            await execFileAsync("ffmpeg", [
+              "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+              "-t", String(estimatedDuration), "-c:a", "libmp3lame", "-b:a", "128k", audioFile,
+            ], { timeout: 10000 });
+          } catch {
+            // Generate WAV silent audio as last resort
+            const sampleRate = 44100;
+            const numSamples = Math.ceil(estimatedDuration * sampleRate);
+            const dataSize = numSamples * 2 * 2;
+            const wav = Buffer.alloc(44 + dataSize);
+            wav.write("RIFF", 0);
+            wav.writeUInt32LE(36 + dataSize, 4);
+            wav.write("WAVE", 8);
+            wav.write("fmt ", 12);
+            wav.writeUInt32LE(16, 16);
+            wav.writeUInt16LE(1, 20);
+            wav.writeUInt16LE(2, 22);
+            wav.writeUInt32LE(44100, 24);
+            wav.writeUInt32LE(176400, 28);
+            wav.writeUInt16LE(4, 32);
+            wav.writeUInt16LE(16, 34);
+            wav.write("data", 36);
+            wav.writeUInt32LE(dataSize, 40);
+            await writeFile(audioFile, wav).catch(() => {});
           }
         }
       } else {
         // Edge TTS with shell-based Python detection
         const ttsOk = await generateTTS(scene.voiceoverText, edgeVoice, audioFile);
         if (!ttsOk) {
-          console.warn(`[Render] TTS failed for scene ${i}, using silent audio`);
+          console.warn(`[Render] TTS failed for scene ${i}, using silent audio (${estimatedDuration.toFixed(1)}s)`);
           try {
             await execFileAsync("ffmpeg", [
               "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-              "-t", "5", "-c:a", "libmp3lame", "-b:a", "128k", audioFile,
+              "-t", String(estimatedDuration), "-c:a", "libmp3lame", "-b:a", "128k", audioFile,
             ], { timeout: 10000 });
           } catch (ffErr) {
             console.error(`[Render] Silent audio fallback failed for scene ${i}:`, ffErr);
-            // Last resort: write minimal silent mp3 via Node
+            // Last resort: generate proper silent WAV of correct duration
+            const sampleRate = 44100;
+            const channels = 2;
+            const bytesPerSample = 2;
+            const numSamples = Math.ceil(estimatedDuration * sampleRate);
+            const dataSize = numSamples * channels * bytesPerSample;
+            const headerSize = 44;
+            const wav = Buffer.alloc(headerSize + dataSize);
+            // WAV header
+            wav.write("RIFF", 0);
+            wav.writeUInt32LE(36 + dataSize, 4);
+            wav.write("WAVE", 8);
+            wav.write("fmt ", 12);
+            wav.writeUInt32LE(16, 16);
+            wav.writeUInt16LE(1, 20); // PCM
+            wav.writeUInt16LE(channels, 22);
+            wav.writeUInt32LE(sampleRate, 24);
+            wav.writeUInt32LE(sampleRate * channels * bytesPerSample, 28);
+            wav.writeUInt16LE(channels * bytesPerSample, 32);
+            wav.writeUInt16LE(16, 34);
+            wav.write("data", 36);
+            wav.writeUInt32LE(dataSize, 40);
+            // samples are already zero (silence)
             const { writeFile } = await import("fs/promises");
-            // Minimal valid MP3 frame (silence, 44100Hz stereo)
-            const silentMp3 = Buffer.from([
-              0xFF,0xFB,0x90,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-              0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-              0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-            ]);
-            await writeFile(audioFile, silentMp3).catch(() => {});
+            const wavFile = audioFile.replace(/\.mp3$/, ".wav");
+            await writeFile(wavFile, wav).catch(() => {});
+            // Convert WAV to MP3 for consistent pipeline
+            try {
+              await execFileAsync("ffmpeg", [
+                "-y", "-i", wavFile, "-c:a", "libmp3lame", "-b:a", "128k", audioFile,
+              ], { timeout: 10000 });
+            } catch {
+              // If MP3 conversion fails, use WAV directly — rename input
+              await writeFile(audioFile, wav).catch(() => {});
+            }
           }
         }
       }
@@ -611,9 +678,11 @@ export async function renderProjectInline(
               const scaleFilter = `scale=${targetW}:${targetH}:force_original_aspect_ratio=decrease,pad=${targetW}:${targetH}:(ow-iw)/2:(oh-ih)/2:black`;
 
               if (ext === "jpg") {
+                // Use estimated speech duration so image covers full voiceover
+                const imgDuration = Math.max(5, Math.ceil(estimateAudioDuration(scenes[i].voiceoverText)));
                 await execFileAsync("ffmpeg", [
                   "-y", "-loop", "1", "-i", processedPath,
-                  "-c:v", "libx264", "-t", "5", "-pix_fmt", "yuv420p",
+                  "-c:v", "libx264", "-t", String(imgDuration), "-pix_fmt", "yuv420p",
                   "-vf", scaleFilter,
                   "-an", materialFile,
                 ], { timeout: 30000 });
@@ -631,21 +700,30 @@ export async function renderProjectInline(
                 } catch {}
 
                 let trimArgs: string[] = [];
-                if (videoDuration > 10) {
-                  const clipLength = Math.min(Math.max(videoDuration * 0.15, 5), 7);
+                const neededDuration = Math.ceil(estimateAudioDuration(scenes[i].voiceoverText));
+                const needsLoop = videoDuration > 0 && videoDuration < neededDuration;
+                if (videoDuration > 10 && !needsLoop) {
+                  // Long enough video: extract a highlight clip at least neededDuration long
+                  const clipLength = Math.min(Math.max(videoDuration * 0.15, neededDuration), videoDuration - 2);
                   const maxStart = videoDuration - clipLength - 2;
                   const startSec = Math.max(1, Math.min(videoDuration * 0.2, maxStart));
                   const startTime = startSec.toFixed(2);
                   trimArgs = ["-ss", startTime, "-t", String(Math.round(clipLength))];
-                  console.log(`[Render] Scene ${i} trimming ${clipLength.toFixed(1)}s from ${startTime}s (total ${videoDuration.toFixed(1)}s)`);
+                  console.log(`[Render] Scene ${i} trimming ${clipLength.toFixed(1)}s from ${startTime}s (total ${videoDuration.toFixed(1)}s, need ${neededDuration}s)`);
                 } else if (videoDuration > 0) {
-                  console.log(`[Render] Scene ${i} video short (${videoDuration.toFixed(1)}s), using full clip`);
+                  console.log(`[Render] Scene ${i} video short (${videoDuration.toFixed(1)}s, need ${neededDuration}s), ${needsLoop ? "looping" : "using full clip"}`);
                 }
 
+                const loopArgs = needsLoop ? ["-stream_loop", "-1"] : [];
+
+                // Cap output duration for looped videos
+                const durationCap = needsLoop ? ["-t", String(neededDuration)] : [];
+
                 await execFileAsync("ffmpeg", [
-                  "-y", ...trimArgs, "-i", processedPath,
+                  "-y", ...loopArgs, ...trimArgs, "-i", processedPath,
                   "-c:v", "libx264", "-preset", "fast", "-crf", "23",
                   "-vf", scaleFilter,
+                  ...durationCap,
                   "-an", "-pix_fmt", "yuv420p", materialFile,
                 ], { timeout: 60000 });
               }
@@ -717,19 +795,33 @@ export async function renderProjectInline(
       let hasAudio = true;
       try { await readFile(audioFile); } catch { hasAudio = false; }
       if (!hasAudio) {
+        console.warn(`[Render] Compose: audio missing for scene ${i}, generating fallback`);
+        const estimatedDur = estimateAudioDuration(scenes[i].voiceoverText);
         try {
           await execFileAsync("ffmpeg", [
             "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-            "-t", "5", "-c:a", "libmp3lame", "-b:a", "128k", audioFile,
+            "-t", String(estimatedDur), "-c:a", "libmp3lame", "-b:a", "128k", audioFile,
           ], { timeout: 10000 });
         } catch {
-          // Last resort minimal MP3
-          const silentMp3 = Buffer.from([
-            0xFF,0xFB,0x90,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-          ]);
-          await writeFile(audioFile, silentMp3).catch(() => {});
+          // Generate proper silent WAV
+          const sampleRate = 44100;
+          const numSamples = Math.ceil(estimatedDur * sampleRate);
+          const dataSize = numSamples * 2 * 2;
+          const wav = Buffer.alloc(44 + dataSize);
+          wav.write("RIFF", 0);
+          wav.writeUInt32LE(36 + dataSize, 4);
+          wav.write("WAVE", 8);
+          wav.write("fmt ", 12);
+          wav.writeUInt32LE(16, 16);
+          wav.writeUInt16LE(1, 20);
+          wav.writeUInt16LE(2, 22);
+          wav.writeUInt32LE(44100, 24);
+          wav.writeUInt32LE(176400, 28);
+          wav.writeUInt16LE(4, 32);
+          wav.writeUInt16LE(16, 34);
+          wav.write("data", 36);
+          wav.writeUInt32LE(dataSize, 40);
+          await writeFile(audioFile, wav).catch(() => {});
         }
       }
 
