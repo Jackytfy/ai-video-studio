@@ -3,6 +3,7 @@ import { execFile, exec } from "child_process";
 import { promisify } from "util";
 import { readFile, writeFile, unlink, mkdir, rm } from "fs/promises";
 import { join } from "path";
+import { probeDimensions, detectWatermarkRegions } from "@/lib/materials/watermark";
 import { randomUUID } from "crypto";
 import { tmpdir } from "os";
 import {
@@ -632,8 +633,7 @@ export async function renderProjectInline(
               await writeFile(localPath, buffer);
               console.log(`[Render] Scene ${i} material downloaded: ${(buffer.length / 1024).toFixed(0)}KB`);
 
-              // Watermark removal for Bilibili/douyin
-              // Strategy: delogo (position-based) + subtle crop + denoise
+              // Watermark removal — dynamic detection based on actual video dimensions
               let processedPath = localPath;
               const needsWatermarkRemoval =
                 (material.source !== "STOCK_FOOTAGE" && material.source !== "AI_GENERATED") ||
@@ -642,32 +642,38 @@ export async function renderProjectInline(
               if (needsWatermarkRemoval) {
                 const cleanPath = join(workDir, `clean-${i}.${ext}`);
                 try {
-                  // delogo: masks logo at Bilibili standard positions
-                  // crop: subtle edge trim for corner watermarks
-                  // hqdn3d: light denoise to blur faint watermarks
-                  const watermarkFilter = [
-                    "delogo=x=5:y=5:w=200:h=65:show=0",
-                    "delogo=x=w-200:y=5:w=200:h=65:show=0",
-                    "crop=iw*0.97:ih*0.97:iw*0.015:ih*0.015",
-                  ].join(",");
+                  // Probe actual dimensions for accurate watermark positioning
+                  const dims = await probeDimensions(localPath);
+                  if (dims.width > 0 && dims.height > 0) {
+                    const regions = detectWatermarkRegions(dims.width, dims.height);
+                    // Build delogo filter chain from detected regions
+                    const delogoFilters = regions.map(
+                      (r) => `delogo=x=${r.x}:y=${r.y}:w=${r.width}:h=${r.height}:show=0`
+                    );
+                    // Crop 3% edges + denoise to blur faint marks
+                    const cropFilter = `crop=iw*0.94:ih*0.94:iw*0.03:ih*0.03,hqdn3d=2:2:3:3`;
+                    const watermarkFilter = [...delogoFilters, cropFilter].join(",");
 
-                  await execFileAsync("ffmpeg", [
-                    "-y", "-i", localPath,
-                    "-vf", watermarkFilter,
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                    "-an", cleanPath,
-                  ], { timeout: 30000 });
-                  processedPath = cleanPath;
-                } catch {
-                  // Fallback: simple crop if delogo fails
-                  try {
                     await execFileAsync("ffmpeg", [
                       "-y", "-i", localPath,
-                      "-vf", "crop=iw*0.95:ih*0.95:iw*0.025:ih*0.025",
+                      "-vf", watermarkFilter,
                       "-c:v", "libx264", "-preset", "fast", "-crf", "23",
                       "-an", cleanPath,
                     ], { timeout: 30000 });
                     processedPath = cleanPath;
+                    console.log(`[Render] Scene ${i} watermark removed (${dims.width}x${dims.height}, ${regions.length} regions)`);
+                  }
+                } catch {
+                  // Fallback: aggressive crop if delogo fails
+                  try {
+                    await execFileAsync("ffmpeg", [
+                      "-y", "-i", localPath,
+                      "-vf", "crop=iw*0.92:ih*0.92:iw*0.04:ih*0.04",
+                      "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                      "-an", cleanPath,
+                    ], { timeout: 30000 });
+                    processedPath = cleanPath;
+                    console.log(`[Render] Scene ${i} watermark fallback crop applied`);
                   } catch {}
                 }
               }
