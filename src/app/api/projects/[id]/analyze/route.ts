@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { requireSession, unauthorized } from "@/lib/auth/session";
 import { analyzeContent, buildProviderConfig } from "@/lib/ai";
+import { splitLongText } from "@/lib/ai/chapterize";
 
 export async function POST(
   _req: Request,
@@ -31,10 +32,26 @@ export async function POST(
       buildProviderConfig(session.user)
     );
 
+    // For long texts, pre-split into chapters and scene segments
+    const WORD_THRESHOLD = 800;
+    const textLength = (project.sourceText.match(/[\u4e00-\u9fff]/g) || []).length +
+      project.sourceText.replace(/[\u4e00-\u9fff]/g, " ").split(/\s+/).filter(w => w).length;
+
+    let chapterInfo = null;
+    if (textLength > WORD_THRESHOLD) {
+      const { chapters, scenes } = splitLongText(project.sourceText);
+      chapterInfo = {
+        totalChapters: chapters.length,
+        totalScenes: scenes.length,
+        chapters: chapters.map(c => ({ title: c.title, wordCount: c.wordCount })),
+        sceneSegments: scenes,
+      };
+    }
+
     await prisma.project.update({
       where: { id },
       data: {
-        aiAnalysis: JSON.stringify(analysis),
+        aiAnalysis: JSON.stringify({ ...analysis, chapterInfo }),
         status: "DRAFT",
       },
     });

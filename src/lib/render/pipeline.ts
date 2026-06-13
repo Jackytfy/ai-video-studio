@@ -12,6 +12,8 @@ import {
   estimateAudioDuration,
   type SubtitleConfig,
 } from "./subtitle";
+import { mapConcurrent } from "@/lib/utils/concurrent";
+import { withRetry, isFFmpegRetryableError, isNetworkError } from "@/lib/utils/retry";
 
 const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
@@ -131,18 +133,22 @@ export async function renderProjectInline(
     const isMiMo = user?.ttsProvider === "mimo";
     const edgeVoice = user?.ttsVoice || "zh-CN-YunxiNeural";
 
-    for (let i = 0; i < scenes.length; i++) {
-      const scene = scenes[i];
+    // TTS with concurrency (3 parallel TTS calls)
+    const TTS_CONCURRENCY = 3;
+    const ttsResults = await mapConcurrent(scenes, TTS_CONCURRENCY, async (scene, i) => {
       const audioFile = join(workDir, `tts-${i}.mp3`);
 
       // Skip TTS only if audioUrl exists AND the file is still on disk
       if (scene.audioUrl) {
         try {
-          await readFile(audioFile);
-          continue; // File exists, skip TTS
+          const stat = await import("fs/promises").then(m => m.stat(audioFile));
+          if (stat.size > 100) {
+            // Verify it's a valid audio file by probing duration
+            const dur = await getAudioDuration(audioFile);
+            if (dur > 0) return { index: i, audioFile, duration: dur };
+          }
         } catch {
-          // File was cleaned up, need to regenerate
-          console.warn(`[Render] Scene ${i} audioUrl set but file missing, regenerating TTS`);
+          console.warn(`[Render] Scene ${i} audioUrl set but file missing/invalid, regenerating TTS`);
         }
       }
       const estimatedDuration = estimateAudioDuration(scene.voiceoverText);
@@ -250,10 +256,31 @@ export async function renderProjectInline(
         }
       }
 
+      // Verify TTS output and get actual duration
+      let actualDuration = 0;
+      try {
+        const stat = await import("fs/promises").then(m => m.stat(audioFile));
+        if (stat.size < 100) {
+          throw new Error("TTS output file too small");
+        }
+        actualDuration = await getAudioDuration(audioFile);
+      } catch {}
+      if (actualDuration <= 0) {
+        actualDuration = estimateAudioDuration(scene.voiceoverText);
+      }
+
       await prisma.scene.update({
         where: { id: scene.id },
-        data: { audioUrl: audioFile, audioDuration: estimateAudioDuration(scene.voiceoverText) },
+        data: { audioUrl: audioFile, audioDuration: actualDuration },
       });
+
+      return { index: i, audioFile, duration: actualDuration };
+    });
+
+    // Build a map of scene index → actual TTS audio duration
+    const ttsDurationMap = new Map<number, number>();
+    for (const result of ttsResults) {
+      if (result) ttsDurationMap.set(result.index, result.duration);
     }
 
     // Materials stage
@@ -262,109 +289,174 @@ export async function renderProjectInline(
       data: { status: "MATERIALS_LOADING", currentStage: "materials" },
     });
 
-    for (let i = 0; i < scenes.length; i++) {
-      const scene = scenes[i];
+    // Materials stage with concurrency (2 parallel material searches)
+    const MATERIALS_CONCURRENCY = 2;
+    await mapConcurrent(scenes, MATERIALS_CONCURRENCY, async (scene, i) => {
       const materialFile = join(workDir, `scene-${i}.mp4`);
       let materialLoaded = false;
 
-      // Auto-search materials from Bilibili if none attached
-      if (!scene.materialId) {
+      // Parse production meta (used by both auto-search and download)
+      let meta: any = null;
+      if (scene.productionMeta) {
+        try { meta = JSON.parse(scene.productionMeta as string); } catch {}
+      }
+      const sourceVideos: string[] = meta?.sourceVideos || [];
+      const materialQuery = meta?.materialQuery || scene.materialQuery || "";
+      const visualDesc = meta?.visualDesc || scene.visualDesc || "";
+
+      // ── Auto-search materials from Bilibili if none attached ──
+      async function autoSearchBilibili(): Promise<boolean> {
         try {
-          // Parse production meta
-          let meta: any = null;
-          if (scene.productionMeta) {
-            try { meta = JSON.parse(scene.productionMeta as string); } catch {}
-          }
+          // ── Build prioritized search queries ──
+          // Strategy: sourceVideos + visualDesc keywords > sourceVideos + materialQuery > visualDesc > materialQuery > properNouns > voiceover
 
-          // Build search queries
-          // Priority: materialQuery (AI-generated) > visualDesc work names > properNouns > voiceover text
-          let primaryQuery = "";
-          let secondaryQuery = "";
+          const abstractWords = new Set([
+            "画面", "描述", "展现", "展示", "呈现", "表现", "体现", "反映",
+            "风格", "色调", "氛围", "镜头", "光影", "构图", "采用", "运用",
+            "使用", "适合", "需要", "可以", "强烈", "突出", "营造",
+            "冷硬", "惨烈", "阴森", "压抑", "悲壮", "辉煌", "宏伟",
+            "相关", "经典", "场景", "缓缓", "慢慢", "特写", "全景", "近景", "远景",
+            "例如", "视频", "片段", "该部", "这部", "中的", "聚焦", "注重",
+            "整体", "戏剧", "冲突", "悲剧", "色彩", "恐怖", "紧张", "庄严",
+          ]);
 
-          // 1. materialQuery — AI-generated search term, HIGHEST priority
-          const materialQuery = meta?.materialQuery || scene.materialQuery || "";
-          if (materialQuery) {
-            primaryQuery = materialQuery;
-          }
+          // Extract concrete scene keywords from visualDesc (people, actions, places, events)
+          // Use 2-4 char segments for better Bilibili search matching
+          function extractSceneKeywords(text: string): string[] {
+            if (!text) return [];
+            // First try to extract known concrete patterns
+            const keywords: string[] = [];
 
-          // 2. visualDesc — extract concrete work names (《xxx》) or historical figures/events
-          const visualDesc = meta?.visualDesc || scene.visualDesc || "";
-          if (!primaryQuery && visualDesc) {
-            // 2a. Extract 影视作品 names from 《书名号》
-            const workMatches = visualDesc.match(/《([^》]+)》/g) || [];
-            const workNames = workMatches.map((m: string) => m.replace(/[《》]/g, ""));
-            if (workNames.length > 0) {
-              primaryQuery = workNames.slice(0, 2).join(" ") + " 纪录片";
-            }
+            // Extract 《》 book/work names
+            const workMatches = text.match(/《([^》]+)》/g) || [];
+            workMatches.forEach((m: string) => {
+              const name = m.replace(/[《》]/g, "");
+              if (name.length >= 2 && name.length <= 8) keywords.push(name);
+            });
 
-            // 2b. No 书名号 — extract meaningful concrete nouns (people, places, events, eras)
-            if (!primaryQuery) {
-              // Match Chinese words, but filter out abstract/generic terms
-              const allWords = visualDesc.match(/[\u4e00-\u9fff]{2,10}/g) || [];
-              const abstractWords = new Set([
-                "画面", "描述", "展现", "展示", "呈现", "表现", "体现", "反映",
-                "相关", "经典", "场景", "镜头", "光影", "色调", "氛围", "风格",
-                "构图", "缓缓", "慢慢", "特写", "全景", "近景", "远景",
-                "采用", "运用", "使用", "适合", "需要", "可以", "例如",
-                "视频", "片段", "该部", "这部", "相关", "中的",
+            // Extract 2-4 char concrete nouns (shorter = better for search)
+            const shortWords = text.match(/[\u4e00-\u9fff]{2,4}/g) || [];
+            const seen = new Set(keywords);
+            for (const w of shortWords) {
+              if (seen.has(w)) continue;
+              if (abstractWords.has(w)) continue;
+              if (/^[一二三四五六七八九十百千万亿]+$/.test(w)) continue;
+              // Filter out incomplete verb phrases (ends with 在/的/了/着/过/和/与)
+              if (/[在的了着过和与及把被从向往]$/ .test(w)) continue;
+              // Filter out common non-searchable words
+              const nonSearchable = new Set([
+                "这是", "那是", "他的", "她的", "我的", "这个", "那个", "这些", "那些",
+                "最后", "首先", "然后", "接着", "同时", "此时", "画面", "镜头", "切换",
+                "缓缓", "慢慢", "快速", "逐渐", "最终", "开始", "结束", "显示", "展示",
+                "映照", "笼罩", "充满", "转为", "变为", "化为", "定格", "聚焦",
               ]);
-              // Keep concrete terms: history figures, dynasties, battles, places
-              const concreteWords = allWords.filter((w: string) => {
-                if (abstractWords.has(w)) return false;
-                if (/^[一二三四五六七八九十百千万亿]+$/.test(w)) return false; // pure numbers
-                if (w.length < 2 || w.length > 8) return false;
-                return true;
+              if (nonSearchable.has(w)) continue;
+              keywords.push(w);
+              seen.add(w);
+              if (keywords.length >= 6) break;
+            }
+
+            return keywords.slice(0, 6);
+          }
+
+          // Extract concrete keywords from materialQuery
+          function extractMaterialKeywords(query: string): string {
+            if (!query) return "";
+            if (query.length <= 20) return query;
+            const words = query.match(/[一-鿿]{2,8}/g) || [];
+            const concrete = words.filter((w: string) => !abstractWords.has(w));
+            return concrete.length > 0
+              ? [...new Set(concrete)].slice(0, 4).join(" ")
+              : query.substring(0, 20);
+          }
+
+          const visualKeywords = extractSceneKeywords(visualDesc);
+          const materialKeywords = extractMaterialKeywords(materialQuery);
+
+          // Build ordered list of search queries to try
+          const searchQueries: { query: string; label: string }[] = [];
+
+          // Q1: sourceVideos + visualDesc scene keywords (MOST PRECISE — targets specific TV show + scene)
+          if (sourceVideos.length > 0 && visualKeywords.length > 0) {
+            searchQueries.push({
+              query: `${sourceVideos[0]} ${visualKeywords.slice(0, 3).join(" ")}`,
+              label: "剧名+画面关键词",
+            });
+          }
+
+          // Q2: sourceVideos + materialQuery
+          if (sourceVideos.length > 0 && materialKeywords) {
+            searchQueries.push({
+              query: `${sourceVideos[0]} ${materialKeywords}`,
+              label: "剧名+检索词",
+            });
+          }
+
+          // Q3: Try 2nd/3rd sourceVideos if available
+          for (let si = 1; si < Math.min(sourceVideos.length, 3); si++) {
+            if (visualKeywords.length > 0) {
+              searchQueries.push({
+                query: `${sourceVideos[si]} ${visualKeywords.slice(0, 3).join(" ")}`,
+                label: `备选剧名${si}+画面关键词`,
               });
-              if (concreteWords.length > 0) {
-                primaryQuery = [...new Set(concreteWords)].slice(0, 4).join(" ") + " 纪录片";
-              }
             }
           }
 
-          // 3. properNouns + era — concrete historical entities
-          if (!primaryQuery) {
+          // Q4: visualDesc keywords alone (without sourceVideos)
+          if (visualKeywords.length > 0) {
+            searchQueries.push({
+              query: visualKeywords.join(" ") + " 电视剧",
+              label: "画面关键词+电视剧",
+            });
+            searchQueries.push({
+              query: visualKeywords.join(" ") + " 纪录片",
+              label: "画面关键词+纪录片",
+            });
+          }
+
+          // Q5: materialQuery alone
+          if (materialKeywords) {
+            searchQueries.push({
+              query: materialKeywords,
+              label: "检索词",
+            });
+          }
+
+          // Q6: properNouns + era
+          {
             const fallbackTerms: string[] = [];
             if (meta?.properNouns?.length) {
               const names = meta.properNouns.map((pn: any) => pn.name).filter(Boolean);
               fallbackTerms.push(...names);
             }
             if (meta?.era) {
-              // Extract dynasty/era like "明朝", "清朝", "清初"
               const eraWords = meta.era.match(/[\u4e00-\u9fff]{2,6}/g) || [];
               fallbackTerms.push(...eraWords);
             }
             if (fallbackTerms.length > 0) {
-              primaryQuery = [...new Set(fallbackTerms)].slice(0, 4).join(" ") + " 纪录片";
+              searchQueries.push({
+                query: [...new Set(fallbackTerms)].slice(0, 4).join(" ") + " 纪录片",
+                label: "专有名词+纪录片",
+              });
             }
           }
 
-          // 4. Secondary query from sources + era (concrete sources like "中国通史")
-          const contextText = [
-            meta?.sources?.join(" ") || "",
-            meta?.era || "",
-          ].join(" ");
-          if (contextText) {
-            const phrases = contextText.match(/[\u4e00-\u9fff]{2,8}/g) || [];
-            const stopWords = new Set(["色调", "镜头", "风格", "突出", "展现", "场景", "聚焦", "注重",
-              "描述", "画面", "整体", "氛围", "采用", "运用", "使用", "适合", "需要", "可以",
-              "纪录片", "电视剧", "电影", "视频", "来源"]);
-            const contextTerms = phrases
-              .filter((p: string) => !stopWords.has(p) && p.length >= 2)
-              .slice(0, 4);
-            secondaryQuery = [...new Set(contextTerms)].join(" ");
-          }
-
-          // 5. Last resort: voiceover text
-          if (!primaryQuery && !secondaryQuery) {
+          // Q7: Last resort — voiceover text
+          {
             const voiceText = scene.voiceoverText || scene.title || "";
-            // Extract concrete nouns from voiceover (simple approach: take first few 2-4 char words)
             const voiceWords = voiceText.match(/[\u4e00-\u9fff]{2,6}/g) || [];
-            const voiceStop = new Set(["然后", "为啥", "为什么", "不是", "今天", "肯定", "听过", "不是", "真实", "发生", "所有", "必须", "几乎", "只留", "一点"]);
+            const voiceStop = new Set(["然后", "为啥", "为什么", "不是", "今天", "肯定", "听过", "真实", "发生", "所有", "必须", "几乎", "只留", "一点"]);
             const filteredVoice = voiceWords.filter((w: string) => !voiceStop.has(w)).slice(0, 4);
-            primaryQuery = filteredVoice.join(" ") || voiceText.slice(0, 20) || "历史";
+            if (filteredVoice.length > 0) {
+              searchQueries.push({
+                query: filteredVoice.join(" ") + " 纪录片",
+                label: "口播文本+纪录片",
+              });
+            }
           }
 
-          console.log(`[Render] Scene ${i} search: primary="${primaryQuery.slice(0, 50)}" secondary="${secondaryQuery.slice(0, 50)}"`);
+          console.log(`[Render] Scene ${i} search plan (${searchQueries.length} queries):`);
+          searchQueries.forEach((sq, qi) => console.log(`  Q${qi + 1} [${sq.label}]: "${sq.query}"`));
 
           // Search with primary query first, fallback to secondary query
           async function bilibiliSearch(query: string, retries = 2): Promise<any[]> {
@@ -438,117 +530,106 @@ export async function renderProjectInline(
             } catch { return false; }
           }
 
-          // Try primary query first (based on visualDesc)
-          let results = await bilibiliSearch(primaryQuery);
+          // ── Execute search queries in priority order, stop at first match ──
+          let matchedVideo: { bvid: string; streamUrl: string; title: string; pic: string; durSec: number; usedQuery: string } | null = null;
 
-          // Fallback to secondary query if primary returns nothing
-          if (results.length === 0 && secondaryQuery) {
-            console.log(`[Render] Scene ${i} primary query empty, trying secondary context query`);
-            results = await bilibiliSearch(secondaryQuery);
-          }
+          for (const sq of searchQueries) {
+            if (matchedVideo) break;
+            const results = await bilibiliSearch(sq.query);
+            console.log(`[Render] Scene ${i} Q[${sq.label}] "${sq.query}" → ${results.length} results`);
 
-          // Last resort: combine both
-          if (results.length === 0 && primaryQuery && secondaryQuery) {
-            results = await bilibiliSearch(`${primaryQuery} ${secondaryQuery}`);
-          }
+            for (const video of results) {
+              if (matchedVideo) break;
+              const bvid = video.bvid;
+              if (!bvid) continue;
 
-          // Super-broad fallback: search with just the era + "纪录片"
-          if (results.length === 0 && meta?.era) {
-            const eraWords = meta.era.match(/[\u4e00-\u9fff]{2,6}/g) || [];
-            const broadQuery = eraWords.slice(0, 2).join(" ") + " 历史 纪录片";
-            console.log(`[Render] Scene ${i} all specific queries empty, trying broad: "${broadQuery}"`);
-            results = await bilibiliSearch(broadQuery);
-          }
+              const durParts = (video.duration || "0:00").split(":").map(Number);
+              const durSec = durParts.length === 2 ? durParts[0]*60+durParts[1] : durParts[0]*3600+durParts[1]*60+durParts[2];
+              const maxDuration = sourceVideos.length > 0 ? 1800 : 600;
+              if (durSec < 5 || durSec > maxDuration) continue;
 
-          console.log(`[Render] Scene ${i} Bilibili found ${results.length} videos`);
-
-          // Find first 16:9 usable video
-          for (const video of results) {
-            if (materialLoaded) break;
-            const bvid = video.bvid;
-            if (!bvid) continue;
-
-            const durParts = (video.duration || "0:00").split(":").map(Number);
-            const durSec = durParts.length === 2 ? durParts[0]*60+durParts[1] : durParts[0]*3600+durParts[1]*60+durParts[2];
-            if (durSec < 5 || durSec > 600) continue;
-
-            let streamUrl: string | null = null;
-            try {
-              const infoRes = await fetch(`https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`, {
-                headers: { "User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/" },
-                signal: AbortSignal.timeout(8000),
-              });
-              if (infoRes.ok) {
-                const infoData = await infoRes.json();
-                const cid = infoData.data?.cid;
-                if (cid) {
-                  const streamRes = await fetch(
-                    `https://api.bilibili.com/x/player/playurl?bvid=${bvid}&cid=${cid}&qn=80&fnval=1`,
-                    { headers: { "User-Agent": "Mozilla/5.0", "Referer": `https://www.bilibili.com/video/${bvid}` } }
-                  );
-                  if (streamRes.ok) {
-                    const streamData = await streamRes.json();
-                    streamUrl = streamData.data?.durl?.[0]?.url || null;
+              let streamUrl: string | null = null;
+              try {
+                const infoRes = await fetch(`https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`, {
+                  headers: { "User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/" },
+                  signal: AbortSignal.timeout(8000),
+                });
+                if (infoRes.ok) {
+                  const infoData = await infoRes.json();
+                  const cid = infoData.data?.cid;
+                  if (cid) {
+                    const streamRes = await fetch(
+                      `https://api.bilibili.com/x/player/playurl?bvid=${bvid}&cid=${cid}&qn=80&fnval=1`,
+                      { headers: { "User-Agent": "Mozilla/5.0", "Referer": `https://www.bilibili.com/video/${bvid}` } }
+                    );
+                    if (streamRes.ok) {
+                      const streamData = await streamRes.json();
+                      streamUrl = streamData.data?.durl?.[0]?.url || null;
+                    }
                   }
                 }
-              }
-            } catch { continue; }
+              } catch { continue; }
 
-            if (!streamUrl) continue;
+              if (!streamUrl) continue;
 
-            // Validate 16:9 aspect ratio before saving
-            const probePath = join(workDir, `probe-${i}-${bvid}.mp4`);
-            let ratio = 1.78; // default: assume 16:9 if probe fails
-            try {
-              const ok = await quickDownloadHead(streamUrl, probePath, 524288); // 512KB head
-              if (ok) {
-                const reso = await probeVideoResolution(probePath);
-                if (reso) {
-                  ratio = reso.width / reso.height;
-                  console.log(`[Render] Scene ${i} candidate [${bvid}] ${reso.width}x${reso.height} ratio=${ratio.toFixed(2)}`);
-                } else {
-                  console.log(`[Render] Scene ${i} candidate [${bvid}] probe failed, assume landscape`);
+              // Validate aspect ratio
+              const probePath = join(workDir, `probe-${i}-${bvid}.mp4`);
+              let ratio = 1.78;
+              try {
+                const ok = await quickDownloadHead(streamUrl, probePath, 524288);
+                if (ok) {
+                  const reso = await probeVideoResolution(probePath);
+                  if (reso) {
+                    ratio = reso.width / reso.height;
+                    console.log(`[Render] Scene ${i} candidate [${bvid}] ${reso.width}x${reso.height} ratio=${ratio.toFixed(2)}`);
+                  }
                 }
-              } else {
-                console.log(`[Render] Scene ${i} candidate [${bvid}] quick download failed`);
+              } catch {} finally {
+                try { await unlink(probePath); } catch {}
               }
-            } catch (probeErr) {
-              console.warn(`[Render] Scene ${i} candidate [${bvid}] probe error:`, probeErr instanceof Error ? probeErr.message : probeErr);
-            } finally {
-              try { await unlink(probePath); } catch {}
-            }
 
-            // Accept landscape or near-landscape videos (ratio >= 1.2, i.e. 4:3 or wider)
-            // Reject extreme portrait (9:16 = 0.56) and square (1:1) which lose too much when padded to 16:9
-            if (ratio < 1.2) {
-              console.log(`[Render] Scene ${i} candidate [${bvid}] skipped (ratio ${ratio.toFixed(2)} too narrow for 16:9 pad)`);
-              continue;
-            }
+              if (ratio < 1.2) {
+                console.log(`[Render] Scene ${i} candidate [${bvid}] skipped (ratio ${ratio.toFixed(2)} too narrow)`);
+                continue;
+              }
 
-            // Save validated material
-            const title = video.title?.replace(/<[^>]*>/g, "") || primaryQuery;
-            const pic = video.pic?.startsWith("//") ? `https:${video.pic}` : (video.pic || "");
-            const usedQuery = results.length > 0 ? (primaryQuery || secondaryQuery) : "";
+              const title = video.title?.replace(/<[^>]*>/g, "") || sq.query;
+              const pic = video.pic?.startsWith("//") ? `https:${video.pic}` : (video.pic || "");
+              matchedVideo = { bvid, streamUrl, title, pic, durSec, usedQuery: sq.query };
+              console.log(`[Render] Scene ${i} matched via [${sq.label}]: ${title.slice(0, 40)} (${durSec}s)`);
+            }
+          }
+
+          // Save matched material to DB
+          if (matchedVideo) {
             const material = await prisma.material.create({
               data: {
-                projectId, name: title.slice(0, 80),
+                projectId, name: matchedVideo.title.slice(0, 80),
                 type: "VIDEO", source: "STOCK_FOOTAGE",
-                fileUrl: streamUrl, thumbnailUrl: pic,
-                width: 1920, height: 1080, duration: durSec,
-                externalId: `bilibili-${bvid}`, externalSource: "bilibili",
-                searchQuery: usedQuery, matchScore: 0.8,
+                fileUrl: matchedVideo.streamUrl, thumbnailUrl: matchedVideo.pic,
+                width: 1920, height: 1080, duration: matchedVideo.durSec,
+                externalId: `bilibili-${matchedVideo.bvid}`, externalSource: "bilibili",
+                searchQuery: matchedVideo.usedQuery, matchScore: 0.8,
               },
             });
             await prisma.scene.update({ where: { id: scene.id }, data: { materialId: material.id } });
             scene.materialId = material.id;
-            materialLoaded = true;
-            console.log(`[Render] Scene ${i} matched: ${title.slice(0, 40)} (${durSec}s)`);
+            return true;
+          } else {
+            console.warn(`[Render] Scene ${i} no matching video found after all queries`);
           }
         } catch (err) {
           console.warn(`[Render] Scene ${i} Bilibili search failed:`, err instanceof Error ? err.message : err);
         }
+        return false;
       }
 
+      // Step 1: Auto-search if no material attached
+      if (!scene.materialId) {
+        await autoSearchBilibili();
+      }
+
+      // Step 2: Download existing material (from confirm route or auto-search)
       if (scene.materialId) {
         const material = await prisma.material.findUnique({
           where: { id: scene.materialId },
@@ -576,37 +657,21 @@ export async function renderProjectInline(
 
               let fileUrl = material.fileUrl;
 
-              // Bilibili stream URLs expire — refresh on first attempt if needed
-              if (isBilibili && attempt > 0) {
+              // Bilibili stream URLs expire quickly — always refresh before download
+              if (isBilibili) {
                 const bvidMatch = material.externalId?.match(/bilibili-(.+)/);
                 const bvid = bvidMatch?.[1];
                 if (bvid) {
                   try {
-                    const infoRes = await fetch(`https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`, {
-                      headers: { "User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/" },
-                      signal: AbortSignal.timeout(8000),
-                    });
-                    if (infoRes.ok) {
-                      const infoData = await infoRes.json();
-                      const cid = infoData.data?.cid;
-                      if (cid) {
-                        const streamRes = await fetch(
-                          `https://api.bilibili.com/x/player/playurl?bvid=${bvid}&cid=${cid}&qn=80&fnval=1`,
-                          { headers: { "User-Agent": "Mozilla/5.0", "Referer": `https://www.bilibili.com/video/${bvid}` } }
-                        );
-                        if (streamRes.ok) {
-                          const streamData = await streamRes.json();
-                          const newUrl = streamData.data?.durl?.[0]?.url;
-                          if (newUrl) {
-                            fileUrl = newUrl;
-                            await prisma.material.update({
-                              where: { id: material.id },
-                              data: { fileUrl: newUrl },
-                            });
-                            console.log(`[Render] Scene ${i} refreshed Bilibili stream URL`);
-                          }
-                        }
-                      }
+                    const { getBilibiliVideoStream } = await import("@/lib/materials/bilibili");
+                    const freshUrl = await getBilibiliVideoStream(bvid);
+                    if (freshUrl) {
+                      fileUrl = freshUrl;
+                      await prisma.material.update({
+                        where: { id: material.id },
+                        data: { fileUrl: freshUrl },
+                      });
+                      console.log(`[Render] Scene ${i} refreshed Bilibili stream URL`);
                     }
                   } catch (refreshErr) {
                     console.warn(`[Render] Scene ${i} failed to refresh stream URL:`, refreshErr instanceof Error ? refreshErr.message : refreshErr);
@@ -645,13 +710,26 @@ export async function renderProjectInline(
                   // Probe actual dimensions for accurate watermark positioning
                   const dims = await probeDimensions(localPath);
                   if (dims.width > 0 && dims.height > 0) {
-                    const regions = detectWatermarkRegions(dims.width, dims.height);
+                    // Bilibili watermarks: top-right (UP主头像+ID), bottom-right (B站logo)
+                    // Use targeted delogo for known watermark positions + crop edges
+                    const isBilibili = material.externalSource === "bilibili";
+                    const regions = isBilibili
+                      ? [
+                          // Top-right: UP主 info (larger area)
+                          { x: Math.round(dims.width * 0.78), y: Math.round(dims.height * 0.01), width: Math.round(dims.width * 0.21), height: Math.round(dims.height * 0.08) },
+                          // Bottom-right: B站 logo
+                          { x: Math.round(dims.width * 0.82), y: Math.round(dims.height * 0.90), width: Math.round(dims.width * 0.17), height: Math.round(dims.height * 0.08) },
+                          // Bottom-left: possible subtitle/credit
+                          { x: Math.round(dims.width * 0.01), y: Math.round(dims.height * 0.90), width: Math.round(dims.width * 0.20), height: Math.round(dims.height * 0.08) },
+                        ]
+                      : detectWatermarkRegions(dims.width, dims.height);
+
                     // Build delogo filter chain from detected regions
                     const delogoFilters = regions.map(
                       (r) => `delogo=x=${r.x}:y=${r.y}:w=${r.width}:h=${r.height}:show=0`
                     );
-                    // Crop 3% edges + denoise to blur faint marks
-                    const cropFilter = `crop=iw*0.94:ih*0.94:iw*0.03:ih*0.03,hqdn3d=2:2:3:3`;
+                    // Crop 5% edges (increased from 3% for better watermark coverage) + denoise
+                    const cropFilter = `crop=iw*0.90:ih*0.90:iw*0.05:ih*0.05,hqdn3d=2:2:3:3`;
                     const watermarkFilter = [...delogoFilters, cropFilter].join(",");
 
                     await execFileAsync("ffmpeg", [
@@ -661,14 +739,14 @@ export async function renderProjectInline(
                       "-an", cleanPath,
                     ], { timeout: 30000 });
                     processedPath = cleanPath;
-                    console.log(`[Render] Scene ${i} watermark removed (${dims.width}x${dims.height}, ${regions.length} regions)`);
+                    console.log(`[Render] Scene ${i} watermark removed (${dims.width}x${dims.height}, ${regions.length} regions, ${isBilibili ? "bilibili" : "generic"})`);
                   }
                 } catch {
                   // Fallback: aggressive crop if delogo fails
                   try {
                     await execFileAsync("ffmpeg", [
                       "-y", "-i", localPath,
-                      "-vf", "crop=iw*0.92:ih*0.92:iw*0.04:ih*0.04",
+                      "-vf", "crop=iw*0.88:ih*0.88:iw*0.06:ih*0.06",
                       "-c:v", "libx264", "-preset", "fast", "-crf", "23",
                       "-an", cleanPath,
                     ], { timeout: 30000 });
@@ -685,7 +763,8 @@ export async function renderProjectInline(
 
               if (ext === "jpg") {
                 // Use estimated speech duration so image covers full voiceover
-                const imgDuration = Math.max(5, Math.ceil(estimateAudioDuration(scenes[i].voiceoverText)));
+                // Add 30% buffer to ensure video is long enough for actual TTS audio
+                const imgDuration = Math.max(8, Math.ceil(estimateAudioDuration(scenes[i].voiceoverText) * 1.3));
                 await execFileAsync("ffmpeg", [
                   "-y", "-loop", "1", "-i", processedPath,
                   "-c:v", "libx264", "-t", String(imgDuration), "-pix_fmt", "yuv420p",
@@ -706,13 +785,25 @@ export async function renderProjectInline(
                 } catch {}
 
                 let trimArgs: string[] = [];
-                const neededDuration = Math.ceil(estimateAudioDuration(scenes[i].voiceoverText));
+                // Add 30% buffer to estimated duration to ensure video covers actual TTS
+                const neededDuration = Math.ceil(estimateAudioDuration(scenes[i].voiceoverText) * 1.3);
                 const needsLoop = videoDuration > 0 && videoDuration < neededDuration;
                 if (videoDuration > 10 && !needsLoop) {
-                  // Long enough video: extract a highlight clip at least neededDuration long
+                  // Smart clip extraction: skip intro/outro, sample from middle
                   const clipLength = Math.min(Math.max(videoDuration * 0.15, neededDuration), videoDuration - 2);
-                  const maxStart = videoDuration - clipLength - 2;
-                  const startSec = Math.max(1, Math.min(videoDuration * 0.2, maxStart));
+                  let startSec: number;
+                  if (videoDuration > 300) {
+                    // Very long video (>5min): sample from 25%-75% range (skip intro/outro)
+                    const rangeStart = videoDuration * 0.25;
+                    const rangeEnd = videoDuration * 0.75 - clipLength;
+                    startSec = Math.max(rangeStart, Math.min(videoDuration * 0.4, rangeEnd));
+                  } else if (videoDuration > 60) {
+                    // Medium video (1-5min): sample from 15%-60%
+                    startSec = Math.max(videoDuration * 0.15, Math.min(videoDuration * 0.4, videoDuration - clipLength - 2));
+                  } else {
+                    // Short video (<1min): start at 10%
+                    startSec = Math.max(1, videoDuration * 0.1);
+                  }
                   const startTime = startSec.toFixed(2);
                   trimArgs = ["-ss", startTime, "-t", String(Math.round(clipLength))];
                   console.log(`[Render] Scene ${i} trimming ${clipLength.toFixed(1)}s from ${startTime}s (total ${videoDuration.toFixed(1)}s, need ${neededDuration}s)`);
@@ -740,7 +831,11 @@ export async function renderProjectInline(
             }
           }
         } else {
-          console.warn(`[Render] Scene ${i} material record not found: ${scene.materialId}`);
+          console.warn(`[Render] Scene ${i} material record not found: ${scene.materialId}, re-searching`);
+          // Clear the stale materialId and re-search
+          await prisma.scene.update({ where: { id: scene.id }, data: { materialId: null } });
+          scene.materialId = null;
+          await autoSearchBilibili();
         }
       } else {
         console.warn(`[Render] Scene ${i} has no materialId`);
@@ -761,7 +856,7 @@ export async function renderProjectInline(
           "-an", materialFile,
         ], { timeout: 15000 });
       }
-    }
+    });
 
     // Compose stage
     await prisma.renderJob.update({
@@ -790,10 +885,12 @@ export async function renderProjectInline(
         const sceneTitle = scenes[i].title || `场景 ${scenes[i].sceneNumber}`;
         const safeTitle = sceneTitle.replace(/['"\\:;%]/g, "");
         const fontPath = "C\\:/Windows/Fonts/msyh.ttc";
+        const midY = Math.round(config.height / 2);
+        // Generate 60s placeholder — long enough for any TTS duration
         await execFileAsync("ffmpeg", [
           "-y", "-f", "lavfi", "-i",
-          `color=c=0x1a1a2e:s=${config.width}x${config.height}:d=5,drawtext=fontfile='${fontPath}':fontsize=48:fontcolor=white@0.6:x=(w-text_w)/2:y=(h-text_h)/2:text='${safeTitle}'`,
-          "-c:v", "libx264", "-t", "5", "-pix_fmt", "yuv420p",
+          `color=c=0x1a1a2e:s=${config.width}x${config.height}:d=60,drawtext=fontfile='${fontPath}':fontsize=48:fontcolor=white@0.6:x=(w-text_w)/2:y=${midY}:text='${safeTitle}'`,
+          "-c:v", "libx264", "-t", "60", "-pix_fmt", "yuv420p",
           "-an", materialFile,
         ], { timeout: 15000 });
       }
@@ -836,12 +933,17 @@ export async function renderProjectInline(
       const videoIdx = i * 2;
       const audioIdx = i * 2 + 1;
 
-      // Get actual audio duration for precise video trim + subtitle sync
-      const audioFileDuration = await getAudioDuration(audioFile);
-      const originalAudioDuration = audioFileDuration > 0
-        ? audioFileDuration
-        : estimateAudioDuration(scenes[i].voiceoverText);
-      let audioDuration = originalAudioDuration;
+      // Use actual TTS duration from TTS stage (most reliable source)
+      // Fallback chain: ttsDurationMap → ffprobe → estimate
+      let audioDuration = ttsDurationMap.get(i) || 0;
+      if (audioDuration <= 0) {
+        const probedDuration = await getAudioDuration(audioFile);
+        audioDuration = probedDuration > 0 ? probedDuration : estimateAudioDuration(scenes[i].voiceoverText);
+      }
+      // Ensure minimum duration
+      audioDuration = Math.max(audioDuration, 0.5);
+
+      console.log(`[Render] Compose scene ${i}: audioDuration=${audioDuration.toFixed(2)}s (source: ${ttsDurationMap.get(i) ? "tts-stage" : "fallback"})`);
 
       // Generate subtitles proportional to actual audio duration
       let scripts: string[] | undefined;
@@ -863,14 +965,17 @@ export async function renderProjectInline(
         scripts
       );
 
-      // Scale video and trim to duration
+      // Scale video and pad/loop to match audio duration exactly
+      // tpad extends short videos by cloning last frame; trim ensures exact duration
+      // Note: tpad uses stop_duration (not duration) for time-based padding
+      const audioDurStr = audioDuration.toFixed(3);
       filterParts.push(
-        `[${videoIdx}:v]scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,trim=duration=${audioDuration},setpts=PTS-STARTPTS[v${i}]`
+        `[${videoIdx}:v]scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,tpad=stop=-1:stop_mode=clone:stop_duration=${audioDurStr},trim=duration=${audioDurStr},setpts=PTS-STARTPTS[v${i}]`
       );
 
-      // Audio: boost volume, resample, trim
+      // Audio: boost volume, resample, trim to exact duration
       filterParts.push(
-        `[${audioIdx}:a]volume=2.0,aresample=44100,atrim=0:${audioDuration},asetpts=PTS-STARTPTS[a${i}]`
+        `[${audioIdx}:a]volume=2.0,aresample=44100,atrim=0:${audioDurStr},asetpts=PTS-STARTPTS[a${i}]`
       );
 
       // Build subtitle filter chain from pre-generated chunks

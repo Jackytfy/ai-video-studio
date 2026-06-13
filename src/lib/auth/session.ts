@@ -8,8 +8,8 @@ const DEFAULT_USER = {
   email: "user@ai-video.local",
   name: "默认用户",
   aiProvider: "openai" as string,
-  aiModel: "gpt-4o" as string,
-  aiBaseUrl: "" as string,
+  aiModel: "mimo-v2.5-pro" as string,
+  aiBaseUrl: "https://token-plan-cn.xiaomimimo.com/v1" as string,
   aiApiKey: "" as string,
   ttsVoice: "zh-CN-YunxiNeural" as string,
 };

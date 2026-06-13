@@ -22,26 +22,111 @@ export interface SceneSearchContext {
   materialQuery: string;
   materialQueryEn?: string;
   visualDesc?: string;
+  sourceVideos?: string[];
+}
+
+/**
+ * Extract concrete 2-4 char keywords from visualDesc for Bilibili search.
+ * Filters out abstract words, incomplete phrases, and non-searchable terms.
+ */
+function extractVisualDescKeywords(text: string): string[] {
+  if (!text) return [];
+  const abstractWords = new Set([
+    "画面", "描述", "展现", "展示", "呈现", "表现", "体现", "反映",
+    "风格", "色调", "氛围", "镜头", "光影", "构图", "采用", "运用",
+    "使用", "适合", "需要", "可以", "强烈", "突出", "营造",
+    "冷硬", "惨烈", "阴森", "压抑", "悲壮", "辉煌", "宏伟",
+    "戏剧", "冲突", "悲剧", "色彩", "恐怖", "紧张", "庄严",
+    "例如", "视频", "片段", "该部", "这部", "中的", "聚焦", "注重",
+    "整体", "相关", "经典", "场景", "缓缓", "慢慢", "快速", "逐渐",
+    "最终", "开始", "结束", "显示", "映照", "笼罩", "充满", "转为",
+    "变为", "化为", "定格", "切换", "这是", "那是", "他的", "她的",
+    "我的", "这个", "那个", "这些", "那些", "最后", "首先", "然后",
+    "接着", "同时", "此时", "近景", "远景", "全景", "特写",
+  ]);
+  const nonSearchable = new Set([
+    "这是", "那是", "他的", "她的", "我的", "这个", "那个", "这些", "那些",
+    "最后", "首先", "然后", "接着", "同时", "此时", "画面", "镜头", "切换",
+    "缓缓", "慢慢", "快速", "逐渐", "最终", "开始", "结束", "显示", "展示",
+    "映照", "笼罩", "充满", "转为", "变为", "化为", "定格", "聚焦",
+  ]);
+
+  const keywords: string[] = [];
+  const shortWords = text.match(/[\u4e00-\u9fff]{2,4}/g) || [];
+  const seen = new Set<string>();
+  for (const w of shortWords) {
+    if (seen.has(w)) continue;
+    if (abstractWords.has(w) || nonSearchable.has(w)) continue;
+    if (/^[一二三四五六七八九十百千万亿]+$/.test(w)) continue;
+    if (/[在的了着过和与及把被从向往]$/.test(w)) continue;
+    keywords.push(w);
+    seen.add(w);
+    if (keywords.length >= 6) break;
+  }
+  return keywords;
+}
+
+/**
+ * Build prioritized search queries for a scene.
+ * Returns an array of {query, label} sorted by priority (most precise first).
+ */
+function buildSearchQueries(ctx: SceneSearchContext): { query: string; label: string }[] {
+  const queries: { query: string; label: string }[] = [];
+  const sourceVideos = ctx.sourceVideos || [];
+  const materialKeywords = ctx.materialQuery || "";
+  const visualKeywords = extractVisualDescKeywords(ctx.visualDesc || "");
+
+  // Q1: sourceVideos + visualDesc keywords (MOST PRECISE)
+  if (sourceVideos.length > 0 && visualKeywords.length > 0) {
+    queries.push({
+      query: `${sourceVideos[0]} ${visualKeywords.slice(0, 3).join(" ")}`,
+      label: "剧名+画面关键词",
+    });
+  }
+  // Q2: sourceVideos + materialQuery
+  if (sourceVideos.length > 0 && materialKeywords) {
+    queries.push({
+      query: `${sourceVideos[0]} ${materialKeywords}`,
+      label: "剧名+检索词",
+    });
+  }
+  // Q3: sourceVideos alone (if no other keywords)
+  if (sourceVideos.length > 0 && visualKeywords.length === 0 && !materialKeywords) {
+    queries.push({
+      query: sourceVideos[0],
+      label: "剧名",
+    });
+  }
+  // Q4: visualDesc keywords + 电视剧/纪录片
+  if (visualKeywords.length > 0) {
+    queries.push({
+      query: `${visualKeywords.join(" ")} 电视剧`,
+      label: "画面关键词+电视剧",
+    });
+    queries.push({
+      query: `${visualKeywords.join(" ")} 纪录片`,
+      label: "画面关键词+纪录片",
+    });
+  }
+  // Q5: materialQuery alone
+  if (materialKeywords) {
+    queries.push({
+      query: materialKeywords,
+      label: "检索词",
+    });
+  }
+
+  return queries;
 }
 
 /**
  * Extract Chinese search keywords for Bilibili.
- * Takes materialQuery and extracts the most searchable parts.
+ * Now uses prioritized multi-query strategy for better match.
  */
 export function extractChineseSearchQuery(ctx: SceneSearchContext): string {
-  const query = ctx.materialQuery || "";
-  // If query is short enough, use directly
-  if (query.length <= 20) return query;
-
-  // Extract key nouns/phrases (remove descriptive adjectives)
-  // Split by spaces and take the first 2-3 segments
-  const parts = query.split(/[,，、\s]+/).filter(p => p.length >= 2);
-  if (parts.length >= 2) {
-    return parts.slice(0, 3).join(" ");
-  }
-
-  // Truncate to first 20 chars
-  return query.substring(0, 20);
+  const queries = buildSearchQueries(ctx);
+  // Return the highest-priority query
+  return queries.length > 0 ? queries[0].query : ctx.materialQuery || "";
 }
 
 /**
@@ -298,28 +383,32 @@ async function searchBilibiliSource(
 
 /**
  * Search for materials across multiple platforms for a scene.
- * Priority: Bilibili (Chinese content) > Pexels/Pixabay (stock footage).
+ * Priority: Bilibili (Chinese content) with multi-query strategy > Pexels/Pixabay (stock footage).
  * Returns results sorted by matchScore (best first).
  */
 export async function searchMaterialsForScene(
   ctx: SceneSearchContext,
   count: number = 5
 ): Promise<MaterialResult[]> {
-  const chineseQuery = extractChineseSearchQuery(ctx);
+  const searchQueries = buildSearchQueries(ctx);
 
-  // Try Bilibili first (best for Chinese content)
-  try {
-    const results = await searchBilibiliSource(chineseQuery, count);
-    if (results.length > 0) {
-      const seenUrls = new Set<string>();
-      return results.filter((r) => {
-        if (seenUrls.has(r.fileUrl)) return false;
-        seenUrls.add(r.fileUrl);
-        return true;
-      }).slice(0, count);
+  // Try Bilibili with prioritized queries (stop when we get results)
+  for (const { query, label } of searchQueries) {
+    try {
+      console.log(`[search] Scene ${ctx.sceneNumber}: trying "${query}" (${label})`);
+      const results = await searchBilibiliSource(query, count);
+      if (results.length > 0) {
+        console.log(`[search] Scene ${ctx.sceneNumber}: found ${results.length} results via "${label}"`);
+        const seenUrls = new Set<string>();
+        return results.filter((r) => {
+          if (seenUrls.has(r.fileUrl)) return false;
+          seenUrls.add(r.fileUrl);
+          return true;
+        }).slice(0, count);
+      }
+    } catch (err) {
+      console.warn(`[search] Bilibili failed for "${query}" (${label}):`, err instanceof Error ? err.message : err);
     }
-  } catch (err) {
-    console.warn("[search] Bilibili failed, falling back to Pexels:", err instanceof Error ? err.message : err);
   }
 
   // Fallback: Pexels stock footage

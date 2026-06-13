@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
@@ -11,6 +11,8 @@ import { SegmentRecorder } from "@/components/editor/SegmentRecorder";
 import { VideoTrimmer } from "@/components/editor/VideoTrimmer";
 import { MusicSelector } from "@/components/editor/MusicSelector";
 import { AutoMatchPanel } from "@/components/editor/AutoMatchPanel";
+import { SubtitleOverlay, type SubtitleChunk } from "@/components/editor/SubtitleOverlay";
+import { WatermarkOverlay, detectWatermarkRegions } from "@/components/editor/WatermarkOverlay";
 import {
   Plus,
   Wand2,
@@ -59,8 +61,8 @@ export default function VideoEditorPage() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isRendering, setIsRendering] = useState(false);
 
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const playIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const previewVideoRef = useRef<HTMLVideoElement>(null);
+  const isSeekingRef = useRef(false);
 
   // Fetch project
   const { data: project } = useQuery<Project>({
@@ -92,12 +94,97 @@ export default function VideoEditorPage() {
     },
   });
 
+  // Fetch storyboard scenes for subtitle overlay
+  const { data: storyboard } = useQuery<{
+    scenes: Array<{
+      id: string;
+      sceneNumber: number;
+      voiceoverText: string;
+      audioDuration: number | null;
+      productionMeta: string | null;
+    }>;
+  }>({
+    queryKey: ["storyboard", projectId],
+    queryFn: async () => {
+      const res = await fetch(`/api/projects/${projectId}/storyboard`);
+      if (!res.ok) return { scenes: [] };
+      return res.json();
+    },
+  });
+
+  // Build subtitle chunks from storyboard scenes
+  const subtitleChunks: SubtitleChunk[] = useMemo(() => {
+    if (!storyboard?.scenes?.length) return [];
+    const chunks: SubtitleChunk[] = [];
+    let timeCursor = 0;
+
+    for (const scene of storyboard.scenes) {
+      const duration = scene.audioDuration || estimateAudioDuration(scene.voiceoverText);
+      // Split voiceover into script segments if productionMeta has scripts
+      let scripts: string[] = [];
+      if (scene.productionMeta) {
+        try {
+          const meta = JSON.parse(scene.productionMeta);
+          if (meta.scripts?.length) scripts = meta.scripts;
+        } catch {}
+      }
+      if (scripts.length === 0) {
+        scripts = [scene.voiceoverText];
+      }
+
+      const scriptDuration = duration / scripts.length;
+      scripts.forEach((script, i) => {
+        chunks.push({
+          text: script.replace(/^脚本\d+[：:]\s*/, ""),
+          startTime: timeCursor + i * scriptDuration,
+          endTime: timeCursor + (i + 1) * scriptDuration,
+        });
+      });
+
+      timeCursor += duration;
+    }
+    return chunks;
+  }, [storyboard]);
+
+  function estimateAudioDuration(text: string): number {
+    if (!text) return 1;
+    const chineseChars = (text.match(/[\u4e00-\u9fff]/g) || []).length;
+    const nonChinese = text.replace(/[\u4e00-\u9fff]/g, "").replace(/[，。！？、；：,;!?\s\n"'「」『』【】（）()\[\]·《》—\-—]/g, "").length;
+    return Math.max(1, chineseChars / 3.5 + nonChinese / 5);
+  }
+
   // Calculate total duration
   const totalDuration = segments.reduce((sum, seg) => {
     const duration =
       (seg.trimEnd ?? seg.duration) - (seg.trimStart ?? 0);
     return sum + duration;
   }, 0);
+
+  // Find current segment and local offset for preview
+  const { segment: currentSegment, offset: currentSegmentOffset } = useMemo(() => {
+    let elapsed = 0;
+    for (const seg of segments) {
+      const segDuration = (seg.trimEnd ?? seg.duration) - (seg.trimStart ?? 0);
+      if (currentTime >= elapsed && currentTime < elapsed + segDuration) {
+        return {
+          segment: seg,
+          offset: (seg.trimStart ?? 0) + (currentTime - elapsed),
+        };
+      }
+      elapsed += segDuration;
+    }
+    return { segment: undefined, offset: 0 };
+  }, [segments, currentTime]);
+
+  // Sync preview video position on seek
+  useEffect(() => {
+    const video = previewVideoRef.current;
+    if (!video) return;
+    const diff = Math.abs(video.currentTime - currentSegmentOffset);
+    if (diff > 0.15) {
+      video.currentTime = currentSegmentOffset;
+    }
+  }, [currentSegmentOffset, currentSegment?.id]);
 
   // Reorder mutation
   const reorderMutation = useMutation({
@@ -185,48 +272,49 @@ export default function VideoEditorPage() {
 
   // Playback controls
   const handlePlay = useCallback(() => {
-    setIsPlaying(true);
     setCurrentTime(0);
-
-    if (playIntervalRef.current) {
-      clearInterval(playIntervalRef.current);
-    }
-
-    playIntervalRef.current = setInterval(() => {
-      setCurrentTime((prev) => {
-        if (prev >= totalDuration) {
-          setIsPlaying(false);
-          if (playIntervalRef.current) {
-            clearInterval(playIntervalRef.current);
-          }
-          return 0;
-        }
-        return prev + 0.1;
-      });
-    }, 100);
-  }, [totalDuration]);
+    setIsPlaying(true);
+  }, []);
 
   const handlePause = useCallback(() => {
     setIsPlaying(false);
-    if (playIntervalRef.current) {
-      clearInterval(playIntervalRef.current);
-    }
+    previewVideoRef.current?.pause();
   }, []);
 
   const handleSeek = useCallback(
     (time: number) => {
+      isSeekingRef.current = true;
       setCurrentTime(Math.min(time, totalDuration));
+      // Allow timeupdate to resume after seek settles
+      setTimeout(() => { isSeekingRef.current = false; }, 200);
     },
     [totalDuration]
   );
 
+  // Auto-play next segment when current one ends
   useEffect(() => {
-    return () => {
-      if (playIntervalRef.current) {
-        clearInterval(playIntervalRef.current);
+    if (!isPlaying || !currentSegment) return;
+    const video = previewVideoRef.current;
+    if (!video) return;
+
+    const handleEnded = () => {
+      const idx = segments.findIndex(s => s.id === currentSegment.id);
+      if (idx < segments.length - 1) {
+        // Move to next segment — currentTime update triggers re-render with next segment
+        let elapsed = 0;
+        for (let i = 0; i <= idx; i++) {
+          elapsed += (segments[i].trimEnd ?? segments[i].duration) - (segments[i].trimStart ?? 0);
+        }
+        setCurrentTime(elapsed);
+      } else {
+        setIsPlaying(false);
+        setCurrentTime(0);
       }
     };
-  }, []);
+
+    video.addEventListener("ended", handleEnded);
+    return () => video.removeEventListener("ended", handleEnded);
+  }, [isPlaying, currentSegment, segments]);
 
   const formatTime = (seconds: number) => {
     const m = Math.floor(seconds / 60);
@@ -284,40 +372,58 @@ export default function VideoEditorPage() {
           <div className="flex-1 flex items-center justify-center bg-black/5 min-h-0">
             {segments.length > 0 ? (
               <div className="relative w-full max-w-2xl aspect-video bg-black rounded-lg overflow-hidden">
-                {/* Find current segment based on currentTime */}
-                {(() => {
-                  let elapsed = 0;
-                  const currentSeg = segments.find((seg) => {
-                    const segDuration =
-                      (seg.trimEnd ?? seg.duration) - (seg.trimStart ?? 0);
-                    if (
-                      currentTime >= elapsed &&
-                      currentTime < elapsed + segDuration
-                    ) {
-                      return true;
-                    }
-                    elapsed += segDuration;
-                    return false;
-                  });
-
-                  return currentSeg ? (
-                    <video
-                      src={currentSeg.fileUrl}
-                      className="w-full h-full object-contain"
-                      muted
-                      autoPlay={isPlaying}
-                    />
-                  ) : (
-                    <div className="flex items-center justify-center h-full text-muted-foreground">
-                      <Film className="w-12 h-12" />
-                    </div>
-                  );
-                })()}
+                {currentSegment ? (
+                  <video
+                    ref={previewVideoRef}
+                    src={currentSegment.fileUrl}
+                    className="w-full h-full object-contain"
+                    muted
+                    autoPlay={isPlaying}
+                    onTimeUpdate={(e) => {
+                      if (!isPlaying || isSeekingRef.current) return;
+                      const video = e.currentTarget;
+                      const segStart = currentSegment.trimStart ?? 0;
+                      const localTime = video.currentTime - segStart;
+                      let elapsed = 0;
+                      for (const seg of segments) {
+                        if (seg.id === currentSegment.id) break;
+                        elapsed += (seg.trimEnd ?? seg.duration) - (seg.trimStart ?? 0);
+                      }
+                      const globalTime = elapsed + Math.max(0, localTime);
+                      setCurrentTime(globalTime);
+                    }}
+                  />
+                ) : (
+                  <div className="flex items-center justify-center h-full text-muted-foreground">
+                    <Film className="w-12 h-12" />
+                  </div>
+                )}
 
                 {/* Time overlay */}
                 <div className="absolute bottom-4 left-4 bg-black/60 px-3 py-1 rounded text-sm font-mono text-white">
                   {formatTime(currentTime)} / {formatTime(totalDuration)}
                 </div>
+
+                {/* Subtitle overlay */}
+                {subtitleChunks.length > 0 && (
+                  <SubtitleOverlay chunks={subtitleChunks} currentTime={currentTime} />
+                )}
+
+                {/* Watermark overlay for Bilibili-sourced materials */}
+                {(() => {
+                  const seg = segments.find((s) => s.id === selectedSegmentId);
+                  const isBilibili = seg?.fileUrl?.includes("bilibili") || false;
+                  return isBilibili ? (
+                    <WatermarkOverlay
+                      videoWidth={1920}
+                      videoHeight={1080}
+                      containerWidth={640}
+                      containerHeight={360}
+                      regions={detectWatermarkRegions(1920, 1080)}
+                      source="bilibili"
+                    />
+                  ) : null;
+                })()}
               </div>
             ) : (
               <div className="text-center space-y-4">

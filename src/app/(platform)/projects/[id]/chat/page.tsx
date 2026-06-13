@@ -6,6 +6,9 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { AnalysisCard } from "@/components/chat/AnalysisCard";
 import { PlanSelector } from "@/components/chat/PlanSelector";
 import { StoryboardCard } from "@/components/chat/StoryboardCard";
+import { RequirementsDocCard } from "@/components/chat/RequirementsDocCard";
+import { SkeletonPlanCard } from "@/components/chat/SkeletonPlanCard";
+import { StoryboardBookCard } from "@/components/chat/StoryboardBookCard";
 
 interface Message {
   id: string;
@@ -162,6 +165,37 @@ export default function ChatPage() {
           projectId={projectId}
           totalScenes={meta.totalScenes}
           totalDuration={meta.totalDuration}
+        />
+      );
+    }
+
+    if (msg.messageType === "REQUIREMENTS_DOC" && msg.metadata) {
+      const meta = typeof msg.metadata === "string" ? JSON.parse(msg.metadata) : msg.metadata;
+      return (
+        <RequirementsDocCard
+          key={msg.id}
+          data={meta}
+        />
+      );
+    }
+
+    if (msg.messageType === "SKELETON_PLAN" && msg.metadata) {
+      const meta = typeof msg.metadata === "string" ? JSON.parse(msg.metadata) : msg.metadata;
+      return (
+        <SkeletonPlanCard
+          key={msg.id}
+          data={meta}
+        />
+      );
+    }
+
+    if (msg.messageType === "STORYBOARD_BOOK" && msg.metadata) {
+      const meta = typeof msg.metadata === "string" ? JSON.parse(msg.metadata) : msg.metadata;
+      return (
+        <StoryboardBookCard
+          key={msg.id}
+          projectId={projectId}
+          data={meta}
         />
       );
     }

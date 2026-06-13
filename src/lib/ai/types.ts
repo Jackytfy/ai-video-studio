@@ -35,6 +35,7 @@ export interface SceneInput {
   visualDesc: string;
   materialQuery: string;
   materialQueryEn?: string;
+  sourceVideos?: string[];
   wordCount: number;
   scripts?: string[];
 }

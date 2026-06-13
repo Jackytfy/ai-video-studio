@@ -149,11 +149,14 @@ export async function searchBilibiliMaterials(
     // Try to get direct stream URL
     const streamUrl = await getBilibiliVideoStream(video.bvid);
 
+    // Skip if no direct stream URL — page URL won't work for FFmpeg download
+    if (!streamUrl) continue;
+
     results.push({
       externalId: `bilibili-${video.bvid}`,
       type: "VIDEO" as const,
       source: "STOCK_FOOTAGE" as const,
-      fileUrl: streamUrl || `https://www.bilibili.com/video/${video.bvid}`,
+      fileUrl: streamUrl,
       thumbnailUrl: video.pic,
       width: 1920, // Bilibili HD is typically 1920x1080
       height: 1080,

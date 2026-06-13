@@ -53,15 +53,32 @@ export function VideoTimeline({
   const timelineRef = useRef<HTMLDivElement>(null);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
 
-  const handleTimelineClick = useCallback(
-    (e: React.MouseEvent<HTMLDivElement>) => {
-      if (!timelineRef.current) return;
+  const seekFromMouse = useCallback(
+    (clientX: number) => {
+      if (!timelineRef.current || totalDuration <= 0) return;
       const rect = timelineRef.current.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      const ratio = x / rect.width;
+      const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
       onSeek(ratio * totalDuration);
     },
     [totalDuration, onSeek]
+  );
+
+  const handleTimelineMouseDown = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      seekFromMouse(e.clientX);
+
+      const handleMove = (me: MouseEvent) => {
+        seekFromMouse(me.clientX);
+      };
+      const handleUp = () => {
+        document.removeEventListener("mousemove", handleMove);
+        document.removeEventListener("mouseup", handleUp);
+      };
+      document.addEventListener("mousemove", handleMove);
+      document.addEventListener("mouseup", handleUp);
+    },
+    [seekFromMouse]
   );
 
   const handleDragStart = (index: number) => {
@@ -130,8 +147,8 @@ export function VideoTimeline({
       {/* Timeline Scrubber */}
       <div
         ref={timelineRef}
-        className="relative h-16 bg-secondary/50 cursor-pointer"
-        onClick={handleTimelineClick}
+        className="relative h-16 bg-secondary/50 cursor-pointer select-none"
+        onMouseDown={handleTimelineMouseDown}
       >
         {/* Time markers */}
         <div className="absolute inset-x-0 top-0 h-6 flex items-center px-2 text-[10px] text-muted-foreground/50">
@@ -164,6 +181,7 @@ export function VideoTimeline({
                 onDragStart={() => handleDragStart(i)}
                 onDragOver={(e) => handleDragOver(e, i)}
                 onDragEnd={handleDragEnd}
+                onMouseDown={(e) => e.stopPropagation()}
                 onClick={(e) => {
                   e.stopPropagation();
                   onSelect(seg);
@@ -227,10 +245,24 @@ export function VideoTimeline({
 
         {/* Playhead */}
         <div
-          className="absolute top-0 bottom-0 w-0.5 bg-red-500 z-30 pointer-events-none"
-          style={{ left: `${playheadPosition}%` }}
+          className="absolute top-0 bottom-0 z-30 cursor-col-resize"
+          style={{ left: `${playheadPosition}%`, width: "12px", marginLeft: "-6px" }}
+          onMouseDown={(e) => {
+            e.stopPropagation();
+
+            const handleMove = (me: MouseEvent) => {
+              seekFromMouse(me.clientX);
+            };
+            const handleUp = () => {
+              document.removeEventListener("mousemove", handleMove);
+              document.removeEventListener("mouseup", handleUp);
+            };
+            document.addEventListener("mousemove", handleMove);
+            document.addEventListener("mouseup", handleUp);
+          }}
         >
-          <div className="absolute -top-0.5 -left-1.5 w-3 h-2 bg-red-500 rounded-t-sm" />
+          <div className="absolute top-0 bottom-0 left-1/2 -translate-x-1/2 w-0.5 bg-red-500" />
+          <div className="absolute -top-0.5 left-1/2 -translate-x-1/2 w-3 h-2 bg-red-500 rounded-t-sm" />
         </div>
       </div>
     </div>

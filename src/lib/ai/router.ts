@@ -1,6 +1,8 @@
 import { ClaudeProvider } from "./claude";
 import { OpenAIProvider } from "./openai";
 import { AIProvider, AIProviderName, AnalysisResult, StoryboardResult, AIStreamOptions } from "./types";
+import { getCachedResult, setCachedResult } from "./cache";
+import { CHAT_SYSTEM_PROMPT } from "./prompts/system";
 
 export interface ProviderConfig {
   provider: string;
@@ -58,8 +60,18 @@ export async function analyzeContent(
   style: string,
   config: string | ProviderConfig = "claude"
 ): Promise<AnalysisResult> {
+  // Check cache first
+  const cacheKey = [text.slice(0, 500), style, typeof config === "string" ? config : `${config.provider}:${config.model}`];
+  const cached = await getCachedResult<AnalysisResult>("analyze", cacheKey);
+  if (cached) return cached;
+
   const ai = getAIProvider(config);
-  return ai.analyzeContent(text, style);
+  const result = await ai.analyzeContent(text, style);
+
+  // Store in cache
+  await setCachedResult("analyze", cacheKey, result);
+
+  return result;
 }
 
 export async function generateStoryboard(
@@ -68,8 +80,18 @@ export async function generateStoryboard(
   sceneCount: number,
   config: string | ProviderConfig = "claude"
 ): Promise<StoryboardResult> {
+  // Check cache first
+  const cacheKey = [text.slice(0, 500), plan, String(sceneCount), typeof config === "string" ? config : `${config.provider}:${config.model}`];
+  const cached = await getCachedResult<StoryboardResult>("storyboard", cacheKey);
+  if (cached) return cached;
+
   const ai = getAIProvider(config);
-  return ai.generateStoryboard(text, plan, sceneCount);
+  const result = await ai.generateStoryboard(text, plan, sceneCount);
+
+  // Store in cache
+  await setCachedResult("storyboard", cacheKey, result);
+
+  return result;
 }
 
 export async function* chatStream(
@@ -105,7 +127,7 @@ export async function generateAI(options: GenerateAIOptions): Promise<string> {
   // Use chatStream and collect the full response
   const stream = ai.chatStream(
     options.messages,
-    "你是一个专业的AI助手，请直接回答问题，只返回要求的内容。"
+    CHAT_SYSTEM_PROMPT
   );
 
   for await (const chunk of stream) {
@@ -123,19 +145,47 @@ export function buildProviderConfig(user: {
 }): ProviderConfig {
   let provider = user.aiProvider || "claude";
 
-  // Auto-fallback: if Claude selected but no key, try MiMo then OpenAI
-  if (provider === "claude" && !user.aiApiKey && !process.env.ANTHROPIC_API_KEY) {
-    if (process.env.MIMO_API_KEY) {
-      return {
-        provider: "openai",
-        model: "mimo-v2.5-pro",
-        baseUrl: "https://token-plan-cn.xiaomimimo.com/v1",
-        apiKey: "unused",
-        defaultHeaders: { "api-key": process.env.MIMO_API_KEY },
-      };
+  // Auto-fallback when no API key available for the selected provider
+  if (!user.aiApiKey) {
+    if (provider === "claude" && !process.env.ANTHROPIC_API_KEY) {
+      if (process.env.MIMO_API_KEY) {
+        return {
+          provider: "openai",
+          model: "mimo-v2.5-pro",
+          baseUrl: "https://token-plan-cn.xiaomimimo.com/v1",
+          apiKey: "unused",
+          defaultHeaders: { "api-key": process.env.MIMO_API_KEY },
+        };
+      }
+      if (process.env.OPENAI_API_KEY) {
+        provider = "openai";
+      }
     }
-    if (process.env.OPENAI_API_KEY) {
-      provider = "openai";
+
+    if (provider === "openai" && !process.env.OPENAI_API_KEY) {
+      // Check if user specified a MiMo base URL
+      const isMiMo = isMiMoUrl(user.aiBaseUrl);
+      if (isMiMo && process.env.MIMO_API_KEY) {
+        return {
+          provider: "openai",
+          model: user.aiModel || "mimo-v2.5-pro",
+          baseUrl: user.aiBaseUrl || "https://token-plan-cn.xiaomimimo.com/v1",
+          apiKey: "unused",
+          defaultHeaders: { "api-key": process.env.MIMO_API_KEY },
+        };
+      }
+      if (process.env.MIMO_API_KEY) {
+        return {
+          provider: "openai",
+          model: "mimo-v2.5-pro",
+          baseUrl: "https://token-plan-cn.xiaomimimo.com/v1",
+          apiKey: "unused",
+          defaultHeaders: { "api-key": process.env.MIMO_API_KEY },
+        };
+      }
+      if (process.env.ANTHROPIC_API_KEY) {
+        provider = "claude";
+      }
     }
   }
 
@@ -145,4 +195,82 @@ export function buildProviderConfig(user: {
     baseUrl: user.aiBaseUrl || undefined,
     apiKey: user.aiApiKey || undefined,
   };
+}
+
+/**
+ * Build the fallback chain of provider configs.
+ * Used when the primary provider fails — try each in order.
+ */
+export function buildFallbackChain(
+  primaryConfig: ProviderConfig
+): ProviderConfig[] {
+  const chain: ProviderConfig[] = [primaryConfig];
+  const seen = new Set([primaryConfig.provider]);
+
+  // Add MiMo if not already in chain and key is available
+  if (!seen.has("openai") && process.env.MIMO_API_KEY) {
+    chain.push({
+      provider: "openai",
+      model: "mimo-v2.5-pro",
+      baseUrl: "https://token-plan-cn.xiaomimimo.com/v1",
+      apiKey: "unused",
+      defaultHeaders: { "api-key": process.env.MIMO_API_KEY },
+    });
+    seen.add("openai");
+  }
+
+  // Add OpenAI if not already in chain and key is available
+  if (!seen.has("openai") && process.env.OPENAI_API_KEY) {
+    chain.push({
+      provider: "openai",
+      apiKey: process.env.OPENAI_API_KEY,
+    });
+    seen.add("openai");
+  }
+
+  // Add Claude if not already in chain and key is available
+  if (!seen.has("claude") && process.env.ANTHROPIC_API_KEY) {
+    chain.push({
+      provider: "claude",
+      apiKey: process.env.ANTHROPIC_API_KEY,
+    });
+    seen.add("claude");
+  }
+
+  return chain;
+}
+
+/**
+ * Execute an AI operation with fallback chain.
+ * Tries each provider in order until one succeeds.
+ */
+export async function withFallback<T>(
+  fn: (provider: AIProvider) => Promise<T>,
+  primaryConfig: ProviderConfig
+): Promise<T> {
+  const chain = buildFallbackChain(primaryConfig);
+
+  let lastError: unknown;
+  for (const config of chain) {
+    try {
+      const provider = getAIProvider(config);
+      return await fn(provider);
+    } catch (error) {
+      lastError = error;
+      const msg = error instanceof Error ? error.message : String(error);
+      console.warn(`[AI Fallback] Provider ${config.provider} failed: ${msg}`);
+
+      // Don't fallback for non-retryable errors (auth, validation)
+      if (
+        msg.includes("401") ||
+        msg.includes("403") ||
+        msg.includes("invalid") ||
+        msg.includes("not configured")
+      ) {
+        continue;
+      }
+    }
+  }
+
+  throw lastError;
 }

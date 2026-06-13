@@ -130,6 +130,9 @@ enum MessageType {
   PLAN_SELECTION
   STORYBOARD_CARD
   GENERATION_STATUS
+  REQUIREMENTS_DOC
+  SKELETON_PLAN
+  STORYBOARD_BOOK
 }
 
 // ==================== STORYBOARD ====================

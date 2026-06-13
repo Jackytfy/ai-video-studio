@@ -37,12 +37,14 @@ export async function POST(
       return NextResponse.json({ error: "场景不存在" }, { status: 404 });
     }
 
-    // Parse productionMeta for English keywords
+    // Parse productionMeta for English keywords and source videos
     let materialQueryEn: string | undefined;
+    let sourceVideos: string[] | undefined;
     if (scene.productionMeta) {
       try {
         const meta = JSON.parse(scene.productionMeta);
         materialQueryEn = meta.materialQueryEn;
+        sourceVideos = meta.sourceVideos;
       } catch {}
     }
 
@@ -51,6 +53,7 @@ export async function POST(
       materialQuery: scene.materialQuery,
       materialQueryEn,
       visualDesc: scene.visualDesc,
+      sourceVideos,
     };
 
     const results = await searchMaterialsForScene(searchCtx, count);

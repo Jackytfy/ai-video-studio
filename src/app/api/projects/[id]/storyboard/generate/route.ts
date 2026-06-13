@@ -42,6 +42,13 @@ export async function POST(
       buildProviderConfig(session.user)
     );
 
+    // Delete existing storyboard if any (allows regeneration)
+    const existing = await prisma.storyboard.findFirst({ where: { projectId: id } });
+    if (existing) {
+      await prisma.scene.deleteMany({ where: { storyboardId: existing.id } });
+      await prisma.storyboard.delete({ where: { id: existing.id } });
+    }
+
     const storyboard = await prisma.storyboard.create({
       data: {
         projectId: id,
@@ -55,6 +62,7 @@ export async function POST(
             const meta: Record<string, unknown> = {};
             if (s.scripts && s.scripts.length > 0) meta.scripts = s.scripts;
             if (s.materialQueryEn) meta.materialQueryEn = s.materialQueryEn;
+            if (s.sourceVideos && s.sourceVideos.length > 0) meta.sourceVideos = s.sourceVideos;
 
             return {
               sceneNumber: s.sceneNumber,

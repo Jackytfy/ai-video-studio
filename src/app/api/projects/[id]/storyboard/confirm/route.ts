@@ -41,9 +41,10 @@ export async function POST(
     });
 
     // Auto-search and assign materials for each scene using smart search engine
+    // Bilibili search does NOT require PEXELS_API_KEY — only Pexels/Pixabay fallback does
     const pexelsApiKey = process.env.PEXELS_API_KEY;
     if (!pexelsApiKey) {
-      console.warn("PEXELS_API_KEY not configured — skipping material search, scenes will use placeholders");
+      console.warn("PEXELS_API_KEY not configured — Pexels/Pixabay fallback disabled, Bilibili search still available");
     }
 
     for (const scene of storyboard.scenes) {
@@ -51,32 +52,31 @@ export async function POST(
         console.log(`[Confirm] Scene ${scene.sceneNumber}: already has material, skipping`);
         continue;
       }
-      if (!scene.materialQuery) {
-        console.warn(`[Confirm] Scene ${scene.sceneNumber}: no materialQuery, skipping`);
-        continue;
-      }
-      if (!pexelsApiKey) {
-        console.warn(`[Confirm] Scene ${scene.sceneNumber}: no PEXELS_API_KEY, skipping`);
+      if (!scene.materialQuery && !scene.visualDesc) {
+        console.warn(`[Confirm] Scene ${scene.sceneNumber}: no materialQuery or visualDesc, skipping`);
         continue;
       }
 
       try {
-        // Parse productionMeta to get English keywords
+        // Parse productionMeta to get English keywords and sourceVideos
         let materialQueryEn: string | undefined;
+        let sourceVideos: string[] | undefined;
         if (scene.productionMeta) {
           try {
             const meta = JSON.parse(scene.productionMeta);
             materialQueryEn = meta.materialQueryEn;
+            sourceVideos = meta.sourceVideos;
           } catch {}
         }
 
-        console.log(`[Confirm] Scene ${scene.sceneNumber}: searching material (query="${scene.materialQuery.substring(0, 40)}", en="${materialQueryEn || 'N/A'}")`);
+        console.log(`[Confirm] Scene ${scene.sceneNumber}: searching material (query="${(scene.materialQuery || "").substring(0, 40)}", sourceVideos=${JSON.stringify(sourceVideos)})`);
 
         const searchCtx: SceneSearchContext = {
           sceneNumber: scene.sceneNumber,
-          materialQuery: scene.materialQuery,
+          materialQuery: scene.materialQuery || "",
           materialQueryEn,
           visualDesc: scene.visualDesc,
+          sourceVideos,
         };
 
         const results = await searchMaterialsForScene(searchCtx, 3);
