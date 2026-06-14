@@ -25,9 +25,10 @@ export class OpenAIProvider implements AIProvider {
   async analyzeContent(
     text: string,
     style: string,
+    materialReqs?: any | null,
     options?: AIStreamOptions
   ): Promise<AnalysisResult> {
-    const prompt = getAnalysisPrompt(text, style as any);
+    const prompt = getAnalysisPrompt(text, style as any, materialReqs);
 
     const response = await this.client.chat.completions.create({
       model: this.model,

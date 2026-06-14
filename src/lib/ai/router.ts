@@ -58,15 +58,16 @@ export function getAIProvider(config: string | ProviderConfig): AIProvider {
 export async function analyzeContent(
   text: string,
   style: string,
-  config: string | ProviderConfig = "claude"
+  config: string | ProviderConfig = "claude",
+  materialReqs?: any | null,
 ): Promise<AnalysisResult> {
   // Check cache first
-  const cacheKey = [text.slice(0, 500), style, typeof config === "string" ? config : `${config.provider}:${config.model}`];
+  const cacheKey = [text.slice(0, 500), style, typeof config === "string" ? config : `${config.provider}:${config.model}`, JSON.stringify(materialReqs || {})];
   const cached = await getCachedResult<AnalysisResult>("analyze", cacheKey);
   if (cached) return cached;
 
   const ai = getAIProvider(config);
-  const result = await ai.analyzeContent(text, style);
+  const result = await ai.analyzeContent(text, style, materialReqs);
 
   // Store in cache
   await setCachedResult("analyze", cacheKey, result);

@@ -2,6 +2,7 @@ import { prisma } from "@/lib/db";
 import { execFile, exec } from "child_process";
 import { promisify } from "util";
 import { readFile, writeFile, unlink, mkdir, rm } from "fs/promises";
+import { createWriteStream } from "fs";
 import { join } from "path";
 import { probeDimensions, detectWatermarkRegions } from "@/lib/materials/watermark";
 import { randomUUID } from "crypto";
@@ -17,6 +18,355 @@ import { withRetry, isFFmpegRetryableError, isNetworkError } from "@/lib/utils/r
 
 const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
+
+/**
+ * Determine if a scene is suitable for MG (Motion Graphics) animation display.
+ * MG is appropriate for: data/statistics, comparisons, lists, abstract concepts.
+ * MG is NOT appropriate for: narrative scenes, historical events, character actions.
+ */
+function isMGAnimationScene(sceneType: string, voiceoverText: string): boolean {
+  // Scene explicitly marked as ANIMATION
+  if (sceneType === "ANIMATION") return true;
+
+  // Check for data-heavy content patterns
+  const dataPatterns = [
+    /占.*分之/,           // "占全球三分之一"
+    /\d+\.?\d*[万亿亿]/,  // Large numbers (GDP, population)
+    /对比|比较|VS|vs/,     // Comparisons
+    /排名|排行|TOP|Top/,   // Rankings
+    /比例|占比|百分比|％/,  // Percentages
+    /增长了?|下降了?|翻了?/, // Growth/decline
+  ];
+  let dataScore = 0;
+  for (const p of dataPatterns) {
+    if (p.test(voiceoverText)) dataScore++;
+  }
+
+  // Must have at least 2 data indicators to qualify as MG-worthy
+  // Single number mentions (like "27年") are not enough — they're narrative context
+  if (dataScore >= 2) return true;
+
+  return false;
+}
+
+/**
+ * Extract key data points (numbers with context) from voiceover text.
+ * E.g., "170艘战船" → { number: "170", unit: "艘战船" }
+ * E.g., "19次" → { number: "19", unit: "次" }
+ * E.g., "两个半世纪" → { number: "2.5", unit: "世纪" }
+ */
+function extractDataPoints(text: string): Array<{ number: string; unit: string }> {
+  const results: Array<{ number: string; unit: string }> = [];
+
+  // Pattern 1: Arabic numbers with Chinese measure word (e.g., "170艘", "19次", "645年")
+  // Match: number + 1-2 char measure/unit word
+  const mw = "艘|次|年|人|个|万|亿|朝|代|国|部|战|条|座|件|场|位|名|期|届|批|项|种|倍|分|秒|里|米|亩|斤|吨|度|升|段|级|层|步|回|番|阵|局|行|群|队|军|师|旅|团|营|户|家|间|栋|城|镇|村|县|省|洲|岛|山|河|湖|海|桥|路|门|塔|寺|宫|殿|园|田|地|井|池|站|厂|炉|钟|鼓|旗|碑|像|画|书|信|令|法|税|银|粮|兵|马|车|船|炮|剑|弓|盾|甲|歌|诗|词|文|章|字|页|编|版";
+  const arabicMatches = text.match(new RegExp(`\\d+\\.?\\d*(?:${mw})`, "g"));
+  if (arabicMatches) {
+    for (const m of arabicMatches.slice(0, 4)) {
+      const numMatch = m.match(/^(\d+\.?\d*)(.{1,4})/);
+      if (numMatch && numMatch[1].length <= 6) {
+        results.push({ number: numMatch[1], unit: numMatch[2] });
+      }
+    }
+  }
+
+  // Pattern 2: Chinese number expressions (e.g., "两个半世纪", "四战", "百余人")
+  const chineseNumMap: Record<string, string> = {
+    "一": "1", "二": "2", "两": "2", "三": "3", "四": "4", "五": "5",
+    "六": "6", "七": "7", "八": "8", "九": "9", "十": "10",
+    "百": "100", "千": "1000", "万": "10000",
+  };
+  // Match "X个/次/年/世纪/人/艘/朝/代/国" patterns
+  const cnMatches = text.match(/[一两二三四五六七八九十百千万]+(?:个|次|年|世纪|人|艘|朝|代|国|州|部|篇|卷|战)/g);
+  if (cnMatches) {
+    for (const m of [...new Set(cnMatches)].slice(0, 2)) {
+      const firstChar = m[0];
+      if (chineseNumMap[firstChar]) {
+        results.push({ number: chineseNumMap[firstChar], unit: m.slice(1) });
+      }
+    }
+  }
+
+  // Pattern 3: Year/era references (e.g., "663年", "630年", "710年")
+  const yearMatches = text.match(/\d{3,4}年/g);
+  if (yearMatches && results.length < 3) {
+    for (const y of [...new Set(yearMatches)].slice(0, 2)) {
+      const yearNum = y.replace("年", "");
+      results.push({ number: yearNum, unit: "年" });
+    }
+  }
+
+  return results.slice(0, 3); // Max 3 data points per scene
+}
+
+/**
+ * Build FFmpeg drawtext filter chain for MG animation data highlights.
+ * Displays extracted numbers as large, glowing text with unit labels below.
+ */
+function buildMGDataDrawText(
+  dataPoints: Array<{ number: string; unit: string }>,
+  w: number,
+  h: number,
+  fontPath: string,
+): string {
+  if (dataPoints.length === 0) return "";
+
+  const filters: string[] = [];
+  const centerX = Math.round(w / 2);
+  const centerY = Math.round(h / 2);
+
+  if (dataPoints.length === 1) {
+    // Single data point: large centered number
+    const dp = dataPoints[0];
+    const safeNum = dp.number.replace(/['"\\:;%]/g, "");
+    const safeUnit = dp.unit.replace(/['"\\:;%]/g, "");
+    filters.push(
+      `drawtext=fontfile='${fontPath}':fontsize=120:fontcolor=white@0.9:x=(w-text_w)/2:y=${centerY - 80}:text='${safeNum}':enable='gt(t,0.5)'`,
+      `drawtext=fontfile='${fontPath}':fontsize=36:fontcolor=white@0.5:x=(w-text_w)/2:y=${centerY + 60}:text='${safeUnit}':enable='gt(t,0.8)'`,
+    );
+  } else if (dataPoints.length === 2) {
+    // Two data points: side by side
+    const leftX = Math.round(w * 0.25);
+    const rightX = Math.round(w * 0.75);
+    for (let idx = 0; idx < 2; idx++) {
+      const dp = dataPoints[idx];
+      const safeNum = dp.number.replace(/['"\\:;%]/g, "");
+      const safeUnit = dp.unit.replace(/['"\\:;%]/g, "");
+      const xPos = idx === 0 ? leftX : rightX;
+      filters.push(
+        `drawtext=fontfile='${fontPath}':fontsize=90:fontcolor=white@0.9:x=${xPos}-text_w/2:y=${centerY - 70}:text='${safeNum}':enable='gt(t,${0.5 + idx * 0.5})'`,
+        `drawtext=fontfile='${fontPath}':fontsize=28:fontcolor=white@0.5:x=${xPos}-text_w/2:y=${centerY + 40}:text='${safeUnit}':enable='gt(t,${0.8 + idx * 0.5})'`,
+      );
+    }
+  } else {
+    // Three data points: top-center, bottom-left, bottom-right
+    for (let idx = 0; idx < 3; idx++) {
+      const dp = dataPoints[idx];
+      const safeNum = dp.number.replace(/['"\\:;%]/g, "");
+      const safeUnit = dp.unit.replace(/['"\\:;%]/g, "");
+      let xPos: number, yPos: number;
+      if (idx === 0) { xPos = centerX; yPos = centerY - 120; }
+      else if (idx === 1) { xPos = Math.round(w * 0.3); yPos = centerY + 30; }
+      else { xPos = Math.round(w * 0.7); yPos = centerY + 30; }
+      filters.push(
+        `drawtext=fontfile='${fontPath}':fontsize=72:fontcolor=white@0.85:x=${xPos}-text_w/2:y=${yPos}:text='${safeNum}':enable='gt(t,${0.5 + idx * 0.4})'`,
+        `drawtext=fontfile='${fontPath}':fontsize=24:fontcolor=white@0.45:x=${xPos}-text_w/2:y=${yPos + 80}:text='${safeUnit}':enable='gt(t,${0.8 + idx * 0.4})'`,
+      );
+    }
+  }
+
+  return filters.join(",");
+}
+
+/**
+ * Extract table-structured data from voiceover text.
+ * Detects comparison patterns (A vs B), lists, and structured facts.
+ * Returns null if no table structure is detected.
+ */
+interface TableRow {
+  label: string;
+  values: string[];
+}
+interface TableData {
+  headers: string[];   // Column headers (e.g., ["", "明朝", "清朝"])
+  rows: TableRow[];    // Data rows (e.g., [{label: "官员自称", values: ["臣", "奴才"]}])
+}
+
+function extractTableData(text: string): TableData | null {
+  // Pattern 1: Explicit A vs B comparison (e.g., "明朝...清朝..." or "A是X，B是Y")
+  const comparisonPairs: string[][] = [
+    ["明朝", "清朝"], ["明", "清"], ["大明", "大清"],
+    ["唐", "宋"], ["唐", "明"], ["中国", "日本"],
+    ["古代", "现代"], ["过去", "现在"],
+  ];
+
+  for (const [left, right] of comparisonPairs) {
+    if (text.includes(left) && text.includes(right)) {
+      const rows: TableRow[] = [];
+
+      // Strategy: Split text into sentences, find pairs with same structure
+      const sentences = text.split(/[，。；！？]/).filter(s => s.trim());
+      const leftSentences = sentences.filter(s => s.includes(left));
+      const rightSentences = sentences.filter(s => s.includes(right));
+
+      // Match paired sentences: each left sentence matches best right sentence
+      const usedRightIdx = new Set<number>();
+      for (const ls of leftSentences) {
+        let bestScore = -1;
+        let bestRow: TableRow | null = null;
+        let bestRIdx = -1;
+        for (let ri = 0; ri < rightSentences.length; ri++) {
+          if (usedRightIdx.has(ri)) continue;
+          const rs = rightSentences[ri];
+          const leftPart = ls.replace(new RegExp(`.*${left}`, "g"), "").replace(/[的了是有都也会被把让向给从]/g, "").trim();
+          const rightPart = rs.replace(new RegExp(`.*${right}`, "g"), "").replace(/[的了是有都也会被把让向给从]/g, "").trim();
+          if (leftPart && rightPart && leftPart !== rightPart
+              && leftPart.length >= 2 && leftPart.length <= 10
+              && rightPart.length >= 2 && rightPart.length <= 10) {
+            const lenDiff = Math.abs(leftPart.length - rightPart.length);
+            if (lenDiff <= 2) {
+              const score = 10 - lenDiff;
+              if (score > bestScore) {
+                bestScore = score;
+                bestRow = { label: "", values: [leftPart, rightPart] };
+                bestRIdx = ri;
+              }
+            }
+          }
+        }
+        if (bestRow && rows.length < 4) {
+          usedRightIdx.add(bestRIdx);
+          rows.push(bestRow);
+        }
+      }
+
+      if (rows.length >= 2) {
+        return {
+          headers: ["", left, right],
+          rows,
+        };
+      }
+    }
+  }
+
+  // Pattern 2: Numbered/bulleted list (3+ items)
+  // e.g., "政治上...经济上...文化上..." or "第一...第二...第三..."
+  const aspectPatterns = text.match(/(?:政治|经济|文化|军事|外交|科技|教育|法律|社会|制度|思想|艺术)[上中方面]/g);
+  if (aspectPatterns && aspectPatterns.length >= 3) {
+    const uniqueAspects = [...new Set(aspectPatterns)];
+    const rows: TableRow[] = [];
+    for (const aspect of uniqueAspects.slice(0, 4)) {
+      // Extract the content after the aspect keyword
+      const aspectRegex = new RegExp(`${aspect}[，：:]?([^，。；！？]{2,12})`, "g");
+      const contentMatch = aspectRegex.exec(text);
+      if (contentMatch) {
+        const content = contentMatch[1].replace(/[的了是有都也会被把让向给从]/g, "").trim();
+        if (content) rows.push({ label: aspect, values: [content] });
+      }
+    }
+    if (rows.length >= 2) {
+      return {
+        headers: ["领域", "内容"],
+        rows,
+      };
+    }
+  }
+
+  // Pattern 3: Multiple data points with same unit → comparison table
+  const dataPoints = extractDataPoints(text);
+  if (dataPoints.length >= 3) {
+    const sameUnit = dataPoints.filter(dp => dp.unit === dataPoints[0].unit);
+    if (sameUnit.length >= 3) {
+      return {
+        headers: ["序号", dataPoints[0].unit],
+        rows: sameUnit.slice(0, 4).map((dp, i) => ({
+          label: `${i + 1}`,
+          values: [dp.number],
+        })),
+      };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Build FFmpeg filter chain for table-style MG animation.
+ * Uses drawbox for table borders + drawtext for cell content.
+ */
+function buildMGTableDrawText(
+  table: TableData,
+  w: number,
+  h: number,
+  fontPath: string,
+): string {
+  const filters: string[] = [];
+  const numCols = table.headers.length;
+  const numRows = table.rows.length + 1; // +1 for header
+
+  // Table dimensions
+  const tableW = Math.min(Math.round(w * 0.7), 1200);
+  const tableH = Math.min(Math.round(h * 0.5), numRows * 80 + 40);
+  const tableX = Math.round((w - tableW) / 2);
+  const tableY = Math.round((h - tableH) / 2);
+  const colW = Math.round(tableW / numCols);
+  const rowH = Math.round(tableH / numRows);
+
+  // Draw table background (semi-transparent dark box)
+  filters.push(
+    `drawbox=x=${tableX}:y=${tableY}:w=${tableW}:h=${tableH}:color=0x0f3460@0.7:t=fill:enable='gt(t,0.3)'`,
+  );
+
+  // Draw header row background (slightly lighter)
+  filters.push(
+    `drawbox=x=${tableX}:y=${tableY}:w=${tableW}:h=${rowH}:color=0x1a5276@0.8:t=fill:enable='gt(t,0.3)'`,
+  );
+
+  // Draw table border
+  filters.push(
+    `drawbox=x=${tableX}:y=${tableY}:w=${tableW}:h=${tableH}:color=white@0.3:t=2:enable='gt(t,0.3)'`,
+  );
+
+  // Draw horizontal lines for each row
+  for (let r = 1; r < numRows; r++) {
+    const lineY = tableY + r * rowH;
+    filters.push(
+      `drawbox=x=${tableX}:y=${lineY}:w=${tableW}:h=1:color=white@0.2:t=fill:enable='gt(t,0.3)'`,
+    );
+  }
+
+  // Draw vertical lines for each column
+  for (let c = 1; c < numCols; c++) {
+    const lineX = tableX + c * colW;
+    filters.push(
+      `drawbox=x=${lineX}:y=${tableY}:w=1:h=${tableH}:color=white@0.2:t=fill:enable='gt(t,0.3)'`,
+    );
+  }
+
+  // Draw header text
+  for (let c = 0; c < numCols; c++) {
+    const header = table.headers[c].replace(/['"\\:;%]/g, "");
+    if (!header) continue;
+    const cellX = tableX + c * colW + Math.round(colW / 2);
+    const cellY = tableY + Math.round(rowH / 2) - 12;
+    filters.push(
+      `drawtext=fontfile='${fontPath}':fontsize=28:fontcolor=white@0.9:x=${cellX}-text_w/2:y=${cellY}:text='${header}':enable='gt(t,0.5)'`,
+    );
+  }
+
+  // Draw data rows with staggered animation
+  for (let r = 0; r < table.rows.length; r++) {
+    const row = table.rows[r];
+    const rowY = tableY + (r + 1) * rowH;
+    const delay = 0.8 + r * 0.4;
+
+    // Row label (first column)
+    if (row.label) {
+      const safeLabel = row.label.replace(/['"\\:;%]/g, "");
+      const cellX = tableX + Math.round(colW / 2);
+      const cellY = rowY + Math.round(rowH / 2) - 12;
+      filters.push(
+        `drawtext=fontfile='${fontPath}':fontsize=24:fontcolor=white@0.7:x=${cellX}-text_w/2:y=${cellY}:text='${safeLabel}':enable='gt(t,${delay})'`,
+      );
+    }
+
+    // Row values (remaining columns)
+    for (let c = 0; c < row.values.length; c++) {
+      const safeVal = row.values[c].replace(/['"\\:;%]/g, "");
+      if (!safeVal) continue;
+      const cellX = tableX + (c + 1) * colW + Math.round(colW / 2);
+      const cellY = rowY + Math.round(rowH / 2) - 12;
+      // Highlight with accent color for contrast values
+      const color = (numCols === 3 && c === 1) ? "0x5dade2@0.95" : "0xf39c12@0.95";
+      filters.push(
+        `drawtext=fontfile='${fontPath}':fontsize=24:fontcolor=${color}:x=${cellX}-text_w/2:y=${cellY}:text='${safeVal}':enable='gt(t,${delay + 0.2})'`,
+      );
+    }
+  }
+
+  return filters.join(",");
+}
 
 /** Try multiple Python paths for edge_tts, using shell for PATH resolution */
 async function generateTTS(text: string, voice: string, outputFile: string): Promise<boolean> {
@@ -133,8 +483,8 @@ export async function renderProjectInline(
     const isMiMo = user?.ttsProvider === "mimo";
     const edgeVoice = user?.ttsVoice || "zh-CN-YunxiNeural";
 
-    // TTS with concurrency (3 parallel TTS calls)
-    const TTS_CONCURRENCY = 3;
+    // TTS with concurrency (5 parallel TTS calls for speed)
+    const TTS_CONCURRENCY = 5;
     const ttsResults = await mapConcurrent(scenes, TTS_CONCURRENCY, async (scene, i) => {
       const audioFile = join(workDir, `tts-${i}.mp3`);
 
@@ -289,8 +639,8 @@ export async function renderProjectInline(
       data: { status: "MATERIALS_LOADING", currentStage: "materials" },
     });
 
-    // Materials stage with concurrency (2 parallel material searches)
-    const MATERIALS_CONCURRENCY = 2;
+    // Materials stage with concurrency (4 parallel material searches for speed)
+    const MATERIALS_CONCURRENCY = 4;
     await mapConcurrent(scenes, MATERIALS_CONCURRENCY, async (scene, i) => {
       const materialFile = join(workDir, `scene-${i}.mp4`);
       let materialLoaded = false;
@@ -300,129 +650,247 @@ export async function renderProjectInline(
       if (scene.productionMeta) {
         try { meta = JSON.parse(scene.productionMeta as string); } catch {}
       }
-      const sourceVideos: string[] = meta?.sourceVideos || [];
+      const sourceVideos: string[] = (meta?.sourceVideos || []).map((sv: string) => {
+        // Clean sourceVideo names: remove parenthetical annotations like "（文化氛围）"
+        // "长安十二时辰（文化氛围）" → "长安十二时辰"
+        return sv.replace(/[（(][^）)]*[）)]/g, "").trim();
+      }).filter((sv: string) => sv.length >= 2);
       const materialQuery = meta?.materialQuery || scene.materialQuery || "";
+      const materialQueryEn = meta?.materialQueryEn || "";
       const visualDesc = meta?.visualDesc || scene.visualDesc || "";
+
+      // Parse project-level material requirements
+      let projectMaterialReqs: {
+        contentSummary?: string;
+        referenceStyle?: string;
+        requiredSources?: string[];
+        preferredSources?: string[];
+        materialTypes?: string[];
+        properNouns?: string[];
+        landmarkScenes?: string[];
+        stylePreference?: string;
+        timeLimit?: string;
+        regionLimit?: string;
+        avoidKeywords?: string[];
+      } | null = null;
+      if (project.materialRequirements) {
+        try { projectMaterialReqs = JSON.parse(project.materialRequirements); } catch {}
+      }
+
+      // Merge: requiredSources take priority over AI-generated sourceVideos
+      const effectiveSources = [
+        ...(projectMaterialReqs?.requiredSources || []),
+        ...sourceVideos.filter(sv => !(projectMaterialReqs?.requiredSources || []).includes(sv)),
+      ];
+      const preferredSources = projectMaterialReqs?.preferredSources || [];
+      const properNouns = projectMaterialReqs?.properNouns || [];
+      const landmarkScenes = projectMaterialReqs?.landmarkScenes || [];
+      const avoidKeywords = [
+        ...(projectMaterialReqs?.avoidKeywords || []),
+        // Auto-add region limit keywords
+        ...(projectMaterialReqs?.regionLimit?.includes("现代") ? ["现代", "都市", "城市", "高楼", "商场", "地铁"] : []),
+      ];
 
       // ── Auto-search materials from Bilibili if none attached ──
       async function autoSearchBilibili(): Promise<boolean> {
         try {
           // ── Build prioritized search queries ──
-          // Strategy: sourceVideos + visualDesc keywords > sourceVideos + materialQuery > visualDesc > materialQuery > properNouns > voiceover
+          // KEY PRINCIPLE: Keep search queries SHORT (2-4 words max).
+          // Bilibili search engine works best with concise keywords.
+          // Long queries like "长安十二时辰 正片 日本贵族吟诵汉诗 唐招提寺 空镜" return garbage.
+          // Instead: "长安十二时辰 片段" or "唐招提寺 空镜"
+          const searchQueries: { query: string; label: string; requireTitleMatch?: string }[] = [];
 
-          const abstractWords = new Set([
-            "画面", "描述", "展现", "展示", "呈现", "表现", "体现", "反映",
-            "风格", "色调", "氛围", "镜头", "光影", "构图", "采用", "运用",
-            "使用", "适合", "需要", "可以", "强烈", "突出", "营造",
-            "冷硬", "惨烈", "阴森", "压抑", "悲壮", "辉煌", "宏伟",
-            "相关", "经典", "场景", "缓缓", "慢慢", "特写", "全景", "近景", "远景",
-            "例如", "视频", "片段", "该部", "这部", "中的", "聚焦", "注重",
-            "整体", "戏剧", "冲突", "悲剧", "色彩", "恐怖", "紧张", "庄严",
-          ]);
+          // ── Extract core visual keywords from visualDesc ──
+          // This is the MOST IMPORTANT step for matching footage to scene descriptions.
+          // We extract concrete, searchable terms from the visual description.
+          const visualKeywords: string[] = [];
+          if (visualDesc) {
+            // Pattern 1: Scene/location nouns (most searchable)
+            const locationNouns = visualDesc.match(/(?:紫禁城|太和殿|朝堂|宫殿|宫门|龙椅|金銮殿|御书房|后宫|考场|城墙|战场|军营|书房|大殿|殿内|殿外|金銮|太庙|天坛|颐和园|圆明园|长城|运河|科举考场|港口|码头|海面|江面|船队|战船|帆船|寺庙|佛寺|古寺|宫殿|皇城|城门|城楼|城墙|街道|集市|朝堂|宫殿|大殿|龙椅|御花园|庭院|和室|茶室|书院|学堂|战场|军营|营地|阵前|城下|护城河|运河|河道|港口|码头|船厂|船坞|海面|江面|湖面|河面|大海|大洋|海峡|海湾|山崖|山顶|山间|山路|平原|草原|沙漠|戈壁|森林|竹林|花园|园林|楼阁|亭台|塔|桥|牌坊|坊门|朱雀门|朱雀大街|棋盘式|东西市|坊|市|平城京|奈良|长安|洛阳|开封|临安|北京|南京)/g) as string[] | null;
+            if (locationNouns) visualKeywords.push(...[...new Set(locationNouns)].slice(0, 4));
 
-          // Extract concrete scene keywords from visualDesc (people, actions, places, events)
-          // Use 2-4 char segments for better Bilibili search matching
-          function extractSceneKeywords(text: string): string[] {
-            if (!text) return [];
-            // First try to extract known concrete patterns
-            const keywords: string[] = [];
+            // Pattern 2: Character/action keywords (2-4 chars, very specific)
+            // Extract concrete visual actions like "遣唐使渡海", "朝堂议事", "跪拜", "吟诗"
+            const actionPatterns = visualDesc.match(/[\u4e00-\u9fff]{2,4}(?:渡海|出海|航行|登船|跪拜|叩首|跪坐|端坐|站立|行走|奔跑|冲锋|厮杀|战斗|交战|对峙|跪奏|上书|奏请|吟诵|诵读|书写|挥毫|执笔|翻阅|展开|捧着|手持|身披|身穿|头戴|端坐|盘坐|俯瞰|仰望|远眺|眺望|注视|凝视|怒视|俯视|环视|巡视)/g) as string[] | null;
+            if (actionPatterns) visualKeywords.push(...[...new Set(actionPatterns)].slice(0, 3));
 
-            // Extract 《》 book/work names
-            const workMatches = text.match(/《([^》]+)》/g) || [];
-            workMatches.forEach((m: string) => {
-              const name = m.replace(/[《》]/g, "");
-              if (name.length >= 2 && name.length <= 8) keywords.push(name);
-            });
-
-            // Extract 2-4 char concrete nouns (shorter = better for search)
-            const shortWords = text.match(/[\u4e00-\u9fff]{2,4}/g) || [];
-            const seen = new Set(keywords);
-            for (const w of shortWords) {
-              if (seen.has(w)) continue;
-              if (abstractWords.has(w)) continue;
-              if (/^[一二三四五六七八九十百千万亿]+$/.test(w)) continue;
-              // Filter out incomplete verb phrases (ends with 在/的/了/着/过/和/与)
-              if (/[在的了着过和与及把被从向往]$/ .test(w)) continue;
-              // Filter out common non-searchable words
-              const nonSearchable = new Set([
-                "这是", "那是", "他的", "她的", "我的", "这个", "那个", "这些", "那些",
-                "最后", "首先", "然后", "接着", "同时", "此时", "画面", "镜头", "切换",
-                "缓缓", "慢慢", "快速", "逐渐", "最终", "开始", "结束", "显示", "展示",
-                "映照", "笼罩", "充满", "转为", "变为", "化为", "定格", "聚焦",
-              ]);
-              if (nonSearchable.has(w)) continue;
-              keywords.push(w);
-              seen.add(w);
-              if (keywords.length >= 6) break;
+            // Pattern 3: Proper nouns from user requirements that appear in visualDesc
+            for (const pn of properNouns) {
+              if (visualDesc.includes(pn)) visualKeywords.push(pn);
             }
 
-            return keywords.slice(0, 6);
+            // Pattern 4: Show names mentioned in visualDesc with 《》
+            const showInVisual = visualDesc.match(/《([^》]+)》/g) as string[] | null;
+            if (showInVisual) {
+              for (const show of [...new Set(showInVisual)].slice(0, 2)) {
+                const showName = show.replace(/[《》]/g, "");
+                // Add to visualKeywords instead of mutating effectiveSources
+                if (!effectiveSources.includes(showName) && !preferredSources.includes(showName)) {
+                  visualKeywords.push(showName);
+                }
+              }
+            }
           }
 
-          // Extract concrete keywords from materialQuery
-          function extractMaterialKeywords(query: string): string {
-            if (!query) return "";
-            if (query.length <= 20) return query;
-            const words = query.match(/[一-鿿]{2,8}/g) || [];
-            const concrete = words.filter((w: string) => !abstractWords.has(w));
-            return concrete.length > 0
-              ? [...new Set(concrete)].slice(0, 4).join(" ")
-              : query.substring(0, 20);
+          // Also extract keywords from materialQuery (but keep it short!)
+          const mqKeywords: string[] = [];
+          if (materialQuery) {
+            // Split materialQuery into short phrases, take the most concrete ones
+            const parts = materialQuery.split(/[\s,，、]+/).filter((p: string) => p.length >= 2 && p.length <= 8);
+            mqKeywords.push(...parts.slice(0, 3));
           }
 
-          const visualKeywords = extractSceneKeywords(visualDesc);
-          const materialKeywords = extractMaterialKeywords(materialQuery);
-
-          // Build ordered list of search queries to try
-          const searchQueries: { query: string; label: string }[] = [];
-
-          // Q1: sourceVideos + visualDesc scene keywords (MOST PRECISE — targets specific TV show + scene)
-          if (sourceVideos.length > 0 && visualKeywords.length > 0) {
-            searchQueries.push({
-              query: `${sourceVideos[0]} ${visualKeywords.slice(0, 3).join(" ")}`,
-              label: "剧名+画面关键词",
-            });
-          }
-
-          // Q2: sourceVideos + materialQuery
-          if (sourceVideos.length > 0 && materialKeywords) {
-            searchQueries.push({
-              query: `${sourceVideos[0]} ${materialKeywords}`,
-              label: "剧名+检索词",
-            });
-          }
-
-          // Q3: Try 2nd/3rd sourceVideos if available
-          for (let si = 1; si < Math.min(sourceVideos.length, 3); si++) {
-            if (visualKeywords.length > 0) {
+          // ── Phase 0: Required sources (user-specified, MUST appear) ──
+          if (projectMaterialReqs?.requiredSources?.length) {
+            for (const req of projectMaterialReqs.requiredSources.slice(0, 3)) {
+              // Search: "剧名 片段" (short and effective)
               searchQueries.push({
-                query: `${sourceVideos[si]} ${visualKeywords.slice(0, 3).join(" ")}`,
-                label: `备选剧名${si}+画面关键词`,
+                query: `${req} 片段`,
+                label: `必须来源+片段`,
+                requireTitleMatch: req,
+              });
+              // Search: "剧名 + top visual keyword" (if available)
+              const topVkw = visualKeywords[0] || mqKeywords[0];
+              if (topVkw && topVkw.length <= 6) {
+                searchQueries.push({
+                  query: `${req} ${topVkw}`,
+                  label: `必须来源+画面词`,
+                  requireTitleMatch: req,
+                });
+              }
+            }
+          }
+
+          // ── Phase 1: AI-recommended sourceVideos (high precision) ──
+          // KEY: Search show name ALONE first, then with ONE keyword
+          for (const sv of effectiveSources.slice(0, 3)) {
+            if (projectMaterialReqs?.requiredSources?.includes(sv)) continue;
+            // "剧名 片段" — simplest, most effective search
+            searchQueries.push({
+              query: `${sv} 片段`,
+              label: "剧名+片段",
+              requireTitleMatch: sv,
+            });
+            // "剧名 + 1 visual keyword" — more targeted
+            const topVkw = visualKeywords[0] || mqKeywords[0];
+            if (topVkw && topVkw.length <= 6 && !sv.includes(topVkw)) {
+              searchQueries.push({
+                query: `${sv} ${topVkw}`,
+                label: "剧名+画面词",
+                requireTitleMatch: sv,
               });
             }
           }
 
-          // Q4: visualDesc keywords alone (without sourceVideos)
-          if (visualKeywords.length > 0) {
+          // ── Phase 1.5: Preferred sources ──
+          for (const ps of preferredSources.slice(0, 2)) {
             searchQueries.push({
-              query: visualKeywords.join(" ") + " 电视剧",
-              label: "画面关键词+电视剧",
-            });
-            searchQueries.push({
-              query: visualKeywords.join(" ") + " 纪录片",
-              label: "画面关键词+纪录片",
+              query: `${ps} 片段`,
+              label: "推荐来源+片段",
+              requireTitleMatch: ps,
             });
           }
 
-          // Q5: materialQuery alone
-          if (materialKeywords) {
+          // ── Phase 2: Visual keywords (NO show name — broader search) ──
+          // These are the MOST IMPORTANT for matching visual description
+          const uniqueVisualKws = [...new Set(visualKeywords)].filter(
+            kw => kw.length >= 2 && kw.length <= 8 && !avoidKeywords.some(ak => kw.includes(ak))
+          );
+          for (const vkw of uniqueVisualKws.slice(0, 4)) {
+            // "关键词 电视剧" — find drama footage
             searchQueries.push({
-              query: materialKeywords,
+              query: `${vkw} 电视剧`,
+              label: `画面词+电视剧`,
+            });
+            // "关键词 纪录片" — find documentary footage
+            searchQueries.push({
+              query: `${vkw} 纪录片`,
+              label: `画面词+纪录片`,
+            });
+            // "关键词 空镜" — for location establishing shots
+            if (vkw.length <= 5) {
+              searchQueries.push({
+                query: `${vkw} 空镜`,
+                label: `画面词+空镜`,
+              });
+            }
+          }
+
+          // ── Phase 2.5: properNouns from user requirements ──
+          if (properNouns.length > 0) {
+            const voiceText = scene.voiceoverText || "";
+            const matchedNouns = properNouns.filter(pn =>
+              voiceText.includes(pn) || (visualDesc || "").includes(pn)
+            );
+            for (const noun of matchedNouns.slice(0, 2)) {
+              searchQueries.push({
+                query: `${noun} 电视剧`,
+                label: `专名+电视剧`,
+              });
+              searchQueries.push({
+                query: `${noun} 纪录片`,
+                label: `专名+纪录片`,
+              });
+            }
+          }
+
+          // ── Phase 2.8: landmarkScenes from user requirements ──
+          if (landmarkScenes.length > 0) {
+            const voiceText = scene.voiceoverText || "";
+            const matchedScenes = landmarkScenes.filter(ls =>
+              voiceText.includes(ls) || (visualDesc || "").includes(ls)
+            );
+            for (const ls of matchedScenes.slice(0, 2)) {
+              searchQueries.push({
+                query: `${ls} 空镜`,
+                label: `标志场景+空镜`,
+              });
+              searchQueries.push({
+                query: `${ls} 纪录片`,
+                label: `标志场景+纪录片`,
+              });
+            }
+          }
+
+          // ── Phase 3: materialQuery (short version only) ──
+          if (materialQuery) {
+            // Use the FULL materialQuery as-is (it should be short per prompt)
+            searchQueries.push({
+              query: materialQuery,
               label: "检索词",
             });
+            // Also try first keyword + "电视剧"
+            if (mqKeywords.length > 0) {
+              searchQueries.push({
+                query: `${mqKeywords[0]} 电视剧`,
+                label: "检索词核心+电视剧",
+              });
+            }
           }
 
-          // Q6: properNouns + era
+          // ── Phase 4: Fallback — voiceover text keywords ──
+          {
+            const voiceText = scene.voiceoverText || scene.title || "";
+            // Extract concrete nouns (2-4 chars) from voiceover
+            const voiceWords = voiceText.match(/[\u4e00-\u9fff]{2,4}/g) || [];
+            const voiceStop = new Set([
+              "然后", "为啥", "为什么", "不是", "今天", "肯定", "听过", "真实",
+              "发生", "所有", "必须", "几乎", "只留", "一点", "但是", "因为",
+              "所以", "如果", "虽然", "不过", "而且", "或者", "已经", "可以",
+              "就是", "还是", "这个", "那个", "什么", "怎么", "这样", "那样",
+              "他们", "我们", "自己", "其他", "一些", "一个", "这种", "那种",
+            ]);
+            const filteredVoice = voiceWords.filter((w: string) => !voiceStop.has(w)).slice(0, 3);
+            if (filteredVoice.length > 0) {
+              searchQueries.push({
+                query: filteredVoice.join(" ") + " 纪录片",
+                label: "口播词+纪录片",
+              });
+            }
+          }
+
+          // ── Phase 5: properNouns + era fallback ──
           {
             const fallbackTerms: string[] = [];
             if (meta?.properNouns?.length) {
@@ -434,23 +902,10 @@ export async function renderProjectInline(
               fallbackTerms.push(...eraWords);
             }
             if (fallbackTerms.length > 0) {
+              const uniqueTerms = [...new Set(fallbackTerms)].slice(0, 3);
               searchQueries.push({
-                query: [...new Set(fallbackTerms)].slice(0, 4).join(" ") + " 纪录片",
-                label: "专有名词+纪录片",
-              });
-            }
-          }
-
-          // Q7: Last resort — voiceover text
-          {
-            const voiceText = scene.voiceoverText || scene.title || "";
-            const voiceWords = voiceText.match(/[\u4e00-\u9fff]{2,6}/g) || [];
-            const voiceStop = new Set(["然后", "为啥", "为什么", "不是", "今天", "肯定", "听过", "真实", "发生", "所有", "必须", "几乎", "只留", "一点"]);
-            const filteredVoice = voiceWords.filter((w: string) => !voiceStop.has(w)).slice(0, 4);
-            if (filteredVoice.length > 0) {
-              searchQueries.push({
-                query: filteredVoice.join(" ") + " 纪录片",
-                label: "口播文本+纪录片",
+                query: uniqueTerms.join(" ") + " 纪录片",
+                label: "专名+时代+纪录片",
               });
             }
           }
@@ -459,12 +914,12 @@ export async function renderProjectInline(
           searchQueries.forEach((sq, qi) => console.log(`  Q${qi + 1} [${sq.label}]: "${sq.query}"`));
 
           // Search with primary query first, fallback to secondary query
-          async function bilibiliSearch(query: string, retries = 2): Promise<any[]> {
+          async function bilibiliSearch(query: string, retries = 1): Promise<any[]> {
             if (!query) return [];
             for (let attempt = 0; attempt <= retries; attempt++) {
               try {
-                if (attempt > 0) await new Promise(r => setTimeout(r, 1500 + Math.random() * 2000));
-                const url = `https://api.bilibili.com/x/web-interface/search/type?search_type=video&keyword=${encodeURIComponent(query)}&page=1&page_size=20&order=totalrank`;
+                if (attempt > 0) await new Promise(r => setTimeout(r, 800 + Math.random() * 1000));
+                const url = `https://api.bilibili.com/x/web-interface/search/type?search_type=video&keyword=${encodeURIComponent(query)}&page=1&page_size=10&order=totalrank`;
                 const res = await fetch(url, {
                   headers: {
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -530,29 +985,108 @@ export async function renderProjectInline(
             } catch { return false; }
           }
 
-          // ── Execute search queries in priority order, stop at first match ──
-          let matchedVideo: { bvid: string; streamUrl: string; title: string; pic: string; durSec: number; usedQuery: string } | null = null;
+          // ── Execute search queries in priority order ──
+          // Strategy: collect valid candidates, then pick the best one.
+          // Title matching sourceVideos is a BONUS (preferred), not mandatory.
+          // All candidates must pass the negative keyword filter.
+          let candidates: { bvid: string; streamUrl: string; title: string; pic: string; durSec: number; usedQuery: string; label: string; titleMatched: boolean }[] = [];
 
           for (const sq of searchQueries) {
-            if (matchedVideo) break;
+            // Stop early if we already have a title-matched candidate from a higher-priority query
+            if (candidates.some(c => c.titleMatched)) break;
+            // Limit total candidates to avoid excessive API calls
+            if (candidates.length >= 3) break;
+
             const results = await bilibiliSearch(sq.query);
             console.log(`[Render] Scene ${i} Q[${sq.label}] "${sq.query}" → ${results.length} results`);
 
-            for (const video of results) {
-              if (matchedVideo) break;
+            // Sort by duration descending when searching with sourceVideos
+            if (sq.requireTitleMatch && results.length > 1) {
+              results.sort((a: any, b: any) => {
+                const parseDur = (d: string) => {
+                  if (!d) return 0;
+                  const p = d.split(":").map(Number);
+                  return p.length === 2 ? p[0]*60+p[1] : p[0]*3600+p[1]*60+p[2];
+                };
+                return parseDur(b.duration) - parseDur(a.duration);
+              });
+            }
+
+            // Only process top 5 results per query (speed optimization)
+            for (const video of results.slice(0, 5)) {
               const bvid = video.bvid;
               if (!bvid) continue;
+              // Skip duplicate bvids
+              if (candidates.some(c => c.bvid === bvid)) continue;
+
+              const title = video.title?.replace(/<[^>]*>/g, "") || sq.query;
+
+              // ── Check if title matches sourceVideos (preferred, not mandatory) ──
+              let titleMatched = false;
+              if (sq.requireTitleMatch) {
+                const matchName = sq.requireTitleMatch;
+                const titleClean = title.replace(/[\s【】\[\]「」『』《》]/g, "");
+                const matchClean = matchName.replace(/[\s【】\[\]「」『』《》]/g, "");
+                if (titleClean.includes(matchClean)) {
+                  titleMatched = true;
+                } else {
+                  // Also check abbreviations (first half / last half of the show name)
+                  const abbreviations = [
+                    matchClean.slice(0, Math.ceil(matchClean.length / 2)),
+                    matchClean.slice(-Math.ceil(matchClean.length / 2)),
+                  ];
+                  titleMatched = abbreviations.some(ab => ab.length >= 2 && titleClean.includes(ab));
+                }
+              }
+
+              // ── Negative keyword filter (applies to ALL candidates) ──
+              // Skip content that is clearly NOT official drama/documentary footage
+              const negativeKeywords = [
+                // 博主/二创内容
+                "解说", "混剪", "踩点", "二创", "reaction", "Reaction",
+                "吐槽", "影评", "观后感", "观后", "推荐", "安利",
+                "UP主", "博主", "up主", "整活", "恶搞", "鬼畜",
+                "弹幕", "翻唱", "cos", "Cos", "COS",
+                "测评", "评测", "开箱", "拆包",
+                // 短剧/言情/网剧（低质量素材）
+                "短剧", "言情", "大女主", "重生", "穿越", "甜宠",
+                "霸总", "逆袭", "爽剧", "微短剧", "竖屏短剧",
+                // 生活/娱乐类
+                "试吃", "吃播", "美食", "做饭", "探店",
+                "比亚迪", "汽车", "手机", "直播", "带货",
+                "搞笑", "段子", "相亲", "综艺",
+                // 游戏/玩具
+                "游戏", "我的世界", "Minecraft", "minecraft",
+                "乐高", "积木", "手办", "模型",
+                // 教育/教学（中小学课程等）
+                "教程", "教学", "攻略", "指南", "入门",
+                "中小学", "初中", "高中", "小学", "课时",
+                "文言文", "语文", "数学", "英语", "考试",
+                "讲解", "习题", "知识点", "考点",
+                // 动漫/二次元（非真人）
+                "动漫", "动画", "番剧", "二次元", "国漫",
+                // 其他不相关
+                "VLOG", "vlog", "日常", "记录", "vlog",
+                // User-specified avoid keywords from materialRequirements
+                ...avoidKeywords,
+              ];
+              const titleLower = title.toLowerCase();
+              const isNegative = negativeKeywords.some(nk => titleLower.includes(nk));
+              if (isNegative) {
+                console.log(`[Render] Scene ${i} candidate [${bvid}] skipped (negative keyword in "${title.slice(0, 30)}")`);
+                continue;
+              }
 
               const durParts = (video.duration || "0:00").split(":").map(Number);
               const durSec = durParts.length === 2 ? durParts[0]*60+durParts[1] : durParts[0]*3600+durParts[1]*60+durParts[2];
-              const maxDuration = sourceVideos.length > 0 ? 1800 : 600;
+              const maxDuration = effectiveSources.length > 0 ? 1800 : 600;
               if (durSec < 5 || durSec > maxDuration) continue;
 
               let streamUrl: string | null = null;
               try {
                 const infoRes = await fetch(`https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`, {
                   headers: { "User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/" },
-                  signal: AbortSignal.timeout(8000),
+                  signal: AbortSignal.timeout(5000),
                 });
                 if (infoRes.ok) {
                   const infoData = await infoRes.json();
@@ -560,7 +1094,8 @@ export async function renderProjectInline(
                   if (cid) {
                     const streamRes = await fetch(
                       `https://api.bilibili.com/x/player/playurl?bvid=${bvid}&cid=${cid}&qn=80&fnval=1`,
-                      { headers: { "User-Agent": "Mozilla/5.0", "Referer": `https://www.bilibili.com/video/${bvid}` } }
+                      { headers: { "User-Agent": "Mozilla/5.0", "Referer": `https://www.bilibili.com/video/${bvid}` },
+                        signal: AbortSignal.timeout(5000) }
                     );
                     if (streamRes.ok) {
                       const streamData = await streamRes.json();
@@ -593,11 +1128,24 @@ export async function renderProjectInline(
                 continue;
               }
 
-              const title = video.title?.replace(/<[^>]*>/g, "") || sq.query;
               const pic = video.pic?.startsWith("//") ? `https:${video.pic}` : (video.pic || "");
-              matchedVideo = { bvid, streamUrl, title, pic, durSec, usedQuery: sq.query };
-              console.log(`[Render] Scene ${i} matched via [${sq.label}]: ${title.slice(0, 40)} (${durSec}s)`);
+              candidates.push({ bvid, streamUrl, title, pic, durSec, usedQuery: sq.query, label: sq.label, titleMatched });
+              console.log(`[Render] Scene ${i} candidate [${sq.label}] ${titleMatched ? "✅" : "⚠️"} ${title.slice(0, 40)} (${durSec}s)`);
             }
+          }
+
+          // ── Pick the best candidate ──
+          // Priority: titleMatched > longer duration
+          let matchedVideo: { bvid: string; streamUrl: string; title: string; pic: string; durSec: number; usedQuery: string } | null = null;
+          if (candidates.length > 0) {
+            // Sort: titleMatched first, then by duration descending
+            candidates.sort((a, b) => {
+              if (a.titleMatched !== b.titleMatched) return a.titleMatched ? -1 : 1;
+              return b.durSec - a.durSec;
+            });
+            const best = candidates[0];
+            matchedVideo = { bvid: best.bvid, streamUrl: best.streamUrl, title: best.title, pic: best.pic, durSec: best.durSec, usedQuery: best.usedQuery };
+            console.log(`[Render] Scene ${i} selected [${best.label}] ${best.titleMatched ? "✅" : "⚠️"} ${best.title.slice(0, 40)} (${best.durSec}s) from ${candidates.length} candidates`);
           }
 
           // Save matched material to DB
@@ -616,7 +1164,48 @@ export async function renderProjectInline(
             scene.materialId = material.id;
             return true;
           } else {
-            console.warn(`[Render] Scene ${i} no matching video found after all queries`);
+            console.warn(`[Render] Scene ${i} no matching video found after all Bilibili queries, trying Pexels fallback`);
+            // ── Pexels fallback with materialQueryEn ──
+            if (materialQueryEn) {
+              try {
+                const pexelsApiKey = process.env.PEXELS_API_KEY;
+                if (pexelsApiKey) {
+                  const pexelsUrl = `https://api.pexels.com/videos/search?query=${encodeURIComponent(materialQueryEn)}&per_page=5&orientation=landscape`;
+                  const pexelsRes = await fetch(pexelsUrl, {
+                    headers: { Authorization: pexelsApiKey },
+                    signal: AbortSignal.timeout(10000),
+                  });
+                  if (pexelsRes.ok) {
+                    const pexelsData = await pexelsRes.json();
+                    const pexelsVideo = pexelsData.videos?.[0];
+                    if (pexelsVideo) {
+                      const bestFile = pexelsVideo.video_files?.find(
+                        (f: any) => f.width >= 1280 && f.height >= 720
+                      ) || pexelsVideo.video_files?.[0];
+                      if (bestFile) {
+                        const material = await prisma.material.create({
+                          data: {
+                            projectId, name: `Pexels: ${materialQueryEn}`,
+                            type: "VIDEO", source: "STOCK_FOOTAGE",
+                            fileUrl: bestFile.link, thumbnailUrl: pexelsVideo.image || "",
+                            width: bestFile.width || 1920, height: bestFile.height || 1080,
+                            duration: pexelsVideo.duration || 0,
+                            externalId: `pexels-${pexelsVideo.id}`, externalSource: "pexels",
+                            searchQuery: materialQueryEn, matchScore: 0.5,
+                          },
+                        });
+                        await prisma.scene.update({ where: { id: scene.id }, data: { materialId: material.id } });
+                        scene.materialId = material.id;
+                        console.log(`[Render] Scene ${i} matched via Pexels: ${materialQueryEn}`);
+                        return true;
+                      }
+                    }
+                  }
+                }
+              } catch (err) {
+                console.warn(`[Render] Scene ${i} Pexels fallback failed:`, err instanceof Error ? err.message : err);
+              }
+            }
           }
         } catch (err) {
           console.warn(`[Render] Scene ${i} Bilibili search failed:`, err instanceof Error ? err.message : err);
@@ -643,7 +1232,7 @@ export async function renderProjectInline(
             try {
               if (attempt > 0) {
                 console.log(`[Render] Scene ${i} material download retry ${attempt}`);
-                await new Promise(r => setTimeout(r, 1000 * attempt));
+                await new Promise(r => setTimeout(r, 500 * attempt));
               }
 
               const isBilibili = material.externalSource === "bilibili";
@@ -698,77 +1287,54 @@ export async function renderProjectInline(
               await writeFile(localPath, buffer);
               console.log(`[Render] Scene ${i} material downloaded: ${(buffer.length / 1024).toFixed(0)}KB`);
 
-              // Watermark removal — dynamic detection based on actual video dimensions
-              let processedPath = localPath;
-              const needsWatermarkRemoval =
-                (material.source !== "STOCK_FOOTAGE" && material.source !== "AI_GENERATED") ||
-                material.externalSource === "bilibili" ||
-                material.externalSource === "douyin";
-              if (needsWatermarkRemoval) {
-                const cleanPath = join(workDir, `clean-${i}.${ext}`);
-                try {
-                  // Probe actual dimensions for accurate watermark positioning
-                  const dims = await probeDimensions(localPath);
-                  if (dims.width > 0 && dims.height > 0) {
-                    // Bilibili watermarks: top-right (UP主头像+ID), bottom-right (B站logo)
-                    // Use targeted delogo for known watermark positions + crop edges
-                    const isBilibili = material.externalSource === "bilibili";
-                    const regions = isBilibili
-                      ? [
-                          // Top-right: UP主 info (larger area)
-                          { x: Math.round(dims.width * 0.78), y: Math.round(dims.height * 0.01), width: Math.round(dims.width * 0.21), height: Math.round(dims.height * 0.08) },
-                          // Bottom-right: B站 logo
-                          { x: Math.round(dims.width * 0.82), y: Math.round(dims.height * 0.90), width: Math.round(dims.width * 0.17), height: Math.round(dims.height * 0.08) },
-                          // Bottom-left: possible subtitle/credit
-                          { x: Math.round(dims.width * 0.01), y: Math.round(dims.height * 0.90), width: Math.round(dims.width * 0.20), height: Math.round(dims.height * 0.08) },
-                        ]
-                      : detectWatermarkRegions(dims.width, dims.height);
-
-                    // Build delogo filter chain from detected regions
-                    const delogoFilters = regions.map(
-                      (r) => `delogo=x=${r.x}:y=${r.y}:w=${r.width}:h=${r.height}:show=0`
-                    );
-                    // Crop 5% edges (increased from 3% for better watermark coverage) + denoise
-                    const cropFilter = `crop=iw*0.90:ih*0.90:iw*0.05:ih*0.05,hqdn3d=2:2:3:3`;
-                    const watermarkFilter = [...delogoFilters, cropFilter].join(",");
-
-                    await execFileAsync("ffmpeg", [
-                      "-y", "-i", localPath,
-                      "-vf", watermarkFilter,
-                      "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                      "-an", cleanPath,
-                    ], { timeout: 30000 });
-                    processedPath = cleanPath;
-                    console.log(`[Render] Scene ${i} watermark removed (${dims.width}x${dims.height}, ${regions.length} regions, ${isBilibili ? "bilibili" : "generic"})`);
-                  }
-                } catch {
-                  // Fallback: aggressive crop if delogo fails
-                  try {
-                    await execFileAsync("ffmpeg", [
-                      "-y", "-i", localPath,
-                      "-vf", "crop=iw*0.88:ih*0.88:iw*0.06:ih*0.06",
-                      "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                      "-an", cleanPath,
-                    ], { timeout: 30000 });
-                    processedPath = cleanPath;
-                    console.log(`[Render] Scene ${i} watermark fallback crop applied`);
-                  } catch {}
-                }
-              }
-
-              // Extract 5-7s highlight clip and force 16:9 output
+              // Build combined filter chain: watermark removal + scale in one pass
+              // This avoids a separate FFmpeg call for watermark removal (major speedup)
               const targetW = config.width || 1920;
               const targetH = config.height || 1080;
               const scaleFilter = `scale=${targetW}:${targetH}:force_original_aspect_ratio=decrease,pad=${targetW}:${targetH}:(ow-iw)/2:(oh-ih)/2:black`;
 
+              const needsWatermarkRemoval =
+                (material.source !== "STOCK_FOOTAGE" && material.source !== "AI_GENERATED") ||
+                material.externalSource === "bilibili" ||
+                material.externalSource === "douyin";
+
+              let combinedFilter = scaleFilter;
+              let processedPath = localPath;
+
+              if (needsWatermarkRemoval) {
+                try {
+                  const dims = await probeDimensions(localPath);
+                  if (dims.width > 0 && dims.height > 0) {
+                    const isBilibili = material.externalSource === "bilibili";
+                    const regions = isBilibili
+                      ? [
+                          { x: Math.round(dims.width * 0.78), y: Math.round(dims.height * 0.01), width: Math.round(dims.width * 0.21), height: Math.round(dims.height * 0.08) },
+                          { x: Math.round(dims.width * 0.82), y: Math.round(dims.height * 0.90), width: Math.round(dims.width * 0.17), height: Math.round(dims.height * 0.08) },
+                          { x: Math.round(dims.width * 0.01), y: Math.round(dims.height * 0.90), width: Math.round(dims.width * 0.20), height: Math.round(dims.height * 0.08) },
+                        ]
+                      : detectWatermarkRegions(dims.width, dims.height);
+
+                    const delogoFilters = regions.map(
+                      (r) => `delogo=x=${r.x}:y=${r.y}:w=${r.width}:h=${r.height}:show=0`
+                    );
+                    const cropFilter = `crop=iw*0.90:ih*0.90:iw*0.05:ih*0.05,hqdn3d=2:2:3:3`;
+                    // Combine: delogo → crop → scale (all in one pass)
+                    combinedFilter = [...delogoFilters, cropFilter, scaleFilter].join(",");
+                    console.log(`[Render] Scene ${i} combined filter: delogo+crop+scale (${dims.width}x${dims.height}, ${regions.length} regions)`);
+                  }
+                } catch {
+                  // Fallback: crop + scale combined
+                  combinedFilter = `crop=iw*0.88:ih*0.88:iw*0.06:ih*0.06,${scaleFilter}`;
+                  console.log(`[Render] Scene ${i} fallback combined filter: crop+scale`);
+                }
+              }
+
               if (ext === "jpg") {
-                // Use estimated speech duration so image covers full voiceover
-                // Add 30% buffer to ensure video is long enough for actual TTS audio
                 const imgDuration = Math.max(8, Math.ceil(estimateAudioDuration(scenes[i].voiceoverText) * 1.3));
                 await execFileAsync("ffmpeg", [
                   "-y", "-loop", "1", "-i", processedPath,
                   "-c:v", "libx264", "-t", String(imgDuration), "-pix_fmt", "yuv420p",
-                  "-vf", scaleFilter,
+                  "-vf", combinedFilter,
                   "-an", materialFile,
                 ], { timeout: 30000 });
               } else {
@@ -785,23 +1351,18 @@ export async function renderProjectInline(
                 } catch {}
 
                 let trimArgs: string[] = [];
-                // Add 30% buffer to estimated duration to ensure video covers actual TTS
                 const neededDuration = Math.ceil(estimateAudioDuration(scenes[i].voiceoverText) * 1.3);
                 const needsLoop = videoDuration > 0 && videoDuration < neededDuration;
                 if (videoDuration > 10 && !needsLoop) {
-                  // Smart clip extraction: skip intro/outro, sample from middle
                   const clipLength = Math.min(Math.max(videoDuration * 0.15, neededDuration), videoDuration - 2);
                   let startSec: number;
                   if (videoDuration > 300) {
-                    // Very long video (>5min): sample from 25%-75% range (skip intro/outro)
                     const rangeStart = videoDuration * 0.25;
                     const rangeEnd = videoDuration * 0.75 - clipLength;
                     startSec = Math.max(rangeStart, Math.min(videoDuration * 0.4, rangeEnd));
                   } else if (videoDuration > 60) {
-                    // Medium video (1-5min): sample from 15%-60%
                     startSec = Math.max(videoDuration * 0.15, Math.min(videoDuration * 0.4, videoDuration - clipLength - 2));
                   } else {
-                    // Short video (<1min): start at 10%
                     startSec = Math.max(1, videoDuration * 0.1);
                   }
                   const startTime = startSec.toFixed(2);
@@ -812,14 +1373,13 @@ export async function renderProjectInline(
                 }
 
                 const loopArgs = needsLoop ? ["-stream_loop", "-1"] : [];
-
-                // Cap output duration for looped videos
                 const durationCap = needsLoop ? ["-t", String(neededDuration)] : [];
 
+                // Single FFmpeg call: watermark removal + scale + trim all combined
                 await execFileAsync("ffmpeg", [
                   "-y", ...loopArgs, ...trimArgs, "-i", processedPath,
-                  "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                  "-vf", scaleFilter,
+                  "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                  "-vf", combinedFilter,
                   ...durationCap,
                   "-an", "-pix_fmt", "yuv420p", materialFile,
                 ], { timeout: 60000 });
@@ -842,19 +1402,187 @@ export async function renderProjectInline(
       }
 
       if (!materialLoaded) {
-        console.warn(`[Render] Scene ${i} all sources failed, using text placeholder`);
-        // Generate a dark gradient-style background with scene title as text
-        const sceneTitle = scene.title || `场景 ${scene.sceneNumber}`;
-        const safeTitle = sceneTitle.replace(/['"\\:;%]/g, "");
-        const safeVoice = (scene.voiceoverText || "").slice(0, 40).replace(/['"\\:;%]/g, "");
-        const fontPath = "C\\:/Windows/Fonts/msyh.ttc";
-        const midY = Math.round(config.height / 2);
-        await execFileAsync("ffmpeg", [
-          "-y", "-f", "lavfi", "-i",
-          `color=c=0x1a1a2e:s=${config.width}x${config.height}:d=60,drawtext=fontfile='${fontPath}':fontsize=48:fontcolor=white@0.8:x=(w-text_w)/2:y=${midY-80}:text='${safeTitle}',drawtext=fontfile='${fontPath}':fontsize=32:fontcolor=white@0.5:x=(w-text_w)/2:y=${midY}:text='${safeVoice}'`,
-          "-c:v", "libx264", "-t", "60", "-pix_fmt", "yuv420p",
-          "-an", materialFile,
-        ], { timeout: 15000 });
+        const voiceText = scene.voiceoverText || "";
+        const shouldUseMG = isMGAnimationScene(scene.sceneType, voiceText);
+
+        if (shouldUseMG) {
+          // ── MG animation: only for data/statistics/comparison scenes ──
+          console.warn(`[Render] Scene ${i} suitable for MG animation, generating data visualization`);
+          const w = config.width;
+          const h = config.height;
+          const fontPath = "C\\:/Windows/Fonts/msyh.ttc";
+
+          const dataPoints = extractDataPoints(voiceText);
+          const tableData = extractTableData(voiceText);
+          const drawTextFilters = tableData
+            ? buildMGTableDrawText(tableData, w, h, fontPath)
+            : buildMGDataDrawText(dataPoints, w, h, fontPath);
+
+          const mgDuration = 30;
+          if (drawTextFilters) {
+            await execFileAsync("ffmpeg", [
+              "-y",
+              "-f", "lavfi", "-i", `color=c=0x1a1a2e:s=${w}x${h}:d=${mgDuration}:r=25`,
+              "-vf", drawTextFilters,
+              "-c:v", "libx264", "-preset", "ultrafast", "-t", String(mgDuration), "-pix_fmt", "yuv420p",
+              "-an", materialFile,
+            ], { timeout: 60000 });
+          } else {
+            await execFileAsync("ffmpeg", [
+              "-y",
+              "-f", "lavfi", "-i", `color=c=0x1a1a2e:s=${w}x${h}:d=${mgDuration}:r=25`,
+              "-c:v", "libx264", "-preset", "ultrafast", "-t", String(mgDuration), "-pix_fmt", "yuv420p",
+              "-an", materialFile,
+            ], { timeout: 60000 });
+          }
+        } else {
+          // ── Non-MG scene: try broader search, then Pexels image + Ken Burns ──
+          console.warn(`[Render] Scene ${i} not suitable for MG, trying broader search fallback`);
+
+          // Try broader Bilibili search with generic terms
+          let broaderFound = false;
+          const broaderQueries = [
+            // Try with era + "纪录片" (most generic but reliable)
+            ...(meta?.era ? [`${meta.era.match(/[\u4e00-\u9fff]{2,4}/g)?.[0] || ""} 纪录片`] : []),
+            // Try with materialQuery + "空镜"
+            ...(materialQuery ? [`${materialQuery.split(/[\s,，、]/)[0]} 空镜`] : []),
+            // Generic historical documentary
+            "中国历史 纪录片",
+          ].filter(q => q && q.length >= 4);
+
+          for (const bq of broaderQueries.slice(0, 2)) {
+            if (broaderFound) break;
+            try {
+              const url = `https://api.bilibili.com/x/web-interface/search/type?search_type=video&keyword=${encodeURIComponent(bq)}&page=1&page_size=5&order=totalrank`;
+              const res = await fetch(url, {
+                headers: {
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                  "Referer": "https://www.bilibili.com/",
+                },
+                signal: AbortSignal.timeout(10000),
+              });
+              if (!res.ok) continue;
+              const data = await res.json();
+              const results = (data.data?.result || []).slice(0, 5);
+              for (const video of results) {
+                const bvid = video.bvid;
+                if (!bvid) continue;
+                const title = (video.title || "").replace(/<[^>]*>/g, "");
+                // Basic negative filter
+                if (["解说", "混剪", "教程", "游戏", "动漫", "短剧", "搞笑"].some(nk => title.includes(nk))) continue;
+                const durParts = (video.duration || "0:00").split(":").map(Number);
+                const durSec = durParts.length === 2 ? durParts[0]*60+durParts[1] : durParts[0]*3600+durParts[1]*60+durParts[2];
+                if (durSec < 30 || durSec > 3600) continue;
+
+                // Get stream URL
+                let streamUrl: string | null = null;
+                try {
+                  const infoRes = await fetch(`https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`, {
+                    headers: { "User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/" },
+                    signal: AbortSignal.timeout(5000),
+                  });
+                  if (infoRes.ok) {
+                    const infoData = await infoRes.json();
+                    const cid = infoData.data?.cid;
+                    if (cid) {
+                      const streamRes = await fetch(
+                        `https://api.bilibili.com/x/player/playurl?bvid=${bvid}&cid=${cid}&qn=80&fnval=1`,
+                        { headers: { "User-Agent": "Mozilla/5.0", "Referer": `https://www.bilibili.com/video/${bvid}` },
+                          signal: AbortSignal.timeout(5000) }
+                      );
+                      if (streamRes.ok) {
+                        const streamData = await streamRes.json();
+                        streamUrl = streamData.data?.durl?.[0]?.url || null;
+                      }
+                    }
+                  }
+                } catch { continue; }
+                if (!streamUrl) continue;
+
+                // Download and process
+                const srcPath = join(workDir, `src-${i}-fallback.mp4`);
+                const dlHeaders: Record<string, string> = {
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                  "Referer": "https://www.bilibili.com/",
+                  "Origin": "https://www.bilibili.com",
+                };
+                const dlRes = await fetch(streamUrl, { headers: dlHeaders, signal: AbortSignal.timeout(60000) });
+                if (!dlRes.ok) continue;
+                await writeFile(srcPath, Buffer.from(await dlRes.arrayBuffer()));
+
+                // Process: scale + pad + trim
+                const { stdout: probeOut } = await execFileAsync("ffprobe", [
+                  "-v", "error", "-show_entries", "format=duration",
+                  "-of", "default=noprint_wrappers=1:nokey=1", srcPath,
+                ], { timeout: 10000 });
+                const videoDuration = parseFloat(probeOut.trim()) || 30;
+
+                await execFileAsync("ffmpeg", [
+                  "-y", "-i", srcPath,
+                  "-vf", `scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,setsar=1`,
+                  "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                  "-t", "30", "-an", "-pix_fmt", "yuv420p", materialFile,
+                ], { timeout: 60000 });
+
+                materialLoaded = true;
+                broaderFound = true;
+                console.log(`[Render] Scene ${i} broader search found: ${title.slice(0, 40)}`);
+                break;
+              }
+            } catch { continue; }
+          }
+
+          // If broader search also failed, try Pexels image + Ken Burns
+          if (!materialLoaded) {
+            console.warn(`[Render] Scene ${i} broader search also failed, trying Pexels image fallback`);
+            try {
+              const pexelsApiKey = process.env.PEXELS_API_KEY;
+              if (pexelsApiKey && materialQueryEn) {
+                const pexelsUrl = `https://api.pexels.com/v1/search?query=${encodeURIComponent(materialQueryEn)}&per_page=3&orientation=landscape`;
+                const pexelsRes = await fetch(pexelsUrl, {
+                  headers: { Authorization: pexelsApiKey },
+                  signal: AbortSignal.timeout(10000),
+                });
+                if (pexelsRes.ok) {
+                  const pexelsData = await pexelsRes.json();
+                  const photo = pexelsData.photos?.[0];
+                  if (photo?.src?.large) {
+                    // Download image
+                    const imgPath = join(workDir, `pexels-${i}.jpg`);
+                    const imgRes = await fetch(photo.src.large, { signal: AbortSignal.timeout(30000) });
+                    if (imgRes.ok) {
+                      await writeFile(imgPath, Buffer.from(await imgRes.arrayBuffer()));
+                      // Ken Burns effect: slow zoom on image
+                      await execFileAsync("ffmpeg", [
+                        "-y", "-loop", "1", "-i", imgPath,
+                        "-vf", `scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,zoompan=z='min(zoom+0.0008,1.2)':d=750:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${config.width}x${config.height}`,
+                        "-c:v", "libx264", "-preset", "ultrafast", "-t", "30", "-pix_fmt", "yuv420p",
+                        "-an", materialFile,
+                      ], { timeout: 60000 });
+                      materialLoaded = true;
+                      console.log(`[Render] Scene ${i} using Pexels image with Ken Burns effect`);
+                    }
+                  }
+                }
+              }
+            } catch (err) {
+              console.warn(`[Render] Scene ${i} Pexels image fallback failed:`, err instanceof Error ? err.message : err);
+            }
+          }
+
+          // Last resort: simple dark background (no fake MG data)
+          if (!materialLoaded) {
+            console.warn(`[Render] Scene ${i} all fallbacks failed, using plain dark background`);
+            const w = config.width;
+            const h = config.height;
+            await execFileAsync("ffmpeg", [
+              "-y",
+              "-f", "lavfi", "-i", `color=c=0x1a1a2e:s=${w}x${h}:d=30:r=25`,
+              "-c:v", "libx264", "-preset", "ultrafast", "-t", "30", "-pix_fmt", "yuv420p",
+              "-an", materialFile,
+            ], { timeout: 30000 });
+          }
+        }
       }
     });
 
@@ -869,32 +1597,59 @@ export async function renderProjectInline(
     await mkdir(outputDir, { recursive: true });
     const outputPath = join(outputDir, outputName);
 
-    const inputArgs: string[] = [];
-    const filterParts: string[] = [];
-    const concatInputs: string[] = [];
     let totalDuration = 0; // accumulated actual audio durations
+
+    // ── Step 1: Compose each scene individually (avoids ENAMETOOLONG) ──
+    const composedFiles: string[] = [];
 
     for (let i = 0; i < scenes.length; i++) {
       const materialFile = join(workDir, `scene-${i}.mp4`);
       const audioFile = join(workDir, `tts-${i}.mp3`);
+      const composedFile = join(workDir, `composed-${i}.mp4`);
 
-      // Ensure files exist
+      // Ensure material exists
       let hasMaterial = true;
       try { await readFile(materialFile); } catch { hasMaterial = false; }
       if (!hasMaterial) {
-        const sceneTitle = scenes[i].title || `场景 ${scenes[i].sceneNumber}`;
-        const safeTitle = sceneTitle.replace(/['"\\:;%]/g, "");
-        const fontPath = "C\\:/Windows/Fonts/msyh.ttc";
-        const midY = Math.round(config.height / 2);
-        // Generate 60s placeholder — long enough for any TTS duration
-        await execFileAsync("ffmpeg", [
-          "-y", "-f", "lavfi", "-i",
-          `color=c=0x1a1a2e:s=${config.width}x${config.height}:d=60,drawtext=fontfile='${fontPath}':fontsize=48:fontcolor=white@0.6:x=(w-text_w)/2:y=${midY}:text='${safeTitle}'`,
-          "-c:v", "libx264", "-t", "60", "-pix_fmt", "yuv420p",
-          "-an", materialFile,
-        ], { timeout: 15000 });
+        const w = config.width;
+        const h = config.height;
+        const voiceText = scenes[i].voiceoverText || "";
+        const shouldUseMG = isMGAnimationScene(scenes[i].sceneType, voiceText);
+
+        if (shouldUseMG) {
+          const fontPath = "C\\:/Windows/Fonts/msyh.ttc";
+          const dataPoints = extractDataPoints(voiceText);
+          const drawTextFilters = buildMGDataDrawText(dataPoints, w, h, fontPath);
+
+          const mgDuration = 30;
+          if (drawTextFilters) {
+            await execFileAsync("ffmpeg", [
+              "-y",
+              "-f", "lavfi", "-i", `color=c=0x1a1a2e:s=${w}x${h}:d=${mgDuration}:r=25`,
+              "-vf", drawTextFilters,
+              "-c:v", "libx264", "-preset", "ultrafast", "-t", String(mgDuration), "-pix_fmt", "yuv420p",
+              "-an", materialFile,
+            ], { timeout: 60000 });
+          } else {
+            await execFileAsync("ffmpeg", [
+              "-y",
+              "-f", "lavfi", "-i", `color=c=0x1a1a2e:s=${w}x${h}:d=${mgDuration}:r=25`,
+              "-c:v", "libx264", "-preset", "ultrafast", "-t", String(mgDuration), "-pix_fmt", "yuv420p",
+              "-an", materialFile,
+            ], { timeout: 60000 });
+          }
+        } else {
+          // Non-MG scene: just use plain dark background
+          await execFileAsync("ffmpeg", [
+            "-y",
+            "-f", "lavfi", "-i", `color=c=0x1a1a2e:s=${w}x${h}:d=30:r=25`,
+            "-c:v", "libx264", "-preset", "ultrafast", "-t", "30", "-pix_fmt", "yuv420p",
+            "-an", materialFile,
+          ], { timeout: 30000 });
+        }
       }
 
+      // Ensure audio exists
       let hasAudio = true;
       try { await readFile(audioFile); } catch { hasAudio = false; }
       if (!hasAudio) {
@@ -906,7 +1661,6 @@ export async function renderProjectInline(
             "-t", String(estimatedDur), "-c:a", "libmp3lame", "-b:a", "128k", audioFile,
           ], { timeout: 10000 });
         } catch {
-          // Generate proper silent WAV
           const sampleRate = 44100;
           const numSamples = Math.ceil(estimatedDur * sampleRate);
           const dataSize = numSamples * 2 * 2;
@@ -928,24 +1682,17 @@ export async function renderProjectInline(
         }
       }
 
-      inputArgs.push("-i", materialFile, "-i", audioFile);
-
-      const videoIdx = i * 2;
-      const audioIdx = i * 2 + 1;
-
-      // Use actual TTS duration from TTS stage (most reliable source)
-      // Fallback chain: ttsDurationMap → ffprobe → estimate
+      // Get audio duration
       let audioDuration = ttsDurationMap.get(i) || 0;
       if (audioDuration <= 0) {
         const probedDuration = await getAudioDuration(audioFile);
         audioDuration = probedDuration > 0 ? probedDuration : estimateAudioDuration(scenes[i].voiceoverText);
       }
-      // Ensure minimum duration
       audioDuration = Math.max(audioDuration, 0.5);
 
       console.log(`[Render] Compose scene ${i}: audioDuration=${audioDuration.toFixed(2)}s (source: ${ttsDurationMap.get(i) ? "tts-stage" : "fallback"})`);
 
-      // Generate subtitles proportional to actual audio duration
+      // Generate subtitles
       let scripts: string[] | undefined;
       if (scenes[i].productionMeta) {
         try {
@@ -965,80 +1712,114 @@ export async function renderProjectInline(
         scripts
       );
 
-      // Scale video and pad/loop to match audio duration exactly
-      // tpad extends short videos by cloning last frame; trim ensures exact duration
-      // Note: tpad uses stop_duration (not duration) for time-based padding
       const audioDurStr = audioDuration.toFixed(3);
-      filterParts.push(
-        `[${videoIdx}:v]scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,tpad=stop=-1:stop_mode=clone:stop_duration=${audioDurStr},trim=duration=${audioDurStr},setpts=PTS-STARTPTS[v${i}]`
+
+      // Build filter for this single scene
+      const sceneFilters: string[] = [];
+      sceneFilters.push(
+        `[0:v]scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,tpad=stop=-1:stop_mode=clone:stop_duration=${audioDurStr},trim=duration=${audioDurStr},setpts=PTS-STARTPTS[v0]`
       );
 
-      // Audio: boost volume, resample, trim to exact duration
-      filterParts.push(
-        `[${audioIdx}:a]volume=2.0,aresample=44100,atrim=0:${audioDurStr},asetpts=PTS-STARTPTS[a${i}]`
-      );
-
-      // Build subtitle filter chain from pre-generated chunks
+      // Build subtitle filter chain
       const { filterParts: subFilters, outputLabel: subLabel } = buildSubtitleFilterChain(
-        `v${i}`,
+        "v0",
         subtitleChunks,
         subtitleConfig
       );
-      filterParts.push(...subFilters);
+      sceneFilters.push(...subFilters);
 
-      // Update scene with final duration (may be extended for subtitle readability)
+      // Audio filter
+      sceneFilters.push(
+        `[1:a]volume=2.0,aresample=44100,atrim=0:${audioDurStr},asetpts=PTS-STARTPTS[a0]`
+      );
+
+      // Compose this scene: video with subtitles + audio
+      await execFileAsync("ffmpeg", [
+        "-y",
+        "-i", materialFile,
+        "-i", audioFile,
+        "-filter_complex", sceneFilters.join(";"),
+        "-map", `[${subLabel}]`, "-map", "[a0]",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+        "-r", String(config.fps),
+        "-pix_fmt", "yuv420p",
+        composedFile,
+      ], { timeout: 120000 });
+
+      composedFiles.push(composedFile);
+
+      // Update scene duration
       await prisma.scene.update({
         where: { id: scenes[i].id },
         data: { audioDuration },
       });
 
       totalDuration += audioDuration;
-
-      concatInputs.push(`[${subLabel}][a${i}]`);
     }
 
-    if (concatInputs.length === 0) throw new Error("No scenes to compose");
+    // ── Step 2: Concatenate all composed scenes using concat demuxer ──
+    if (composedFiles.length === 0) throw new Error("No scenes to compose");
 
-    filterParts.push(
-      `${concatInputs.join("")}concat=n=${concatInputs.length}:v=1:a=1[outv][outa]`
-    );
+    const concatListPath = join(workDir, "concat.txt");
+    const concatContent = composedFiles.map(f => `file '${f.replace(/'/g, "'\\''")}'`).join("\n");
+    await writeFile(concatListPath, concatContent);
 
-    let finalAudioMap = "[outa]";
-
-    // Background music
-    if (project.musicTracks.length > 0) {
+    // Check for background music
+    let finalOutputPath = outputPath;
+    if (project.musicTracks.length > 0 && project.musicTracks[0].fileUrl) {
       const music = project.musicTracks[0];
-      if (music.fileUrl) {
-        const musicFile = join(workDir, "bgm.mp3");
-        try {
-          const res = await fetch(music.fileUrl);
-          if (res.ok) {
-            await writeFile(musicFile, Buffer.from(await res.arrayBuffer()));
-            inputArgs.push("-i", musicFile);
-            const musicIdx = scenes.length * 2;
+      const musicFile = join(workDir, "bgm.mp3");
+      const preMixPath = join(workDir, "premix.mp4");
+      try {
+        const res = await fetch(music.fileUrl);
+        if (res.ok) {
+          await writeFile(musicFile, Buffer.from(await res.arrayBuffer()));
 
-            filterParts.push(
-              `[${musicIdx}:a]volume=${music.volume},afade=t=in:st=0:d=${music.fadeIn},afade=t=out:st=${totalDuration - music.fadeOut}:d=${music.fadeOut}[bgm]`
-            );
-            filterParts.push(
-              `[outa][bgm]amix=inputs=2:duration=first:dropout_transition=2[finala]`
-            );
-            finalAudioMap = "[finala]";
-          }
-        } catch {}
+          // Concat scenes first
+          await execFileAsync("ffmpeg", [
+            "-y", "-f", "concat", "-safe", "0", "-i", concatListPath,
+            "-c", "copy", preMixPath,
+          ], { timeout: 300000 });
+
+          // Mix with background music
+          await execFileAsync("ffmpeg", [
+            "-y",
+            "-i", preMixPath,
+            "-i", musicFile,
+            "-filter_complex",
+            `[1:a]volume=${music.volume},afade=t=in:st=0:d=${music.fadeIn},afade=t=out:st=${totalDuration - music.fadeOut}:d=${music.fadeOut}[bgm];[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=2[finala]`,
+            "-map", "0:v", "-map", "[finala]",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart",
+            outputPath,
+          ], { timeout: 300000 });
+
+          finalOutputPath = outputPath;
+        } else {
+          // No music - just concat
+          await execFileAsync("ffmpeg", [
+            "-y", "-f", "concat", "-safe", "0", "-i", concatListPath,
+            "-c", "copy", "-movflags", "+faststart",
+            outputPath,
+          ], { timeout: 300000 });
+        }
+      } catch {
+        // Music mixing failed - just concat without music
+        await execFileAsync("ffmpeg", [
+          "-y", "-f", "concat", "-safe", "0", "-i", concatListPath,
+          "-c", "copy", "-movflags", "+faststart",
+          outputPath,
+        ], { timeout: 300000 });
       }
+    } else {
+      // No music - simple concat
+      await execFileAsync("ffmpeg", [
+        "-y", "-f", "concat", "-safe", "0", "-i", concatListPath,
+        "-c", "copy", "-movflags", "+faststart",
+        outputPath,
+      ], { timeout: 300000 });
     }
-
-    await execFileAsync("ffmpeg", [
-      "-y", ...inputArgs,
-      "-filter_complex", filterParts.join(";"),
-      "-map", "[outv]", "-map", finalAudioMap,
-      "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-      "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
-      "-r", String(config.fps),
-      "-movflags", "+faststart",
-      outputPath,
-    ], { timeout: 600000 });
 
     // Get duration
     let duration = 0;
@@ -1052,6 +1833,31 @@ export async function renderProjectInline(
 
     const outputUrl = `/api/uploads/${projectId}/output/${outputName}`;
     const videoBuffer = await readFile(outputPath);
+
+    // ── Material coverage verification ──
+    // Check if requiredSources from materialRequirements were actually used
+    if (project.materialRequirements) {
+      try {
+        const reqs = JSON.parse(project.materialRequirements);
+        const requiredSources: string[] = reqs.requiredSources || [];
+        if (requiredSources.length > 0) {
+          // Get all materials used in this render
+          const usedMaterials = await prisma.material.findMany({
+            where: { projectId, source: "STOCK_FOOTAGE" },
+            select: { name: true, searchQuery: true },
+          });
+          const usedNames = usedMaterials.map(m => `${m.name} ${m.searchQuery}`).join(" ");
+          const covered = requiredSources.filter(rs => usedNames.includes(rs));
+          const uncovered = requiredSources.filter(rs => !usedNames.includes(rs));
+          if (uncovered.length > 0) {
+            console.warn(`[Render] Material coverage warning: required sources NOT found: ${uncovered.join(", ")}`);
+            console.log(`[Render] Covered sources: ${covered.join(", ") || "none"}`);
+          } else {
+            console.log(`[Render] Material coverage OK: all required sources found (${covered.join(", ")})`);
+          }
+        }
+      } catch {}
+    }
 
     await prisma.renderJob.update({
       where: { id: renderJob.id },

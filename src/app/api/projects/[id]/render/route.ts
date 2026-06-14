@@ -28,6 +28,22 @@ export async function POST(
       );
     }
 
+    // Allow re-render if project was previously failed
+    if (project.status === "RENDERING") {
+      return NextResponse.json(
+        { error: "项目正在渲染中，请稍候" },
+        { status: 409 }
+      );
+    }
+
+    // Reset project status if previously failed
+    if (project.status === "FAILED") {
+      await prisma.project.update({
+        where: { id },
+        data: { status: "STORYBOARD_READY" },
+      });
+    }
+
     // Inline render - no Redis needed
     const result = await renderProjectInline(id, session.user.id);
 

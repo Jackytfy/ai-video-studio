@@ -12,9 +12,10 @@ export class ClaudeProvider implements AIProvider {
   async analyzeContent(
     text: string,
     style: string,
+    materialReqs?: any | null,
     options?: AIStreamOptions
   ): Promise<AnalysisResult> {
-    const prompt = getAnalysisPrompt(text, style as any);
+    const prompt = getAnalysisPrompt(text, style as any, materialReqs);
 
     const response = await this.client.messages.create({
       model: "claude-sonnet-4-20250514",

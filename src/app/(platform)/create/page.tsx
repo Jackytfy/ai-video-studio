@@ -4,7 +4,7 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
 import { HeroSection } from "@/components/landing/HeroSection";
-import { TextInputArea } from "@/components/landing/TextInputArea";
+import { TextInputArea, MaterialRequirements } from "@/components/landing/TextInputArea";
 import { StyleSelector } from "@/components/landing/StyleSelector";
 import { ContentTags } from "@/components/landing/ContentTags";
 
@@ -17,7 +17,7 @@ export default function CreatePage() {
 
   const [statusText, setStatusText] = useState("");
 
-  const handleSubmit = async (text: string) => {
+  const handleSubmit = async (text: string, materialReqs?: MaterialRequirements) => {
     setIsLoading(true);
     try {
       // Step 1: Create project
@@ -31,6 +31,7 @@ export default function CreatePage() {
           aspectRatio,
           voice,
           contentStyle,
+          materialRequirements: materialReqs,
         }),
       });
 

@@ -157,6 +157,9 @@ function splitIntoSentences(text: string): string[] {
  * Generate subtitle chunks. When scripts[] is provided, each script becomes
  * one timed chunk — subtitles stay in sync with voiceover pacing.
  * Without scripts, auto-splits text by sentence boundaries.
+ *
+ * IMPORTANT: If scripts are provided but don't match the text content,
+ * falls back to auto-splitting to ensure subtitle-text consistency.
  */
 export function generateSubtitleChunks(
   text: string,
@@ -167,12 +170,55 @@ export function generateSubtitleChunks(
   const maxCharsPerLine = calcMaxCharsPerLine(config.videoWidth, fontSize);
 
   if (scripts && scripts.length > 0) {
-    return generateScriptChunks(scripts, config, maxCharsPerLine);
+    // Validate: scripts joined must match the text (after stripping prefixes and whitespace)
+    const cleanScripts = scripts
+      .map(s => s.replace(/^脚本\d+[：:]\s*/, "").trim())
+      .filter(Boolean);
+    const joinedScripts = cleanScripts.join("");
+    const cleanText = text.replace(/\s+/g, "");
+
+    // If scripts content matches text, use scripts for precise timing
+    // Allow minor whitespace/punctuation differences
+    if (joinedScripts.length > 0 && cleanText.length > 0) {
+      const similarity = computeSimilarity(joinedScripts, cleanText);
+      if (similarity >= 0.85) {
+        return generateScriptChunks(scripts, config, maxCharsPerLine);
+      }
+      // Scripts don't match text — log warning and fall back to auto-split
+      console.warn(
+        `[Subtitle] Scripts don't match voiceoverText (similarity=${similarity.toFixed(2)}). ` +
+        `Falling back to auto-split. Scripts: "${joinedScripts.slice(0, 50)}..." vs Text: "${cleanText.slice(0, 50)}..."`
+      );
+    }
   }
 
   // Fallback: auto-split by sentence boundaries for better sync
   const sentences = splitIntoSentences(text);
   return generateScriptChunks(sentences, config, maxCharsPerLine);
+}
+
+/**
+ * Compute similarity between two strings (character-level Jaccard).
+ * Used to validate scripts match voiceoverText.
+ */
+function computeSimilarity(a: string, b: string): number {
+  if (a === b) return 1;
+  if (a.length === 0 || b.length === 0) return 0;
+
+  // Use bigram Jaccard similarity for robust comparison
+  const bigramsA = new Set<string>();
+  const bigramsB = new Set<string>();
+
+  for (let i = 0; i < a.length - 1; i++) bigramsA.add(a.slice(i, i + 2));
+  for (let i = 0; i < b.length - 1; i++) bigramsB.add(b.slice(i, i + 2));
+
+  let intersection = 0;
+  for (const bg of bigramsA) {
+    if (bigramsB.has(bg)) intersection++;
+  }
+
+  const union = bigramsA.size + bigramsB.size - intersection;
+  return union === 0 ? 0 : intersection / union;
 }
 
 /**

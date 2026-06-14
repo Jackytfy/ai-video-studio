@@ -56,6 +56,11 @@ model Project {
   aiAnalysis     String?
   productionPlan String?
 
+  // Structured material requirements from user input
+  // JSON: { contentSummary, referenceStyle, requiredSources[], preferredSources[], materialTypes[],
+  //         properNouns[], landmarkScenes[], stylePreference, timeLimit, regionLimit, avoidKeywords[] }
+  materialRequirements String?
+
   storyboard  Storyboard?
   messages    ChatMessage[]
   materials   Material[]

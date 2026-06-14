@@ -29,7 +29,8 @@ export async function POST(
     const analysis = await analyzeContent(
       project.sourceText,
       project.contentStyle,
-      buildProviderConfig(session.user)
+      buildProviderConfig(session.user),
+      project.materialRequirements ? JSON.parse(project.materialRequirements) : null,
     );
 
     // For long texts, pre-split into chapters and scene segments

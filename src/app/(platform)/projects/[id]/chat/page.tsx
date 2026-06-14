@@ -132,7 +132,7 @@ export default function ChatPage() {
       const res = await fetch(`/api/projects/${projectId}/storyboard/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ plan, sceneCount: 10 }),
+        body: JSON.stringify({ plan }),
       });
 
       if (res.ok) {

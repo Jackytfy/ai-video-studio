@@ -7,7 +7,7 @@ import { estimateAudioDuration } from "@/lib/render/subtitle";
 
 const generateSchema = z.object({
   plan: z.enum(["A", "B"]),
-  sceneCount: z.number().int().min(3).max(20),
+  sceneCount: z.number().int().min(3).max(40).optional(),
 });
 
 export async function POST(
@@ -20,7 +20,8 @@ export async function POST(
 
     const { id } = await params;
     const body = await req.json();
-    const { plan, sceneCount } = generateSchema.parse(body);
+    const parsed = generateSchema.parse(body);
+    const { plan } = parsed;
 
     const project = await prisma.project.findFirst({
       where: { id, userId: session.user.id },
@@ -29,6 +30,13 @@ export async function POST(
     if (!project) {
       return NextResponse.json({ error: "项目不存在" }, { status: 404 });
     }
+
+    // Auto-calculate scene count based on text length if not provided
+    // Target ~60-80 Chinese characters per scene for detailed storyboards
+    const chineseChars = (project.sourceText.match(/[\u4e00-\u9fff]/g) || []).length;
+    const autoSceneCount = Math.max(5, Math.min(30, Math.round(chineseChars / 70)));
+    const sceneCount = parsed.sceneCount || autoSceneCount;
+    console.log(`[Storyboard] Text has ${chineseChars} chars, auto sceneCount=${autoSceneCount}, using=${sceneCount}`);
 
     await prisma.project.update({
       where: { id },

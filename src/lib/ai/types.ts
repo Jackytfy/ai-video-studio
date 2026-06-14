@@ -6,7 +6,7 @@ export interface AIStreamOptions {
 }
 
 export interface AIProvider {
-  analyzeContent(text: string, style: string, options?: AIStreamOptions): Promise<AnalysisResult>;
+  analyzeContent(text: string, style: string, materialReqs?: any | null, options?: AIStreamOptions): Promise<AnalysisResult>;
   generateStoryboard(text: string, plan: "A" | "B", sceneCount: number, options?: AIStreamOptions): Promise<StoryboardResult>;
   chatStream(messages: Array<{ role: "user" | "assistant"; content: string }>, systemPrompt: string, options?: AIStreamOptions): AsyncGenerator<string>;
 }
