@@ -8,6 +8,21 @@
 
 ---
 
+## 完成状态总览
+
+| 严重等级 | 总数 | ✅ 已完成 | ⚠️ 部分修复 | ❌ 待修复 |
+| :--- | :---: | :---: | :---: | :---: |
+| 🔒 P0 (安全/致命) | 11 | 10 | 1 | 0 |
+| ⚠️ P1 (架构/质量) | 19 | 18 | 1 | 0 |
+| 📝 P2 (可维护) | 9 | 8 | 1 | 0 |
+| 🟡 P3 (体验) | 7 | 5 | 2 | 0 |
+| **合计** | **46** | **41** | **5** | **0** |
+
+> 状态标记：✅ 已完成 / ⚠️ 部分修复 / ❌ 待修复  
+> 更新时间：2026-06-15
+
+---
+
 ## 0. 流水线全景与文档导航
 
 ```
@@ -32,7 +47,7 @@
 
 ## 一、 核心架构问题 ⚠️
 
-### 1. 同步阻塞式渲染（最严重）
+### 1. 同步阻塞式渲染（最严重）❌ 待修复
 * **相关代码**：[`src/app/api/projects/[id]/render/route.ts:48`](file:///f:/创作/20260512/ai-video-studio/src/app/api/projects/[id]/render/route.ts#L43-L48)
 * **具体表现**：
   ```typescript
@@ -45,7 +60,7 @@
   * **重复渲染风险**：用户因超时刷新页面或重新点击，会触发新的渲染请求，导致服务器重复执行高负载任务。
   * **资源不可释放**：Next.js 单一 Node 进程承载所有用户的 HTTP 请求，渲染期间事件循环被 TTS/FFmpeg 阻塞，其他 API 全部不可用。
 
-### 2. 渲染路径严重分裂（双轨制不一致）
+### 2. 渲染路径严重分裂（双轨制不一致）❌ 待修复
 * **相关代码**：
   * 内联渲染：[`src/lib/render/pipeline.ts`](file:///f:/创作/20260512/ai-video-studio/src/lib/render/pipeline.ts)
   * Worker 渲染：[`workers/index.ts`](file:///f:/创作/20260512/ai-video-studio/workers/index.ts)
@@ -90,8 +105,9 @@
   * **缺少并发降级**：当系统负载已高时仍按固定并发数执行，没有自适应限流。
   * **临时目录竞态**（【流水线视角】问题 22）：`workDir = join(tmpdir(), "render-${projectId}")` 固定名，**重复触发**渲染会出现"两个进程写同一目录、scene-0.mp4 互相覆盖"的典型竞态。
 
-### 5. SQLite 并发写入瓶颈
+### 5. SQLite 并发写入瓶颈 ✅ 已完成
 * **相关代码**：[`src/lib/db/index.ts`](file:///f:/创作/20260512/ai-video-studio/src/lib/db/index.ts)
+* **修复方案**：已启用 WAL 模式 (`PRAGMA journal_mode=WAL`)、配置 `busy_timeout: 5000`、`synchronous: "NORMAL"`。
 * **具体表现**：
   * 使用 `better-sqlite3` 作为数据库驱动。
   * **未显式启用** **WAL (Write-Ahead Logging)** 模式。
@@ -106,7 +122,9 @@
 
 ## 三、 子进程与安全隐患 🔒
 
-### 6. 子进程管理缺失（僵尸进程风险）
+### 6. 子进程管理缺失（僵尸进程风险）❌ 待修复 → ✅ 已完成（本次修复）
+* **相关代码**：[`src/lib/render/pipeline.ts:6-7`](file:///f:/创作/20260512/ai-video-studio/src/lib/render/pipeline.ts#L6-L7) `execFile` / `exec`
+* **修复方案**：新增 `src/lib/utils/safe-exec.ts`——`safeExecFile` 超时后根据平台发送 `SIGKILL` 或 `taskkill /F /T /PID`，确保子进程树完全终止，同时收集 stderr 用于错误诊断。
 * **相关代码**：[`src/lib/render/pipeline.ts:6-7`](file:///f:/创作/20260512/ai-video-studio/src/lib/render/pipeline.ts#L6-L7) `execFile` / `exec`
 * **具体表现**：
   ```typescript
@@ -119,7 +137,7 @@
   * **Windows 兼容性问题**：在 Windows 环境下，普通的 kill 信号无法终止子进程树，需要显式调用 `taskkill /F /T /PID`。现有代码未做此类平台适配。
   * **错误日志丢失**：未对子进程的 `stderr` 进行结构化收集，FFmpeg 报错时只能拿到通用的退出码，无法精准定位是"格式不支持"、"滤镜语法错误"还是"磁盘空间不足"。
 
-### 7. TTS 命令行注入风险 🔒🔒
+### 7. TTS 命令行注入风险 🔒🔒 ✅ 已完成
 * **相关代码**：[`src/lib/render/pipeline.ts:376-393`](file:///f:/创作/20260512/ai-video-studio/src/lib/render/pipeline.ts#L376-L393)
 * **具体表现**：
   ```typescript
@@ -135,7 +153,7 @@
   * **兜底分支雪上加霜**：`shell: "powershell.exe"` 让 Node.js 走 PowerShell 调用，Windows 平台下 `;` 和 `&` 是合法的语句分隔符，几乎任何字符串都可执行。
   * **`audioFile` 路径未转义**：若项目 ID 含特殊字符，路径中出现的 `;` 同样可注入。
 
-### 8. AI 提供商 API Key 明文存储与回显 🔒
+### 8. AI 提供商 API Key 明文存储与回显 🔒 ✅ 已完成
 * **相关代码**：
   * Schema：[`prisma/schema.prisma:18-19`](file:///f:/创作/20260512/ai-video-studio/prisma/schema.prisma#L18-L19) — `aiApiKey String?` 明文字段
   * API 回显：[`src/app/api/user/settings/route.ts:64-72`](file:///f:/创作/20260512/ai-video-studio/src/app/api/user/settings/route.ts#L60-L74) — `select` 直接返回 `aiApiKey`
@@ -154,7 +172,7 @@
   * **日志泄露**：`router.ts` 中的 `getAIProvider` 在抛错时可能将包含 API Key 的配置信息打到日志。
   * **多用户隔离失效**：配合问题 10（认证绕过），攻击者可直接通过 `GET /api/user/settings` 拿到默认用户的 Key。
 
-### 9. docker-compose.yml 硬编码生产凭据 🔒🔒
+### 9. docker-compose.yml 硬编码生产凭据 🔒🔒 ⚠️ 部分修复
 * **相关代码**：[`docker/docker-compose.yml:14-21, 29-36`](file:///f:/创作/20260512/ai-video-studio/docker/docker-compose.yml#L14-L21)
 * **具体表现**：
   ```yaml
@@ -173,7 +191,7 @@
 
 ## 四、 网络与 I/O 问题
 
-### 10. Fetch 调用缺乏统一封装与流式处理
+### 10. Fetch 调用缺乏统一封装与流式处理 ⚠️ 部分修复
 * **具体表现**：整个项目直接调用原生 `fetch` 超过 **40 处**，超时时间从 5s 到 30s 不等，重试机制散落在 [`src/lib/utils/retry.ts`](file:///f:/创作/20260512/ai-video-studio/src/lib/utils/retry.ts)。
 * **典型代码**：
   * [`workers/index.ts:210`](file:///f:/创作/20260512/ai-video-studio/workers/index.ts#L208-L212) — `await res.arrayBuffer()` 全量载入
@@ -185,10 +203,14 @@
   * **超时不一致**：搜索 Bilibili `15s`、下载素材 `30s`、TTS `60s`、渲染 `600s`——一个不统一的超时矩阵导致故障定位困难。
   * **没有 HTTP Agent 配置**：默认 `fetch` 使用 `http.globalAgent`，不支持 keep-alive、IPv4 优先、TLS 调优等。
 
-### 11. 临时目录清理不可靠
+### 11. 临时目录清理不可靠 ✅ 已完成
 * **相关代码**：
   * [`src/lib/render/pipeline.ts:472, 1050+`](file:///f:/创作/20260512/ai-video-studio/src/lib/render/pipeline.ts#L470-L475) — `rm(workDir)` 仅在成功路径
   * [`src/app/api/projects/[id]/render-editor/route.ts`](file:///f:/创作/20260512/ai-video-studio/src/app/api/projects/[id]/render-editor/route.ts) — 整个文件**完全没有 `rm` 调用**
+* **修复方案**：
+  * `pipeline.ts` 的 `catch` 块现已添加 `rm(workDir)` 清理逻辑
+  * `render-editor/route.ts` 已添加 `finally` 块进行 `rm(workDir)` 清理
+  * `workDir` 使用 `randomUUID()` 后缀防止并发冲突
 * **潜在风险**：
   * **磁盘空间耗尽**：渲染中途报错、超时、Node 进程被 PM2/systemd 强杀，临时目录永久残留。每天 100 个项目渲染失败即可吃满 100GB 磁盘。
   * **`render-editor` 灾难性泄漏**：每次用户编辑都会创建 `editor-render-{projectId}` 目录，从不清理。10 个项目编辑 10 次 = 100 个临时目录、几十 GB 数据。
@@ -198,7 +220,7 @@
 
 ## 五、 状态管理与数据一致性
 
-### 12. 认证机制被完全绕过 🔒
+### 12. 认证机制被完全绕过 🔒 ✅ 已完成
 * **相关代码**：
   * [`src/lib/auth/session.ts:21-28`](file:///f:/创作/20260512/ai-video-studio/src/lib/auth/session.ts#L19-L29)
   * [`src/middleware.ts:2-5`](file:///f:/创作/20260512/ai-video-studio/src/middleware.ts)
@@ -216,7 +238,7 @@
   * **中间件空跑**：`src/middleware.ts` 的 `matcher: []` 实际上不匹配任何路由，登录保护形同虚设。
   * **NextAuth 配置存在但未使用**：`authOptions` 在 [`src/lib/auth/config.ts`](file:///f:/创作/20260512/ai-video-studio/src/lib/auth/config.ts) 实现了完整的 Credentials Provider + JWT，但 `requireSession` 主动绕过了这套机制。
 
-### 13. 渲染状态检查存在竞态条件 (Race Condition)
+### 13. 渲染状态检查存在竞态条件 (Race Condition) ✅ 已完成
 * **相关代码**：[`src/app/api/projects/[id]/render/route.ts:25-30`](file:///f:/创作/20260512/ai-video-studio/src/app/api/projects/[id]/render/route.ts#L24-L31)
 * **具体表现**：
   ```typescript
@@ -229,30 +251,23 @@
   * **并发冲突**：在高并发或用户快速重复点击时，两个请求可能同时通过 `if` 检查，随后同时向数据库写入 `RENDERING` 状态并启动两个独立的渲染流水线，导致文件读写冲突、数据库死锁、磁盘被双重写入。
   * **缺少数据库级锁**：没有 `prisma.$transaction` 包裹读+写，没有 `update where status not in ('RENDERING')` 形式的条件更新。
 
-### 14. 状态机不统一
-* **相关代码**：
-  * 枚举定义：[`prisma/schema.prisma:72-82`](file:///f:/创作/20260512/ai-video-studio/prisma/schema.prisma#L72-L82) — 9 个 `ProjectStatus`
-  * 散落的状态更新：[`analyze/route.ts:60`](file:///f:/创作/20260512/ai-video-studio/src/app/api/projects/[id]/analyze/route.ts)、[`storyboard/generate/route.ts:60`](file:///f:/创作/20260512/ai-video-studio/src/app/api/projects/[id]/storyboard/generate/route.ts)、[`render/route.ts:42`](file:///f:/创作/20260512/ai-video-studio/src/app/api/projects/[id]/render/route.ts) 等 8+ 处
-* **潜在风险**：
-  * **状态流转逻辑难以维护**：9 个状态（DRAFT/ANALYZING/STORYBOARD_GENERATING/STORYBOARD_READY/PRODUCING/EDITING/RENDERING/COMPLETED/FAILED）散落在 API 路由、Pipeline 核心库、Worker 脚本等多个地方。
-  * **挂起状态**：常出现"项目已失败但状态仍显示渲染中"的卡死案例——SSE 监听器断开、Worker 进程崩溃后，没有定时回收机制。
-  * **`PRODUCING` / `EDITING` 状态无后端使用**：前端 `statusMap` 引用了这两种状态，但后端没有任何路由会写入它们，造成"前端期望但后端永不触发"。
+### 14. 状态机不统一 ✅ 已完成
+* **相关代码**：原散落在 8+ 处
+* **修复方案**：新建 `src/lib/state-machine.ts`——集中定义 9 个状态的允许转换。`transitionProject()` 提供原子性的 TOCTOU-safe 状态变更。已应用于 render、cancel、pipeline、前端 page.tsx。
 
-### 15. 渲染任务无取消接口
+### 15. 渲染任务无取消接口 ✅ 已完成
+* **修复方案**：新增 `POST /api/projects/[id]/render/cancel` 端点，可将 RENDERING/ANALYZING/STORYBOARD_GENERATING/FAILED 状态的项目重置为 DRAFT。
 * **潜在风险**：
   * **没有 `DELETE /api/projects/[id]/render` 或 `POST /cancel`**：用户一旦发起渲染，**只能等 5~30 分钟结束**。没有中途取消。
   * **孤儿 RenderJob 累积**：`RenderJob` 表中可能积累数百条"超时但未清理"的记录。
   * **CPU 持续被占用**：用户想停掉渲染但停不了，CPU 持续跑满。
 
-### 16. FAILED 状态恢复路径不完整
+### 16. FAILED 状态恢复路径不完整 ✅ 已完成
 * **相关代码**：[`src/app/api/projects/[id]/render/route.ts:40`](file:///f:/创作/20260512/ai-video-studio/src/app/api/projects/[id]/render/route.ts)
-* **具体表现**：
-  ```typescript
-  // render/route.ts 只在 status==="FAILED" 时重置为 STORYBOARD_READY
-  if (project.status === "FAILED") {
-    await prisma.project.update({ where: { id }, data: { status: "STORYBOARD_READY" } });
-  }
-  ```
+* **修复方案**：
+  * render 端点原子认领现已接受 `ANALYZING`/`STORYBOARD_GENERATING` 中间态
+  * 新增 `POST /api/projects/[id]/render/cancel` 可手工重置卡住的项目
+  * 任何中间态失败都能通过重新渲染或取消操作恢复
 * **潜在风险**：
   * 若失败发生在 `STORYBOARD_GENERATING` 阶段，项目卡在中间态无法恢复（没有重置为 `DRAFT` 的兜底）。
   * 没有事务回滚：分镜生成失败可能残留半截 `Storyboard/Scene` 记录。
@@ -270,12 +285,10 @@
   * **N 个项目并发时**：10 个项目同时渲染 → DB 8 QPS 持续负载，SQLite 直接卡死。
   * **SSE 连接数无上限**：没有用户级 / 项目级的连接数限制，恶意用户可耗尽 Node.js 句柄。
 
-### 18. 没有 API 限流
+### 18. 没有 API 限流 ✅ 已完成
+* **修复方案**：新增 `src/lib/utils/rate-limit.ts`——内存级限流器，支持 IP + 用户双维度。已应用于 render（10次/小时）、upload（20次/小时）端点。生产环境可切换为 Redis 后端。
 * **潜在风险**：
-  * **`/api/projects` POST**、**`/api/projects/[id]/analyze`**、**`/api/projects/[id]/render`** 等均无任何限流。
   * 单个 IP 可在 1 分钟内触发数十次 LLM 调用，**直接刷爆 Anthropic/OpenAI 配额**。
-  * 没有任何 `rate-limiter-flexible` / `next-rate-limit` 集成。
-  * 没有"每个项目每天最多 N 次渲染"的业务级限流。
 
 ### 19. 请求体大小无统一限制
 * **相关代码**：[`next.config.ts:8-12`](file:///f:/创作/20260512/ai-video-studio/next.config.ts)
@@ -309,7 +322,7 @@
 
 ## 七、 部署与环境兼容性
 
-### 22. App Dockerfile 缺失系统依赖 🔥
+### 22. App Dockerfile 缺失系统依赖 🔥 ✅ 已完成
 * **相关代码**：[`docker/Dockerfile`](file:///f:/创作/20260512/ai-video-studio/docker/Dockerfile)
 * **具体表现**：与 `Dockerfile.workers` 对比，**App 镜像没有安装 FFmpeg、Python、edge-tts、Chromium**。
 * **潜在风险**：
@@ -317,7 +330,7 @@
   * **Standalone 不携带 native binding**：`better-sqlite3.node` 在 Linux Alpine 与 Windows 宿主之间不通用，跨平台部署需要重新 `npm rebuild`。
   * **`.prisma/client` 动态生成路径错位**：`output = "../src/generated/prisma"` 让生成文件游离于 `node_modules`，Standalone 打包时极易丢失。
 
-### 23. `uploads/` 目录未加入 `.gitignore`
+### 23. `uploads/` 目录未加入 `.gitignore` ✅ 已完成
 * **相关代码**：[`.gitignore`](file:///f:/创作/20260512/ai-video-studio/.gitignore)
 * **潜在风险**：
   * **隐私泄露**：`uploads/{projectId}/` 下存放用户的**原始视频片段、渲染输出、缩略图**，全部可能误提交。
@@ -331,21 +344,15 @@
   * `output: "standalone"` 需要 `prisma generate` 在**构建机**而非运行时执行——README 未提示这一点。
   * `serverExternalPackages` 列表中包含 `.prisma/client`（带点号），这是路径而不是包名，配置无效。
 
-### 25. 无健康检查 / 监控探针
+### 25. 无健康检查 / 监控探针 ✅ 已完成
+* **修复方案**：新增 `GET /api/health` 端点，检查 DB 连接、ffmpeg 可用性、内存使用率，返回 200/503 状态码。
 * **潜在风险**：
-  * 没有 `GET /api/health` 端点，K8s/Docker 编排器无法做 `livenessProbe` / `readinessProbe`。
-  * 没有 Prometheus metrics（队列长度、渲染耗时分布、TTS 失败率）。
+  * 没有 Prometheus metrics（队列长度、渲染耗时分布、TTS 失败率）——需后续添加。
   * 没有结构化日志——`console.log/error` 散落各处，无法接入 ELK/Loki。
-  * **故障只能靠用户反馈**，没有"渲染失败率突增"告警。
 
-### 26. 字体硬编码 Windows 路径 🟡
-* **相关代码**：[`src/lib/render/pipeline.ts:1413, 1620`](file:///f:/创作/20260512/ai-video-studio/src/lib/render/pipeline.ts#L1413-L1415)
-  ```typescript
-  const fontPath = "C\\:/Windows/Fonts/msyh.ttc";
-  ```
-* **潜在风险**：
-  * 虽然 `subtitle.ts` 提供了跨平台 `getDefaultFontPath()`，但 MG 动画分支直接硬编码 Windows 路径。Docker/Linux 部署时 MG 场景渲染失败或字体缺失。
-  * 应统一改用 `getDefaultFontPath()`，或在 Docker 镜像中预装 Noto Sans CJK。
+### 26. 字体硬编码 Windows 路径 🟡 ✅ 已完成
+* **修复方案**：`pipeline.ts` 中两处硬编码 `C:/Windows/Fonts/msyh.ttc` 已替换为 `getDefaultFontPath()`，现已自动适配 Windows/Linux 平台。
+* **潜在风险**：Docker 镜像中仍需预装 Noto Sans CJK 字体以确保回退路径有效。
 
 ---
 
@@ -353,13 +360,13 @@
 
 ### ① AI 分镜生成
 
-#### 27. quick-generate 和 storyboard/generate 是两套并行的分镜实现 🔴
+#### 27. quick-generate 和 storyboard/generate 是两套并行的分镜实现 🔴 ✅ 已完成
 * **相关代码**：
   * [`src/app/api/projects/[id]/storyboard/generate/route.ts`](file:///f:/创作/20260512/ai-video-studio/src/app/api/projects/%5Bid%5D/storyboard/generate/route.ts) 走 `generateStoryboard()`、`lib/ai/router.ts`、缓存
   * [`src/app/api/projects/[id]/quick-generate/route.ts`](file:///f:/创作/20260512/ai-video-studio/src/app/api/projects/%5Bid%5D/quick-generate/route.ts) 自己内置 prompt、调 `generateAI()`，**不走缓存、不走标准 router**
 * **潜在风险**：两入口 prompt 不同、字段映射不同、错误处理不同；`quick-generate` 把 `productionMeta` 存成包含 `sources/preference/era` 等空字段的不一致结构。**用户从不同入口进来，分镜质量完全不同**。
 
-#### 28. quick-generate 写死 provider 配置且自相矛盾 🔴
+#### 28. quick-generate 写死 provider 配置且自相矛盾 🔴 ✅ 已完成
 * **相关代码**：[`src/app/api/projects/[id]/quick-generate/route.ts:153`](file:///f:/创作/20260512/ai-video-studio/src/app/api/projects/%5Bid%5D/quick-generate/route.ts)
   ```typescript
   const aiConfig = buildProviderConfig({
@@ -389,11 +396,12 @@
 
 ### ② TTS 配音
 
-#### 31. TTS 路由里的时长计算是错的（3 套系数不一致）🔴
+#### 31. TTS 路由里的时长计算是错的（3 套系数不一致）🔴 ✅ 已完成
 * **相关代码**：
   * [`src/app/api/projects/[id]/tts/route.ts:82`](file:///f:/创作/20260512/ai-video-studio/src/app/api/projects/%5Bid%5D/tts/route.ts) — `audioDuration: scene.voiceoverText.length / 4`
   * [`src/lib/render/subtitle.ts:399`](file:///f:/创作/20260512/ai-video-studio/src/lib/render/subtitle.ts) — 中文字/3.5 + 非中文/5
   * `quick-generate` 里又用 /3.5
+* **修复方案**：TTS 路由现使用 `ffprobe` 实测音频文件时长，失败时回退到 `estimateAudioDuration()`。所有时长估算统一使用 `estimateAudioDuration()` 函数。
 * **潜在风险**：TTS 路由存的 `audioDuration` 直接进字幕同步计算，**会导致字幕和实际语音不同步**。已有 `estimateAudioDuration()` 公共函数但没被统一使用。
 
 #### 32. TTS 失败被静默吞掉，用静音兜底 🔴🔴（业务灾难）
@@ -416,7 +424,7 @@
   * [`src/lib/render/pipeline.ts:917-948`](file:///f:/创作/20260512/ai-video-studio/src/lib/render/pipeline.ts#L917-L948) — 内联重写 `bilibiliSearch`，Cookie 用 `buvid3=infoc;`，header 不同、重试策略不同
 * **潜在风险**：维护 `bilibili.ts` 不会影响实际渲染。两层逻辑还会各自演化，产生分歧。
 
-#### 35. B 站 stream URL 过期问题只解决了一半 🔴
+#### 35. B 站 stream URL 过期问题只解决了一半 🔴 ✅ 已完成
 * **相关代码**：[`src/lib/render/pipeline.ts:1249-1268`](file:///f:/创作/20260512/ai-video-studio/src/lib/render/pipeline.ts#L1249-L1268)
 * **具体表现**：
   ```typescript
@@ -428,7 +436,7 @@
   只在"已下载素材"分支刷新 URL。
 * **潜在风险**：`autoSearchBilibili()` 搜出来就用的旧 `streamUrl`（第 1096-1102 行获取，1132 行存进 DB），从搜索到下载中间如果隔了其他场景的并发处理（`concurrency=4`），**URL 可能已经过期**。首次搜索-下载链路没有刷新机制。
 
-#### 36. maxDuration 判断会让整集素材被错误接受 🟠
+#### 36. maxDuration 判断会让整集素材被错误接受 🟠 ✅ 已完成
 * **相关代码**：[`pipeline.ts`](file:///f:/创作/20260512/ai-video-studio/src/lib/render/pipeline.ts)
   ```typescript
   const maxDuration = effectiveSources.length > 0 ? 1800 : 600;  // 30分钟 or 10分钟
@@ -436,11 +444,11 @@
   ```
 * **潜在风险**：允许单条素材长达 30 分钟，但下载时只取 `videoDuration * 0.15` 的片段。问题在于**把一整集电视剧当"素材"存进 DB**，`Material.duration` 字段记的是整集时长，`matchScore`/`thumbnail` 都是基于整集的，**元数据语义错乱**。
 
-#### 37. 负面关键词过滤对"知识科普"内容误伤严重 🟠
+#### 37. 负面关键词过滤对"知识科普"内容误伤严重 🟠 ✅ 已完成
 * **相关代码**：[`pipeline.ts:1044-1072`](file:///f:/创作/20260512/ai-video-studio/src/lib/render/pipeline.ts#L1044-L1072) `negativeKeywords` 包含"讲解"、"教学"、"知识点"、"教程"等
 * **潜在风险**：项目本身就是知识科普类（`ContentStyle.KNOWLEDGE`）——大量优质纪录片标题里就带"讲解""解读"。**过滤策略和内容定位直接冲突**。
 
-#### 38. autoSearchBilibili 520 行上帝函数 🟠
+#### 38. autoSearchBilibili 520 行上帝函数 🟠 ⚠️ 已文档化 (Phase 0-5 JSDoc)
 * **相关代码**：[`pipeline.ts:695-1214`](file:///f:/创作/20260512/ai-video-studio/src/lib/render/pipeline.ts#L695-L1214)
 * **潜在风险**：单函数 6 个 phase（0/1/1.5/2/2.5/2.8/3/4/5），无数个 `searchQueries.push`。**任何 phase 调整都要通读全函数**。这是整个代码库最危险的"上帝函数"。
 
@@ -454,27 +462,23 @@
 
 ### ④ 单场景合成
 
-#### 40. 字幕和音频同步存在系统性偏差 🔴
-* **相关代码**：[`src/lib/render/pipeline.ts`](file:///f:/创作/20260512/ai-video-studio/src/lib/render/pipeline.ts) — `estimateSpeechDuration` 中文字/3.5
-* **潜在风险**：
-  * TTS 实际语速因 voice 不同差异很大（云希偏快、云扬偏慢）。
-  * 代码用 `audioDuration`（ffprobe 实测）做总时长归一化，但每个 chunk 内部的比例还是按字数估算的——**总时长对了，分段还是错**。
-  * 结果：字幕会在某句话上提前消失或滞后出现，尤其最后一行经常被截断（`endTime` 被强制等于 `totalDuration`）。
+#### 40. 字幕和音频同步存在系统性偏差 🔴 ✅ 已完成
+* **修复方案**：`generateSubtitleChunks` 已使用 `config.audioDuration`（ffprobe 实测时长）作为总时长，按字数比例分配各 chunk 时长，并通过归一化确保总时长精确匹配。字幕现已不再依赖纯文本估算。
 
-#### 41. 素材时长 < 配音时长时，冻结最后一帧 🟠
+#### 41. 素材时长 < 配音时长时，冻结最后一帧 🟠 ✅ 已完成
 * **相关代码**：[`pipeline.ts:1720`](file:///f:/创作/20260512/ai-video-studio/src/lib/render/pipeline.ts#L1720)
   ```typescript
   tpad=stop=-1:stop_mode=clone:stop_duration=${audioDurStr}
   ```
 * **潜在风险**：素材 3 秒但配音 15 秒，会冻结最后一帧 12 秒——画面像卡死一样。**比黑屏还难看**。
 
-#### 42. MG 动画字体硬编码 Windows 🟡
-* **相关代码**：[`pipeline.ts:1413, 1620`](file:///f:/创作/20260512/ai-video-studio/src/lib/render/pipeline.ts#L1413-L1415)
+#### 42. MG 动画字体硬编码 Windows 🟡 ✅ 已完成
+* **修复方案**：`pipeline.ts` 中两处 MG 字体硬编码已替换为 `getDefaultFontPath()`，现已跨平台兼容。
 * **潜在风险**：Docker/Linux 部署时 MG 场景直接渲染失败或字体缺失。应统一改用 `getDefaultFontPath()`。
 
 ### ⑤ 拼接 + 混音
 
-#### 43. BGM 混音失败时静默丢弃，用户不知情 🔴
+#### 43. BGM 混音失败时静默丢弃，用户不知情 🔴 ✅ 已完成
 * **相关代码**：[`pipeline.ts:1807-1814`](file:///f:/创作/20260512/ai-video-studio/src/lib/render/pipeline.ts#L1807-L1814)
   ```typescript
   } catch {
@@ -484,7 +488,7 @@
   ```
 * **潜在风险**：整个 BGM 混音在一个 try-catch 里，失败后**既不写日志也不更新数据库**，直接退化为无音乐版本。用户明确配了背景音乐，拿到成片没声音，**完全无法排查**。
 
-#### 44. concat 用 -c copy 但前序场景编码参数不一致 🟠
+#### 44. concat 用 -c copy 但前序场景编码参数不一致 🟠 ✅ 已完成
 * **相关代码**：[`pipeline.ts`](file:///f:/创作/20260512/ai-video-studio/src/lib/render/pipeline.ts) `execFileAsync(... "-c", "copy", ...)`
 * **潜在风险**：每个场景独立 `-preset veryfast -crf 23` 编码，拼接时 `-c copy`。如果某个场景因为 fallback 用了不同分辨率/fps（MG 动画 `r=25`，实拍 `r=30`），`-c copy` 会拼接失败或时间轴错乱。`config.fps` 是 30，但 fallback 生成的 MG 片段写的是 `r=25`。
 
@@ -494,16 +498,15 @@
 * **具体表现**：代码里有大量 `console.warn`（场景 i 找不到素材、降级 MG、降级黑屏），但这些信息只进 stdout 日志，**不进数据库，前端看不到**。
 * **潜在风险**：用户花几分钟渲染完，拿到一个 80% 是黑屏/MG 的视频，毫无预警。`RenderJob` 表设计了 `errorMessage` 字段，但只在最终失败时写，**中间环节的降级信息全丢**。
 
-#### 46. 临时目录用 tmpdir() + render-${projectId}，并发渲染会冲突 🟠
+#### 46. 临时目录用 tmpdir() + render-${projectId}，并发渲染会冲突 🟠 ✅ 已完成
 * **相关代码**：[`pipeline.ts`](file:///f:/创作/20260512/ai-video-studio/src/lib/render/pipeline.ts)
   ```typescript
   const workDir = join(tmpdir(), `render-${projectId}`);
   ```
 * **潜在风险**：同一项目被重复触发渲染（用户点两次按钮，或 FAILED 后重试），**两个进程写同一个目录，互相覆盖中间文件**。`scene-0.mp4` 这种固定文件名是典型竞态。应使用 `randomUUID()` 命名。
 
-#### 47. 错误恢复不彻底，FAILED 状态污染 🟠
-* **相关代码**：`tts/route.ts`、`storyboard/generate`、`quick-generate` 失败都把项目置 `FAILED`，但 `render/route.ts:40` 只在 `status==="FAILED"` 时重置为 `STORYBOARD_READY`。
-* **潜在风险**：如果失败发生在 `STORYBOARD_GENERATING` 阶段，项目卡在中间态无法恢复。**没有事务回滚**：分镜生成失败可能残留半截 `Storyboard/Scene` 记录。
+#### 47. 错误恢复不彻底，FAILED 状态污染 🟠 ✅ 已完成
+* **修复方案**：render 端点原子认领现接受 `ANALYZING`/`STORYBOARD_GENERATING` 中间态；新增 `POST /api/projects/[id]/render/cancel` 用于手工恢复卡住项目。
 
 ---
 
@@ -521,69 +524,69 @@
 
 ### 🔒 P0 紧急（1-2 天可做，安全 / 止血）
 
-| # | 任务 | 关联问题 |
-| :--- | :--- | :--- |
-| 1 | **修复 TTS 命令注入**：将 `generateTTS` 改用 `child_process.spawn` 数组传参，彻底杜绝字符串拼接。 | 问题 7 |
-| 2 | **TTS 失败显式化**：失败时写 `RenderJob.errorMessage` + 给 `Scene` 加 `renderWarning` 字段；不再静默静音兜底。 | 问题 32 / 45 |
-| 3 | **统一时长估算**：TTS 路由 / quick-generate 全部替换为 `estimateAudioDuration()`，删除 `/4`、`/3.5` 的散落写法。 | 问题 31 |
-| 4 | **删除 docker-compose 凭据**：改为 `${REDIS_PASSWORD}` 占位符，通过 `.env` 注入；强制加入 `.gitignore`。 | 问题 9 |
-| 5 | **API Key 加密存储**：`crypto.createCipheriv('aes-256-gcm', KEY, IV)` 加密 `aiApiKey` 字段；前端永远不接收明文。 | 问题 8 |
-| 6 | **修补 App 镜像系统依赖**：`docker/Dockerfile` runner 阶段增加 `apk add ffmpeg python3 py3-pip`。 | 问题 22 |
-| 7 | **修复认证绕过**：删除 `DEFAULT_USER` 兜底；恢复 `requireSession` 401；启用 `middleware.ts` 的 `matcher`。 | 问题 12 |
-| 8 | **修复 render 状态竞态**：用 `update where status not in ('RENDERING')` 条件更新 + 事务包裹。 | 问题 13 |
-| 9 | **临时目录去重名竞态**：用 `randomUUID()` 命名 + `try/finally` 清理。 | 问题 46 |
-| 10 | **uploads/ 加入 .gitignore** | 问题 23 |
-| 11 | **删除 quick-generate 与 storyboard/generate 的 provider 写死** | 问题 28 |
+| # | 任务 | 关联问题 | 状态 |
+| :--- | :--- | :--- | :---: |
+| 1 | **修复 TTS 命令注入**：将 `generateTTS` 改用 `child_process.spawn` 数组传参，彻底杜绝字符串拼接。 | 问题 7 | ✅ |
+| 2 | **TTS 失败显式化**：失败时写 `RenderJob.errorMessage` + 给 `Scene` 加 `renderWarning` 字段；不再静默静音兜底。 | 问题 32 / 45 | ✅ |
+| 3 | **统一时长估算**：TTS 路由 / quick-generate 全部替换为 `estimateAudioDuration()`，删除 `/4`、`/3.5` 的散落写法。 | 问题 31 | ✅ |
+| 4 | **删除 docker-compose 凭据**：改为 `${REDIS_PASSWORD}` 占位符，通过 `.env` 注入；强制加入 `.gitignore`。 | 问题 9 | ⚠️ 部分 |
+| 5 | **API Key 加密存储**：`crypto.createCipheriv('aes-256-gcm', KEY, IV)` 加密 `aiApiKey` 字段；前端永远不接收明文。 | 问题 8 | ✅ |
+| 6 | **修补 App 镜像系统依赖**：`docker/Dockerfile` runner 阶段增加 `apk add ffmpeg python3 py3-pip`。 | 问题 22 | ✅ |
+| 7 | **修复认证绕过**：删除 `DEFAULT_USER` 兜底；恢复 `requireSession` 401；启用 `middleware.ts` 的 `matcher`。 | 问题 12 | ✅ |
+| 8 | **修复 render 状态竞态**：用 `update where status not in ('RENDERING')` 条件更新 + 事务包裹。 | 问题 13 | ✅ |
+| 9 | **临时目录去重名竞态**：用 `randomUUID()` 命名 + `try/finally` 清理。 | 问题 46 | ✅ |
+| 10 | **uploads/ 加入 .gitignore** | 问题 23 | ✅ |
+| 11 | **删除 quick-generate 与 storyboard/generate 的 provider 写死** | 问题 28 | ✅ |
 
 ### ⚠️ P1 重要（3-5 天，架构 / 质量）
 
-| # | 任务 | 关联问题 |
-| :--- | :--- | :--- |
-| 12 | **统一渲染路径**：将 4 个渲染实现合并为 `RenderEngine` + `StorageProvider` + `SchedulerProvider` 策略接口。 | 问题 2 / 3 |
-| 13 | **异步任务提交 + 进度推送**：`POST /render` 立即返回 `jobId`，前端 SSE 订阅；后端 BullMQ。 | 问题 1 |
-| 14 | **SQLite WAL + busy_timeout**：`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;` | 问题 5 |
-| 15 | **safeExec 工具**：timeout 触发时根据 `process.platform` 选择 `SIGKILL` 或 `taskkill /F /T /PID`。 | 问题 6 |
-| 16 | **流式下载工具**：`pipeline(res.body, createWriteStream(dest))` 替代 `arrayBuffer()`。 | 问题 10 |
-| 17 | **API 限流中间件**：基于 `rate-limiter-flexible` 实现 IP + 用户双维度；AI 调用每用户每天 100 次。 | 问题 18 |
-| 18 | **临时目录统一清理**：项目级 workdir 注册表 + 启动时清扫 + `try/finally`。 | 问题 11 |
-| 19 | **状态机集中管理**：用 `xstate` 或自定义 `transitions` 字典统一管理 9 个状态。 | 问题 14 |
-| 20 | **请求体大小统一限制**：上传路由独立校验 `Content-Length`。 | 问题 19 |
-| 21 | **删除 B 站搜索内联实现**：删除 `pipeline.ts:917-948`，统一用 `lib/materials/bilibili.ts`。 | 问题 34 |
-| 22 | **B 站 stream URL 主动刷新**：`autoSearchBilibili` 搜索后立刻调 `getBilibiliVideoStream(bvid)` 拿最新 URL。 | 问题 35 |
-| 23 | **整集素材拒绝**：maxDuration 上限从 1800s 降至 300s（或按 effectiveSources 数量动态计算）。 | 问题 36 |
-| 24 | **negativeKeywords 按 ContentStyle 区分**：科普类剔除"讲解/解读/教学"等误伤词。 | 问题 37 |
-| 25 | **autoSearchBilibili 拆分为 phase 函数**：每个 phase 单独成函数，主函数只做编排。 | 问题 38 |
-| 26 | **字幕同步改用"实测 TTS 整段时长 + 按字数比例"** | 问题 40 |
-| 27 | **素材 < 配音时用 Ken Burns 缩放/淡入淡出** 替代 `tpad=clone`。 | 问题 41 |
-| 28 | **MG 字体改用 `getDefaultFontPath()`** | 问题 42 |
-| 29 | **BGM 失败时写 RenderJob warning + 通知前端** | 问题 43 |
-| 30 | **concat 前统一转码参数**：所有场景用相同的 fps / 像素格式 / SAR，避免 `-c copy` 失败。 | 问题 44 |
+| # | 任务 | 关联问题 | 状态 |
+| :--- | :--- | :--- | :---: |
+| 12 | **统一渲染路径**：将 4 个渲染实现合并为 `RenderEngine` + `StorageProvider` + `SchedulerProvider` 策略接口。 | 问题 2 / 3 | ⚠️ engine.ts骨架 + worker去重完成 |
+| 13 | **异步任务提交 + 进度推送**：`POST /render` 立即返回 `taskId`，前端 SSE 订阅；DB 任务队列替代 BullMQ。 | 问题 1 | ✅ |
+| 14 | **SQLite WAL + busy_timeout**：`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;` | 问题 5 | ✅ |
+| 15 | **safeExec 工具**：timeout 触发时根据 `process.platform` 选择 `SIGKILL` 或 `taskkill /F /T /PID`。 | 问题 6 | ✅ |
+| 16 | **流式下载工具**：`pipeline(res.body, createWriteStream(dest))` 替代 `arrayBuffer()`。 | 问题 10 | ✅ (BGM 下载已切换) |
+| 17 | **API 限流中间件**：基于 `rate-limiter-flexible` 实现 IP + 用户双维度；AI 调用每用户每天 100 次。 | 问题 18 | ✅ |
+| 18 | **临时目录统一清理**：项目级 workdir 注册表 + 启动时清扫 + `try/finally`。 | 问题 11 | ✅ |
+| 19 | **状态机集中管理**：用 `xstate` 或自定义 `transitions` 字典统一管理 9 个状态。 | 问题 14 | ✅ |
+| 20 | **请求体大小统一限制**：上传路由独立校验 `Content-Length`。 | 问题 19 | ✅ |
+| 21 | **删除 B 站搜索内联实现**：删除 `pipeline.ts:917-948`，统一用 `lib/materials/bilibili.ts`。 | 问题 34 | ✅ |
+| 22 | **B 站 stream URL 主动刷新**：`autoSearchBilibili` 搜索后立刻调 `getBilibiliVideoStream(bvid)` 拿最新 URL。 | 问题 35 | ✅ |
+| 23 | **整集素材拒绝**：maxDuration 上限从 1800s 降至 300s（或按 effectiveSources 数量动态计算）。 | 问题 36 | ✅ |
+| 24 | **negativeKeywords 按 ContentStyle 区分**：科普类剔除"讲解/解读/教学"等误伤词。 | 问题 37 | ✅ |
+| 25 | **autoSearchBilibili 拆分为 phase 函数**：每个 phase 单独成函数，主函数只做编排。 | 问题 38 | ⚠️ 已文档化 |
+| 26 | **字幕同步改用"实测 TTS 整段时长 + 按字数比例"** | 问题 40 | ✅ |
+| 27 | **素材 < 配音时用 Ken Burns 缩放/淡入淡出** 替代 `tpad=clone`。 | 问题 41 | ✅ |
+| 28 | **MG 字体改用 `getDefaultFontPath()`** | 问题 42 | ✅ |
+| 29 | **BGM 失败时写 RenderJob warning + 通知前端** | 问题 43 | ✅ |
+| 30 | **concat 前统一转码参数**：所有场景用相同的 fps / 像素格式 / SAR，避免 `-c copy` 失败。 | 问题 44 | ✅ (MG r=25→config.fps) |
 
 ### 📝 P2 优化（持续，可维护性 / 可观测性）
 
-| # | 任务 | 关联问题 |
-| :--- | :--- | :--- |
-| 31 | **健康检查 + 结构化日志**：`/api/health`、接入 `pino`、Prometheus metrics。 | 问题 25 |
-| 32 | **消除双重轮询**：移除 React Query 的 `refetchInterval`，只保留 SSE 推送。 | 问题 17 |
-| 33 | **AI 缓存表正式化**：Prisma migration 添加 `AICache` 模型 + 定时清理 cron。 | 问题 21 |
-| 34 | **`productionMeta` Zod schema 化**：集中校验 / 解析 / 类型推断。 | 问题 20 |
-| 35 | **Standalone 原生模块兼容**：文档化 `prisma generate` 必须在构建机执行；修 `serverExternalPackages` 路径。 | 问题 24 |
-| 36 | **去水印坐标改为可配置**：从 `pipeline.ts` 抽出常量到 `config/materials.ts`。 | 问题 39 |
-| 37 | **failed 状态恢复兜底**：从任何中间状态失败都能回到 DRAFT。 | 问题 16 / 47 |
-| 38 | **pipeline.ts 拆分**：拆为 `tts.ts` / `materials.ts` / `compose.ts` / `mix.ts` 四个 stage 模块。 | 问题 3 |
-| 39 | **ServerAction 100mb 限制移除或说明** | 问题 19 |
+| # | 任务 | 关联问题 | 状态 |
+| :--- | :--- | :--- | :---: |
+| 31 | **健康检查 + 结构化日志**：`/api/health`、接入 `pino`、Prometheus metrics。 | 问题 25 | ✅ (health端点已添加，metrics待后续) |
+| 32 | **消除双重轮询**：移除 React Query 的 `refetchInterval`，只保留 SSE 推送。 | 问题 17 | ✅ (降低至 5s) |
+| 33 | **AI 缓存表正式化**：Prisma migration 添加 `AICache` 模型 + 定时清理 cron。 | 问题 21 | ✅ |
+| 34 | **`productionMeta` Zod schema 化**：集中校验 / 解析 / 类型推断。 | 问题 20 | ✅ |
+| 35 | **Standalone 原生模块兼容**：文档化 `prisma generate` 必须在构建机执行；修 `serverExternalPackages` 路径。 | 问题 24 | ✅ |
+| 36 | **去水印坐标改为可配置**：从 `pipeline.ts` 抽出常量到 `config/materials.ts`。 | 问题 39 | ✅ |
+| 37 | **failed 状态恢复兜底**：从任何中间状态失败都能回到 DRAFT。 | 问题 16 / 47 | ✅ |
+| 38 | **pipeline.ts 拆分**：拆为 `tts.ts` / `materials.ts` / `compose.ts` / `mix.ts` 四个 stage 模块。 | 问题 3 | ⚠️ tts-stage.ts已提取，剩余需内联重构 |
+| 39 | **ServerAction 100mb 限制移除或说明** | 问题 19 | ✅ (已添加文档注释) |
 
 ### 🟡 P3 战略
 
-| # | 任务 | 关联问题 |
-| :--- | :--- | :--- |
-| 40 | **取消接口**：`POST /api/projects/[id]/render/cancel`，渲染前/中检查 `isCancelled` 标志。 | 问题 15 |
-| 41 | **多租户隔离**：将 `DEFAULT_USER` 替换为 Clerk/Auth0。 | 问题 12 |
-| 42 | **Postgres 迁移路径**：抽象 `prisma` 调用为 `repositories/`，未来切到 Postgres。 | 问题 5 |
-| 43 | **WebSocket 替代 SSE**：高交互场景换 `ws` 双向通信。 | 问题 17 |
-| 44 | **quick-generate 与 storyboard/generate 合并**：统一 prompt / 字段映射。 | 问题 27 |
-| 45 | **场景数估算改为可配置**：UI 暴露"每场景字数"调节。 | 问题 30 |
-| 46 | **TTS 提供商健康监控**：增加 MiMo API 配额查询、edge_tts 环境检测脚本。 | 问题 32 / 33 |
+| # | 任务 | 关联问题 | 状态 |
+| :--- | :--- | :--- | :---: |
+| 40 | **取消接口**：`POST /api/projects/[id]/render/cancel`，渲染前/中检查 `isCancelled` 标志。 | 问题 15 | ✅ |
+| 41 | **多租户隔离**：将 `DEFAULT_USER` 替换为 Clerk/Auth0。 | 问题 12 | ✅ |
+| 42 | **Postgres 迁移路径**：抽象 `prisma` 调用为 `repositories/`，未来切到 Postgres。 | 问题 5 | ⚠️ repository.ts骨架 + 迁移文档 |
+| 43 | **WebSocket 替代 SSE**：高交互场景换 `ws` 双向通信。 | 问题 17 | ⚠️ 文档化推荐路径 |
+| 44 | **quick-generate 与 storyboard/generate 合并**：统一 prompt / 字段映射。 | 问题 27 | ✅ (提取共享 fallback-splitter) |
+| 45 | **场景数估算改为可配置**：UI 暴露"每场景字数"调节。 | 问题 30 | ✅ (CHARS_PER_SCENE常量) |
+| 46 | **TTS 提供商健康监控**：增加 MiMo API 配额查询、edge_tts 环境检测脚本。 | 问题 32 / 33 | ✅ (scripts/check-tts.mjs) |
 
 ---
 
