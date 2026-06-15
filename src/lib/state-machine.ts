@@ -12,22 +12,16 @@
  */
 
 import { prisma } from "@/lib/db";
+import { ProjectStates, type ProjectState } from "./state-machine-constants";
 
-// ── States ──────────────────────────────────────────────────────────
-
-export const ProjectStates = [
-  "DRAFT",
-  "ANALYZING",
-  "STORYBOARD_GENERATING",
-  "STORYBOARD_READY",
-  "PRODUCING",
-  "EDITING",
-  "RENDERING",
-  "COMPLETED",
-  "FAILED",
-] as const;
-
-export type ProjectState = (typeof ProjectStates)[number];
+// Re-export constants for backward compatibility.
+// Client components should import from state-machine-constants instead.
+export {
+  ACTIVE_STATUSES,
+  CANCELLABLE_STATUSES,
+  getStatusLabel,
+} from "./state-machine-constants";
+export type { ProjectState } from "./state-machine-constants";
 
 // ── Transitions ─────────────────────────────────────────────────────
 
@@ -43,12 +37,9 @@ const TRANSITIONS: Record<ProjectState, ProjectState[]> = {
   PRODUCING: ["RENDERING", "EDITING", "FAILED"],
   EDITING: ["RENDERING", "FAILED"],
   RENDERING: ["COMPLETED", "FAILED", "DRAFT"],
-  COMPLETED: ["RENDERING", "EXPORTING"] as any, // re-render
+  COMPLETED: ["RENDERING"], // re-render
   FAILED: ["DRAFT", "RENDERING", "STORYBOARD_GENERATING"],
 };
-
-// Forward-declare for COMPLETED → RENDERING bypass
-(TRANSITIONS.COMPLETED as ProjectState[]).push("RENDERING");
 
 // ── Public API ──────────────────────────────────────────────────────
 
@@ -102,7 +93,7 @@ export async function transitionProject(
     where: {
       id: projectId,
       userId,
-      status: { in: allowedFrom },
+      status: { in: allowedFrom as ProjectState[] },
     },
     data: { status: to },
   });
@@ -133,41 +124,3 @@ export function isValidTransition(from: string, to: string): boolean {
   if (!ProjectStates.includes(to as ProjectState)) return false;
   return canTransition(from as ProjectState, to as ProjectState);
 }
-
-/**
- * Get a human-readable status label for the UI.
- */
-export function getStatusLabel(status: string): string {
-  const labels: Record<string, string> = {
-    DRAFT: "草稿",
-    ANALYZING: "分析中",
-    STORYBOARD_GENERATING: "生成分镜中",
-    STORYBOARD_READY: "分镜就绪",
-    PRODUCING: "制作中",
-    EDITING: "编辑中",
-    RENDERING: "渲染中",
-    COMPLETED: "已完成",
-    FAILED: "失败",
-  };
-  return labels[status] ?? status;
-}
-
-/**
- * All statuses that indicate the project is "in progress" (should poll / SSE).
- */
-export const ACTIVE_STATUSES: ProjectState[] = [
-  "ANALYZING",
-  "STORYBOARD_GENERATING",
-  "RENDERING",
-  "PRODUCING",
-];
-
-/**
- * All statuses where a cancel/reset is appropriate.
- */
-export const CANCELLABLE_STATUSES: ProjectState[] = [
-  "ANALYZING",
-  "STORYBOARD_GENERATING",
-  "RENDERING",
-  "FAILED",
-];

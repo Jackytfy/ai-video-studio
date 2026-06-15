@@ -848,6 +848,27 @@ export async function renderProjectInline(
                 }
               }
             }
+
+            // Pattern 5 (universal fallback): if the hardcoded word banks missed,
+            // extract any 2-4 char Chinese phrases from visualDesc that look like
+            // content nouns (not punctuation/function words). This catches
+            // locations/objects not in the hardcoded list (莫高窟, 布达拉宫, etc.).
+            if (visualKeywords.length === 0) {
+              const genericKeywords = visualDesc.match(/[\u4e00-\u9fff]{2,4}/g) as string[] | null;
+              if (genericKeywords) {
+                // Filter out stop words and punctuation-only matches
+                const stopWords = new Set([
+                  "一个", "可以", "他们", "我们", "这个", "那个", "什么", "怎么",
+                  "不是", "没有", "还是", "但是", "因为", "所以", "如果", "虽然",
+                  "这里", "那里", "前面", "后面", "上面", "下面", "里面", "外面",
+                  "之前", "之后", "已经", "正在", "一直", "非常", "比较", "更加",
+                ]);
+                const filtered = [...new Set(genericKeywords)]
+                  .filter(k => !stopWords.has(k) && k.length === 4)
+                  .slice(0, 3);
+                visualKeywords.push(...filtered);
+              }
+            }
           }
 
           // Also extract keywords from materialQuery (but keep it short!)

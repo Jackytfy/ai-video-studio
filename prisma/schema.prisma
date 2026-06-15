@@ -446,16 +446,13 @@ model AICache {
 model RenderTask {
   id        String      @id @default(cuid())
   projectId String
-  project   Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
   userId    String
-  user      User        @relation(fields: [userId], references: [id])
 
   status    TaskStatus  @default(PENDING)
   priority  Int         @default(0)
 
   // The RenderJob this task created (optional — set after job creation)
   renderJobId String?
-  renderJob   RenderJob? @relation(fields: [renderJobId], references: [id])
 
   config    String?     // JSON snapshot of render config
   errorMessage String?

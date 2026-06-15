@@ -265,9 +265,13 @@ function generateScriptChunks(
     rawDurations.push(Math.max(dur, minByLength));
   }
 
-  // Normalize: scale all durations so they sum to totalDuration
+  // Normalize: scale all durations so they EXACTLY sum to totalDuration.
+  // Previously we only compressed (rawTotal > totalDuration) but did not
+  // expand (rawTotal < totalDuration), causing subtitle gaps before the
+  // last chunk's endTime clamp kicked in. Now we scale in both directions
+  // so every subtitle chunk fills its proportional share of the audio.
   const rawTotal = rawDurations.reduce((sum, d) => sum + d, 0);
-  const scaleFactor = rawTotal > totalDuration ? totalDuration / rawTotal : 1;
+  const scaleFactor = rawTotal > 0 ? totalDuration / rawTotal : 1;
   const normalizedDurations = rawDurations.map(d => d * scaleFactor);
 
   // 5. Build chunks

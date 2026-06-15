@@ -11,24 +11,25 @@
 import { spawn } from "child_process";
 import { execFile } from "child_process";
 import { promisify } from "util";
-import { writeFile, readFile, stat } from "fs/promises";
+import { writeFile } from "fs/promises";
 import { join } from "path";
 
 const execFileAsync = promisify(execFile);
 
-// ── helpers from pipeline.ts (to be deduplicated later) ──
+// ── helpers (to be deduplicated with pipeline.ts later) ──
 
-function getAudioDurationFn(filePath: string): Promise<number> {
-  const { execFile } = require("child_process");
-  const { promisify } = require("util");
-  return promisify(execFile)("ffprobe", [
-    "-v", "error",
-    "-show_entries", "format=duration",
-    "-of", "default=noprint_wrappers=1:nokey=1",
-    filePath,
-  ], { timeout: 5000 }).then(
-    ({ stdout }: { stdout: string }) => parseFloat(stdout.trim()) || 0
-  ).catch(() => 0);
+async function getAudioDurationFn(filePath: string): Promise<number> {
+  try {
+    const { stdout } = await execFileAsync("ffprobe", [
+      "-v", "error",
+      "-show_entries", "format=duration",
+      "-of", "default=noprint_wrappers=1:nokey=1",
+      filePath,
+    ], { timeout: 5000 });
+    return parseFloat(stdout.trim()) || 0;
+  } catch {
+    return 0;
+  }
 }
 
 export interface TTSSceneInput {
@@ -76,11 +77,9 @@ export async function generateTTSSceneAudio(
 ): Promise<{ outputs: TTSSceneOutput[]; warnings: string[] }> {
   const { mapConcurrent } = await import("@/lib/utils/concurrent");
   const { estimateAudioDuration } = await import("./subtitle");
-  const { decryptSecret } = await import("@/lib/utils/crypto");
 
   const warnings: string[] = [];
-  const getAudioDuration = (await import("./pipeline").then(() => null))?.valueOf ?? getAudioDurationFn;
-  // ^ We can't circular-import getAudioDuration from pipeline.ts, so we inline it above
+  const getAudioDuration = getAudioDurationFn;
 
   const results = await mapConcurrent(scenes, config.concurrency, async (scene) => {
     const { index, voiceoverText } = scene;

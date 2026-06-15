@@ -1,14 +1,18 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Check, Loader2, Play, X, Sparkles, Film, Mic,
-  Clock, Layers, FileText, Settings
+  Clock, Layers, FileText, Settings, Video
 } from "lucide-react";
 import { SceneCard } from "@/components/storyboard/SceneCard";
 import { SceneEditor } from "@/components/storyboard/SceneEditor";
+import { ACTIVE_STATUSES } from "@/lib/state-machine-constants";
+
+// States where a render is in progress (button should show "rendering")
+const RENDERING_STATES = [...ACTIVE_STATUSES, "RENDERING"];
 
 interface Scene {
   id: string;
@@ -41,6 +45,7 @@ interface ProjectData {
   aiAnalysis?: string | null;
   contentStyle: string;
   aspectRatio: string;
+  renderJobs?: Array<{ status: string; outputUrl?: string }>;
 }
 
 export default function StoryboardPage() {
@@ -59,6 +64,13 @@ export default function StoryboardPage() {
       const res = await fetch(`/api/projects/${projectId}`);
       if (!res.ok) throw new Error("获取项目失败");
       return res.json();
+    },
+    // Poll while rendering to detect completion
+    refetchInterval: (query) => {
+      const status = (query.state.data as ProjectData | undefined)?.status;
+      if (!status) return false;
+      if (RENDERING_STATES.includes(status)) return 3000;
+      return false;
     },
   });
 
@@ -152,19 +164,43 @@ export default function StoryboardPage() {
       const res = await fetch(`/api/projects/${projectId}/render`, {
         method: "POST",
       });
+      const data = await res.json();
       if (!res.ok) {
-        const data = await res.json();
         throw new Error(data.error || "渲染失败");
       }
-      return res.json();
+      return data;
     },
     onSuccess: (data) => {
+      // Invalidate to trigger polling for render status
       queryClient.invalidateQueries({ queryKey: ["project", projectId] });
+      // Sync mode: redirect immediately (outputUrl is in response)
       if (data.outputUrl) {
         router.push(`/projects/${projectId}`);
       }
+      // Async mode: project status changes to RENDERING, polling kicks in,
+      // useEffect below detects COMPLETED → redirect
     },
   });
+
+  // Auto-redirect when rendering completes
+  const [hasStartedRender, setHasStartedRender] = useState(false);
+  const projectStatus = project?.status ?? "";
+  const isRendering = RENDERING_STATES.includes(projectStatus);
+  const lastJob = project?.renderJobs?.[0];
+
+  useEffect(() => {
+    if (isRendering) setHasStartedRender(true);
+  }, [isRendering]);
+
+  useEffect(() => {
+    if (
+      hasStartedRender &&
+      projectStatus === "COMPLETED" &&
+      lastJob?.status === "COMPLETED"
+    ) {
+      router.push(`/projects/${projectId}`);
+    }
+  }, [projectStatus, lastJob?.status, hasStartedRender, projectId, router]);
 
   if (isLoading) {
     return (
@@ -194,7 +230,8 @@ export default function StoryboardPage() {
   }
 
   const isConfirmed = storyboard.status === "CONFIRMED";
-  const isGenerating = renderMutation.isPending;
+  // Show "rendering" state if mutation is pending OR project is in a rendering state
+  const isGenerating = renderMutation.isPending || isRendering;
 
   // Scene type label mapping
   const sceneTypeLabel: Record<string, string> = {
@@ -389,12 +426,30 @@ export default function StoryboardPage() {
           </button>
 
           {isGenerating ? (
+            <div className="flex items-center gap-3">
+              <div className="flex items-center gap-2 bg-gray-600 text-white px-8 py-2.5 rounded-full font-medium cursor-not-allowed">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                {projectStatus === "RENDERING" ? "渲染中..." : "生成中..."}
+              </div>
+              <span className="text-xs text-muted-foreground">
+                完成后自动跳转
+              </span>
+            </div>
+          ) : projectStatus === "FAILED" ? (
             <button
-              disabled
-              className="flex items-center gap-2 bg-gray-600 text-white px-8 py-2.5 rounded-full font-medium cursor-not-allowed"
+              onClick={() => renderMutation.mutate()}
+              className="flex items-center gap-2 bg-gradient-to-r from-orange-500 to-red-400 text-white px-8 py-2.5 rounded-full font-medium hover:opacity-90 transition-opacity shadow-lg shadow-orange/20"
             >
-              <Loader2 className="w-4 h-4 animate-spin" />
-              生成中...
+              <Play className="w-4 h-4" />
+              重新渲染
+            </button>
+          ) : projectStatus === "COMPLETED" && lastJob?.outputUrl ? (
+            <button
+              onClick={() => router.push(`/projects/${projectId}`)}
+              className="flex items-center gap-2 bg-gradient-to-r from-green-500 to-emerald-400 text-white px-8 py-2.5 rounded-full font-medium hover:opacity-90 transition-opacity shadow-lg shadow-green/20"
+            >
+              <Video className="w-4 h-4" />
+              查看视频
             </button>
           ) : !isConfirmed ? (
             <button
@@ -412,14 +467,9 @@ export default function StoryboardPage() {
           ) : (
             <button
               onClick={() => renderMutation.mutate()}
-              disabled={renderMutation.isPending}
-              className="flex items-center gap-2 bg-gradient-to-r from-purple to-pink-400 text-white px-8 py-2.5 rounded-full font-medium hover:opacity-90 transition-opacity disabled:opacity-50 shadow-lg shadow-purple/20"
+              className="flex items-center gap-2 bg-gradient-to-r from-purple to-pink-400 text-white px-8 py-2.5 rounded-full font-medium hover:opacity-90 transition-opacity shadow-lg shadow-purple/20"
             >
-              {renderMutation.isPending ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
-              ) : (
-                <Play className="w-4 h-4" />
-              )}
+              <Play className="w-4 h-4" />
               生成视频
             </button>
           )}

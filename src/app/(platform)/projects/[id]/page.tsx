@@ -5,7 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { useState } from "react";
 import { MessageSquare, Layers, Film, ArrowRight, Loader2, CheckCircle, AlertCircle, Play, RefreshCw, Download, Trash2 } from "lucide-react";
-import { ACTIVE_STATUSES, ProjectStates, getStatusLabel } from "@/lib/state-machine";
+import { ACTIVE_STATUSES, ProjectStates, getStatusLabel } from "@/lib/state-machine-constants";
 
 // Polling statuses: both project-level and renderJob-level active states
 const POLLING_STATUSES = [...ACTIVE_STATUSES, "COMPOSITING", "TTS_GENERATING", "MATERIALS_LOADING"];
