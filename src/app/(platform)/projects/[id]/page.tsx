@@ -5,20 +5,26 @@ import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { useState } from "react";
 import { MessageSquare, Layers, Film, ArrowRight, Loader2, CheckCircle, AlertCircle, Play, RefreshCw, Download, Trash2 } from "lucide-react";
+import { ACTIVE_STATUSES, ProjectStates, getStatusLabel } from "@/lib/state-machine";
 
-const POLLING_STATUSES = ["RENDERING", "COMPOSITING", "TTS_GENERATING", "MATERIALS_LOADING"];
+// Polling statuses: both project-level and renderJob-level active states
+const POLLING_STATUSES = [...ACTIVE_STATUSES, "COMPOSITING", "TTS_GENERATING", "MATERIALS_LOADING"];
 
-const statusMap: Record<string, { label: string; color: string }> = {
-  DRAFT: { label: "草稿", color: "text-muted-foreground" },
-  ANALYZING: { label: "分析中", color: "text-yellow-400" },
-  STORYBOARD_GENERATING: { label: "生成分镜中", color: "text-yellow-400" },
-  STORYBOARD_READY: { label: "分镜就绪", color: "text-blue-400" },
-  PRODUCING: { label: "制作中", color: "text-cyan-400" },
-  EDITING: { label: "编辑中", color: "text-purple" },
-  RENDERING: { label: "渲染中", color: "text-orange-400" },
-  COMPLETED: { label: "已完成", color: "text-green-400" },
-  FAILED: { label: "失败", color: "text-destructive" },
+const statusColors: Record<string, string> = {
+  DRAFT: "text-muted-foreground",
+  ANALYZING: "text-yellow-400",
+  STORYBOARD_GENERATING: "text-yellow-400",
+  STORYBOARD_READY: "text-blue-400",
+  PRODUCING: "text-cyan-400",
+  EDITING: "text-purple",
+  RENDERING: "text-orange-400",
+  COMPLETED: "text-green-400",
+  FAILED: "text-destructive",
 };
+
+const statusMap: Record<string, { label: string; color: string }> = Object.fromEntries(
+  ProjectStates.map((s) => [s, { label: getStatusLabel(s), color: statusColors[s] || "text-muted-foreground" }])
+);
 
 export default function ProjectDetailPage() {
   const params = useParams();
@@ -64,13 +70,16 @@ export default function ProjectDetailPage() {
     refetchInterval: (query) => {
       const state = query.state.data as { status?: string; renderJobs?: Array<{ status: string }> } | undefined;
       if (!state) return false;
-      // Poll during rendering and also when renderJobs has an active job
+      // Poll during rendering and also when renderJobs has an active job.
+      // Prefer SSE (useProjectEvents) for lower-latency updates; this poll
+      // acts as a safety-net fallback at a relaxed 5 s interval to reduce
+      // SQLite write-lock contention during concurrent renders.
       const isRendering = POLLING_STATUSES.includes(state.status ?? "");
       const hasActiveRender = state.renderJobs?.[0]?.status && !["COMPLETED", "FAILED"].includes(state.renderJobs[0].status);
       if (!isRendering && !hasActiveRender) return false;
       const elapsed = Date.now() - (query.state.dataUpdatedAt || Date.now());
-      if (elapsed > 300_000) return false; // 5 min timeout
-      return 3000; // Poll every 3 seconds
+      if (elapsed > 600_000) return false; // 10 min timeout
+      return 5000; // Poll every 5 seconds (reduced from 3s to ease DB load)
     },
   });
 

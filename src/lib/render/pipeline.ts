@@ -1,10 +1,15 @@
 import { spawn, execFile } from "child_process";
 import { prisma } from "@/lib/db";
+import { transitionProject } from "@/lib/state-machine";
 import { promisify } from "util";
 import { readFile, writeFile, unlink, mkdir, rm } from "fs/promises";
 import { createWriteStream } from "fs";
+import { pipeline } from "stream/promises";
+import { Readable } from "stream";
 import { join } from "path";
 import { probeDimensions, detectWatermarkRegions } from "@/lib/materials/watermark";
+import { getBilibiliWatermarkRegions } from "@/lib/materials/watermark-config";
+import { searchBilibiliVideos } from "@/lib/materials/bilibili";
 import { randomUUID } from "crypto";
 import { tmpdir } from "os";
 import { decryptSecret } from "@/lib/utils/crypto";
@@ -12,6 +17,7 @@ import {
   generateSubtitleChunks,
   buildSubtitleFilterChain,
   estimateAudioDuration,
+  getDefaultFontPath,
   type SubtitleConfig,
 } from "./subtitle";
 import { mapConcurrent } from "@/lib/utils/concurrent";
@@ -778,6 +784,31 @@ export async function renderProjectInline(
       ];
 
       // ── Auto-search materials from Bilibili if none attached ──
+      /**
+       * autoSearchBilibili — multi-phase Bilibili material search pipeline.
+       *
+       * Phases (in priority order):
+       *   0. Required sources (user-specified, MUST appear)
+       *   1. AI-recommended sourceVideos (high precision: "剧名 片段")
+       *   1.5 Preferred sources (user preferences)
+       *   2. Visual keywords from visualDesc (no show name bias)
+       *   2.5 properNouns from user requirements
+       *   2.8 landmarkScenes from user requirements
+       *   3. materialQuery (short version, 15 chars max)
+       *   4. Voiceover text keywords (fallback)
+       *   5. properNouns + era fallback
+       *
+       * For each phase:
+       *   - Build search queries → execute via shared searchBilibiliVideos()
+       *   - Apply negative keyword filter (context-aware: relaxed for KNOWLEDGE)
+       *   - Filter by duration (300s cap with sources, 600s without)
+       *   - Probe resolution, check aspect ratio (≥1.2 for landscape)
+       *
+       * Selection: prefer title-matched candidates; fallback to any valid result.
+       * On failure: Pexels fallback → MG animation (data scenes) → dark bg.
+       *
+       * @returns true if a material was found and assigned
+       */
       async function autoSearchBilibili(): Promise<boolean> {
         try {
           // ── Build prioritized search queries ──
@@ -1000,37 +1031,11 @@ export async function renderProjectInline(
           searchQueries.forEach((sq, qi) => console.log(`  Q${qi + 1} [${sq.label}]: "${sq.query}"`));
 
           // Search with primary query first, fallback to secondary query
-          async function bilibiliSearch(query: string, retries = 1): Promise<any[]> {
-            if (!query) return [];
-            for (let attempt = 0; attempt <= retries; attempt++) {
-              try {
-                if (attempt > 0) await new Promise(r => setTimeout(r, 800 + Math.random() * 1000));
-                const url = `https://api.bilibili.com/x/web-interface/search/type?search_type=video&keyword=${encodeURIComponent(query)}&page=1&page_size=10&order=totalrank`;
-                const res = await fetch(url, {
-                  headers: {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Referer": "https://www.bilibili.com/",
-                    "Origin": "https://www.bilibili.com",
-                    "Accept": "application/json, text/plain, */*",
-                    "Accept-Language": "zh-CN,zh;q=0.9",
-                    "Cookie": "buvid3=infoc;",
-                  },
-                  signal: AbortSignal.timeout(10000),
-                });
-                if (!res.ok) continue;
-                const text = await res.text();
-                try {
-                  const data = JSON.parse(text);
-                  if (data.code !== 0) continue;
-                  return (data.data?.result || []).slice(0, 20);
-                } catch {
-                  // Bilibili rate-limited → returned HTML, retry
-                  if (text.startsWith("<")) continue;
-                  return [];
-                }
-              } catch { continue; }
-            }
-            return [];
+          // Use the shared Bilibili search helper (lib/materials/bilibili.ts)
+          // instead of an inline duplicate. It already handles retry, HTML
+          // rate-limit responses, and returns typed BilibiliVideo objects.
+          async function bilibiliSearch(query: string): Promise<any[]> {
+            return searchBilibiliVideos(query, 10);
           }
 
           // Helper: check video resolution via ffprobe
@@ -1129,7 +1134,7 @@ export async function renderProjectInline(
               // Skip content that is clearly NOT official drama/documentary footage
               const negativeKeywords = [
                 // 博主/二创内容
-                "解说", "混剪", "踩点", "二创", "reaction", "Reaction",
+                "混剪", "踩点", "二创", "reaction", "Reaction",
                 "吐槽", "影评", "观后感", "观后", "推荐", "安利",
                 "UP主", "博主", "up主", "整活", "恶搞", "鬼畜",
                 "弹幕", "翻唱", "cos", "Cos", "COS",
@@ -1144,11 +1149,10 @@ export async function renderProjectInline(
                 // 游戏/玩具
                 "游戏", "我的世界", "Minecraft", "minecraft",
                 "乐高", "积木", "手办", "模型",
-                // 教育/教学（中小学课程等）
-                "教程", "教学", "攻略", "指南", "入门",
+                // 中小学课程（不适用于知识科普）
                 "中小学", "初中", "高中", "小学", "课时",
                 "文言文", "语文", "数学", "英语", "考试",
-                "讲解", "习题", "知识点", "考点",
+                "习题", "考点",
                 // 动漫/二次元（非真人）
                 "动漫", "动画", "番剧", "二次元", "国漫",
                 // 其他不相关
@@ -1156,6 +1160,17 @@ export async function renderProjectInline(
                 // User-specified avoid keywords from materialRequirements
                 ...avoidKeywords,
               ];
+
+              // For KNOWLEDGE-style projects, relax the education filter:
+              // documentary titles often contain 讲解/解读/教学/知识点/解说.
+              // We still block 中小学/课时/语文/数学/etc (already above) which are
+              // clearly school-course material unsuitable for knowledge videos.
+              if (project.contentStyle !== "KNOWLEDGE") {
+                negativeKeywords.push(
+                  "解说", "讲解", "教学", "教程", "攻略",
+                  "指南", "入门", "知识点", "解读",
+                );
+              }
               const titleLower = title.toLowerCase();
               const isNegative = negativeKeywords.some(nk => titleLower.includes(nk));
               if (isNegative) {
@@ -1165,7 +1180,10 @@ export async function renderProjectInline(
 
               const durParts = (video.duration || "0:00").split(":").map(Number);
               const durSec = durParts.length === 2 ? durParts[0]*60+durParts[1] : durParts[0]*3600+durParts[1]*60+durParts[2];
-              const maxDuration = effectiveSources.length > 0 ? 1800 : 600;
+              // Cap at 300s (5min) even with sourceVideos to avoid pulling
+              // full episodes as "material". For non-source searches the cap
+              // stays at 600s (10min) to allow slightly longer documentary clips.
+              const maxDuration = effectiveSources.length > 0 ? 300 : 600;
               if (durSec < 5 || durSec > maxDuration) continue;
 
               let streamUrl: string | null = null;
@@ -1248,6 +1266,24 @@ export async function renderProjectInline(
             });
             await prisma.scene.update({ where: { id: scene.id }, data: { materialId: material.id } });
             scene.materialId = material.id;
+
+            // Immediately refresh the Bilibili stream URL so the stored
+            // fileUrl is as fresh as possible. Bilibili stream URLs can
+            // expire within minutes; refreshing here reduces the window
+            // between search and the later download phase.
+            try {
+              const { getBilibiliVideoStream } = await import("@/lib/materials/bilibili");
+              const freshUrl = await getBilibiliVideoStream(matchedVideo.bvid);
+              if (freshUrl) {
+                await prisma.material.update({
+                  where: { id: material.id },
+                  data: { fileUrl: freshUrl },
+                });
+              }
+            } catch {
+              // Non-fatal: the download path will retry with a fresh URL
+            }
+
             return true;
           } else {
             console.warn(`[Render] Scene ${i} no matching video found after all Bilibili queries, trying Pexels fallback`);
@@ -1393,11 +1429,7 @@ export async function renderProjectInline(
                   if (dims.width > 0 && dims.height > 0) {
                     const isBilibili = material.externalSource === "bilibili";
                     const regions = isBilibili
-                      ? [
-                          { x: Math.round(dims.width * 0.78), y: Math.round(dims.height * 0.01), width: Math.round(dims.width * 0.21), height: Math.round(dims.height * 0.08) },
-                          { x: Math.round(dims.width * 0.82), y: Math.round(dims.height * 0.90), width: Math.round(dims.width * 0.17), height: Math.round(dims.height * 0.08) },
-                          { x: Math.round(dims.width * 0.01), y: Math.round(dims.height * 0.90), width: Math.round(dims.width * 0.20), height: Math.round(dims.height * 0.08) },
-                        ]
+                      ? getBilibiliWatermarkRegions(dims.width, dims.height)
                       : detectWatermarkRegions(dims.width, dims.height);
 
                     const delogoFilters = regions.map(
@@ -1496,7 +1528,7 @@ export async function renderProjectInline(
           console.warn(`[Render] Scene ${i} suitable for MG animation, generating data visualization`);
           const w = config.width;
           const h = config.height;
-          const fontPath = "C\\:/Windows/Fonts/msyh.ttc";
+          const fontPath = getDefaultFontPath();
 
           const dataPoints = extractDataPoints(voiceText);
           const tableData = extractTableData(voiceText);
@@ -1508,7 +1540,7 @@ export async function renderProjectInline(
           if (drawTextFilters) {
             await execFileAsync("ffmpeg", [
               "-y",
-              "-f", "lavfi", "-i", `color=c=0x1a1a2e:s=${w}x${h}:d=${mgDuration}:r=25`,
+              "-f", "lavfi", "-i", `color=c=0x1a1a2e:s=${w}x${h}:d=${mgDuration}:r=${config.fps}`,
               "-vf", drawTextFilters,
               "-c:v", "libx264", "-preset", "ultrafast", "-t", String(mgDuration), "-pix_fmt", "yuv420p",
               "-an", materialFile,
@@ -1516,7 +1548,7 @@ export async function renderProjectInline(
           } else {
             await execFileAsync("ffmpeg", [
               "-y",
-              "-f", "lavfi", "-i", `color=c=0x1a1a2e:s=${w}x${h}:d=${mgDuration}:r=25`,
+              "-f", "lavfi", "-i", `color=c=0x1a1a2e:s=${w}x${h}:d=${mgDuration}:r=${config.fps}`,
               "-c:v", "libx264", "-preset", "ultrafast", "-t", String(mgDuration), "-pix_fmt", "yuv420p",
               "-an", materialFile,
             ], { timeout: 60000 });
@@ -1663,7 +1695,7 @@ export async function renderProjectInline(
             const h = config.height;
             await execFileAsync("ffmpeg", [
               "-y",
-              "-f", "lavfi", "-i", `color=c=0x1a1a2e:s=${w}x${h}:d=30:r=25`,
+              "-f", "lavfi", "-i", `color=c=0x1a1a2e:s=${w}x${h}:d=30:r=${config.fps}`,
               "-c:v", "libx264", "-preset", "ultrafast", "-t", "30", "-pix_fmt", "yuv420p",
               "-an", materialFile,
             ], { timeout: 30000 });
@@ -1703,7 +1735,7 @@ export async function renderProjectInline(
         const shouldUseMG = isMGAnimationScene(scenes[i].sceneType, voiceText);
 
         if (shouldUseMG) {
-          const fontPath = "C\\:/Windows/Fonts/msyh.ttc";
+          const fontPath = getDefaultFontPath();
           const dataPoints = extractDataPoints(voiceText);
           const drawTextFilters = buildMGDataDrawText(dataPoints, w, h, fontPath);
 
@@ -1711,7 +1743,7 @@ export async function renderProjectInline(
           if (drawTextFilters) {
             await execFileAsync("ffmpeg", [
               "-y",
-              "-f", "lavfi", "-i", `color=c=0x1a1a2e:s=${w}x${h}:d=${mgDuration}:r=25`,
+              "-f", "lavfi", "-i", `color=c=0x1a1a2e:s=${w}x${h}:d=${mgDuration}:r=${config.fps}`,
               "-vf", drawTextFilters,
               "-c:v", "libx264", "-preset", "ultrafast", "-t", String(mgDuration), "-pix_fmt", "yuv420p",
               "-an", materialFile,
@@ -1719,7 +1751,7 @@ export async function renderProjectInline(
           } else {
             await execFileAsync("ffmpeg", [
               "-y",
-              "-f", "lavfi", "-i", `color=c=0x1a1a2e:s=${w}x${h}:d=${mgDuration}:r=25`,
+              "-f", "lavfi", "-i", `color=c=0x1a1a2e:s=${w}x${h}:d=${mgDuration}:r=${config.fps}`,
               "-c:v", "libx264", "-preset", "ultrafast", "-t", String(mgDuration), "-pix_fmt", "yuv420p",
               "-an", materialFile,
             ], { timeout: 60000 });
@@ -1728,7 +1760,7 @@ export async function renderProjectInline(
           // Non-MG scene: just use plain dark background
           await execFileAsync("ffmpeg", [
             "-y",
-            "-f", "lavfi", "-i", `color=c=0x1a1a2e:s=${w}x${h}:d=30:r=25`,
+            "-f", "lavfi", "-i", `color=c=0x1a1a2e:s=${w}x${h}:d=30:r=${config.fps}`,
             "-c:v", "libx264", "-preset", "ultrafast", "-t", "30", "-pix_fmt", "yuv420p",
             "-an", materialFile,
           ], { timeout: 30000 });
@@ -1799,11 +1831,18 @@ export async function renderProjectInline(
       );
 
       const audioDurStr = audioDuration.toFixed(3);
+      const totalFrames = Math.ceil(audioDuration * config.fps);
 
-      // Build filter for this single scene
+      // Build filter for this single scene.
+      // When material is shorter than audio, use a Ken Burns-style slow zoom
+      // instead of the old tpad=clone (which froze the last frame and looked
+      // broken). The zoompan creates a gentle 5% zoom-in over the entire clip,
+      // making short materials feel intentional rather than broken.
+      const kenBurnsFilter = `zoompan=z='min(zoom+0.0005,1.05)':d=${totalFrames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${config.width}x${config.height}:fps=${config.fps}`;
+
       const sceneFilters: string[] = [];
       sceneFilters.push(
-        `[0:v]scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,tpad=stop=-1:stop_mode=clone:stop_duration=${audioDurStr},trim=duration=${audioDurStr},setpts=PTS-STARTPTS[v0]`
+        `[0:v]scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,${kenBurnsFilter},fade=in:st=0:d=0.3,trim=duration=${audioDurStr},setpts=PTS-STARTPTS[v0]`
       );
 
       // Build subtitle filter chain
@@ -1859,8 +1898,9 @@ export async function renderProjectInline(
       const preMixPath = join(workDir, "premix.mp4");
       try {
         const res = await fetch(music.fileUrl);
-        if (res.ok) {
-          await writeFile(musicFile, Buffer.from(await res.arrayBuffer()));
+        if (res.ok && res.body) {
+          // Stream bgm to disk to avoid keeping the full file in memory
+          await pipeline(Readable.fromWeb(res.body as any), createWriteStream(musicFile));
 
           // Concat scenes first
           await execFileAsync("ffmpeg", [
@@ -1890,8 +1930,17 @@ export async function renderProjectInline(
             outputPath,
           ], { timeout: 300000 });
         }
-      } catch {
-        // Music mixing failed - just concat without music
+      } catch (bgmErr) {
+        // Music mixing failed - just concat without music, but warn the user
+        const bgmWarning = `BGM混音失败，已生成无背景音乐版本: ${bgmErr instanceof Error ? bgmErr.message.slice(0, 200) : "unknown error"}`;
+        console.warn(`[Render] ${bgmWarning}`);
+        try {
+          const existingWarnings = renderJob.errorMessage || "";
+          await prisma.renderJob.update({
+            where: { id: renderJob.id },
+            data: { errorMessage: existingWarnings ? `${existingWarnings}\n${bgmWarning}` : bgmWarning },
+          });
+        } catch {}
         await execFileAsync("ffmpeg", [
           "-y", "-f", "concat", "-safe", "0", "-i", concatListPath,
           "-c", "copy", "-movflags", "+faststart",
@@ -1958,10 +2007,8 @@ export async function renderProjectInline(
       },
     });
 
-    await prisma.project.update({
-      where: { id: projectId },
-      data: { status: "COMPLETED" },
-    });
+    // Use state machine for validated transition
+    await transitionProject(projectId, userId, "COMPLETED");
 
     await rm(workDir, { recursive: true, force: true }).catch(() => {});
 
@@ -1972,10 +2019,10 @@ export async function renderProjectInline(
       where: { id: renderJob.id },
       data: { status: "FAILED", errorMessage: message },
     });
-    await prisma.project.update({
-      where: { id: projectId },
-      data: { status: "FAILED" },
-    });
+    // Validate the FAILED transition via state machine
+    await transitionProject(projectId, userId, "FAILED");
+    // Clean up temporary files even on failure to prevent disk exhaustion
+    await rm(workDir, { recursive: true, force: true }).catch(() => {});
     throw error;
   }
 }

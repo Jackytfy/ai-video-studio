@@ -3,20 +3,7 @@ import { prisma } from "@/lib/db";
 import { requireSession, unauthorized } from "@/lib/auth/session";
 import { generateAI, buildProviderConfig, type ProviderConfig } from "@/lib/ai/router";
 import { estimateAudioDuration } from "@/lib/render/subtitle";
-
-interface SceneData {
-  sceneNumber: number;
-  title: string;
-  sceneType: string;
-  voiceoverText: string;
-  visualDesc: string;
-  materialQuery: string;
-  materialQueryEn: string;
-  sourceVideos: string[];
-  scripts: string[];
-  wordCount: number;
-  estimatedDuration: number;
-}
+import { fallbackSplitScenes, type SceneData } from "@/lib/ai/fallback-splitter";
 
 /**
  * Generate detailed storyboard in one AI call using the same prompt as storyboard/generate.
@@ -195,93 +182,6 @@ ${planDescription}
   }));
 }
 
-/**
- * Fallback: split text into scenes by paragraphs when AI fails.
- * Still generates reasonable scene structure.
- */
-function fallbackSplit(rawText: string): SceneData[] {
-  const paragraphs = rawText
-    .split(/\n{2,}/)
-    .map((p) => p.replace(/\n/g, "").trim())
-    .filter((p) => p.length > 0);
-
-  if (paragraphs.length === 0) {
-    paragraphs.push(rawText);
-  }
-
-  // Merge short paragraphs (< 40 chars) with previous
-  const merged: string[] = [];
-  for (const p of paragraphs) {
-    if (merged.length > 0 && p.length < 40) {
-      merged[merged.length - 1] += p;
-    } else {
-      merged.push(p);
-    }
-  }
-
-  // Further split long paragraphs (> 150 chars) by sentences
-  const scenes: SceneData[] = [];
-  let sceneNum = 1;
-  for (const para of merged) {
-    if (para.length > 150) {
-      // Split by sentence boundaries
-      const sentences = para.match(/[^。！？]+[。！？]?/g) || [para];
-      let currentText = "";
-      for (const sent of sentences) {
-        currentText += sent;
-        if (currentText.length >= 60) {
-          scenes.push({
-            sceneNumber: sceneNum++,
-            title: currentText.slice(0, 10),
-            sceneType: "REAL_FOOTAGE",
-            voiceoverText: currentText.trim(),
-            visualDesc: currentText.slice(0, 80),
-            materialQuery: currentText.replace(/[，。！？、]/g, " ").slice(0, 30),
-            materialQueryEn: "",
-            sourceVideos: [],
-            scripts: [currentText.trim()],
-            wordCount: currentText.trim().length,
-            estimatedDuration: Math.round(estimateAudioDuration(currentText.trim())),
-          });
-          currentText = "";
-        }
-      }
-      if (currentText.trim()) {
-        scenes.push({
-          sceneNumber: sceneNum++,
-          title: currentText.slice(0, 10),
-          sceneType: "REAL_FOOTAGE",
-          voiceoverText: currentText.trim(),
-          visualDesc: currentText.slice(0, 80),
-          materialQuery: currentText.replace(/[，。！？、]/g, " ").slice(0, 30),
-          materialQueryEn: "",
-          sourceVideos: [],
-          scripts: [currentText.trim()],
-          wordCount: currentText.trim().length,
-          estimatedDuration: Math.round(estimateAudioDuration(currentText.trim())),
-        });
-      }
-    } else {
-      scenes.push({
-        sceneNumber: sceneNum++,
-        title: para.slice(0, 10),
-        sceneType: "REAL_FOOTAGE",
-        voiceoverText: para,
-        visualDesc: para.slice(0, 80),
-        materialQuery: para.replace(/[，。！？、]/g, " ").slice(0, 30),
-        materialQueryEn: "",
-        sourceVideos: [],
-        scripts: [para],
-        wordCount: para.length,
-        estimatedDuration: Math.round(estimateAudioDuration(para)),
-      });
-    }
-  }
-
-  console.log(`[quick-generate] Fallback split: ${scenes.length} scenes`);
-  return scenes;
-}
-
 // ──────────────────── Main handler ────────────────────
 
 export async function POST(
@@ -348,7 +248,7 @@ export async function POST(
       const errMsg = err instanceof Error ? err.message : String(err);
       console.warn("[quick-generate] AI generation failed:", errMsg);
       try {
-        scenes = fallbackSplit(rawText);
+        scenes = fallbackSplitScenes(rawText);
       } catch (fallbackErr) {
         console.error("[quick-generate] Fallback split also failed:", fallbackErr instanceof Error ? fallbackErr.message : fallbackErr);
         await prisma.project.update({

@@ -423,3 +423,57 @@ model MusicTrack {
 
   @@index([projectId])
 }
+
+// ==================== AI CACHE ====================
+
+model AICache {
+  id        String   @id @default(cuid())
+  cacheKey  String   @unique
+  operation String
+  result    String
+  createdAt DateTime @default(now())
+
+  @@index([cacheKey])
+  @@index([operation, createdAt])
+  @@index([createdAt])
+}
+
+// ==================== RENDER TASK QUEUE ====================
+// DB-backed async job queue — no Redis/BullMQ dependency.
+// Workers atomically claim PENDING tasks and process them inline.
+// Stale PROCESSING tasks (>30 min) are auto-reset on startup.
+
+model RenderTask {
+  id        String      @id @default(cuid())
+  projectId String
+  project   Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User        @relation(fields: [userId], references: [id])
+
+  status    TaskStatus  @default(PENDING)
+  priority  Int         @default(0)
+
+  // The RenderJob this task created (optional — set after job creation)
+  renderJobId String?
+  renderJob   RenderJob? @relation(fields: [renderJobId], references: [id])
+
+  config    String?     // JSON snapshot of render config
+  errorMessage String?
+
+  claimedAt   DateTime?
+  startedAt   DateTime?
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([status, priority, createdAt])
+  @@index([projectId])
+}
+
+enum TaskStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+}

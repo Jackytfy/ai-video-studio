@@ -9,6 +9,9 @@ const nextConfig: NextConfig = {
     ".prisma/client",
   ],
   experimental: {
+    // `bodySizeLimit` applies ONLY to Server Actions (useFormState etc.).
+    // It does NOT affect App Router Route Handlers — those must enforce
+    // their own Content-Length / stream-size checks (e.g. upload route).
     serverActions: {
       bodySizeLimit: "100mb",
     },

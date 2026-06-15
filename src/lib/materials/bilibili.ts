@@ -31,41 +31,66 @@ function parseDuration(dur: string): number {
 /**
  * Search Bilibili for videos matching a query.
  * Returns video metadata (no download URLs — use getVideoStream for that).
+ *
+ * Supports retry with exponential backoff and handles Bilibili rate-limit
+ * responses (HTML instead of JSON) gracefully.
  */
 export async function searchBilibiliVideos(
   query: string,
   count: number = 5
 ): Promise<BilibiliVideo[]> {
-  const url = `https://api.bilibili.com/x/web-interface/search/type?search_type=video&keyword=${encodeURIComponent(query)}&page=1&page_size=${count}&order=totalrank`;
+  if (!query) return [];
 
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      "Referer": "https://search.bilibili.com/",
-      "Origin": "https://search.bilibili.com",
-      "Accept": "application/json",
-      "Cookie": "buvid3=placeholder",
-    },
-    signal: AbortSignal.timeout(15000),
-  });
+  for (let attempt = 0; attempt <= 1; attempt++) {
+    try {
+      if (attempt > 0) {
+        await new Promise((r) => setTimeout(r, 800 + Math.random() * 1000));
+      }
 
-  if (!res.ok) throw new Error(`Bilibili search HTTP ${res.status}`);
+      const url = `https://api.bilibili.com/x/web-interface/search/type?search_type=video&keyword=${encodeURIComponent(query)}&page=1&page_size=${count}&order=totalrank`;
 
-  const data = await res.json();
-  if (data.code !== 0) throw new Error(`Bilibili API error: ${data.message}`);
+      const res = await fetch(url, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "Referer": "https://www.bilibili.com/",
+          "Origin": "https://www.bilibili.com",
+          "Accept": "application/json, text/plain, */*",
+          "Accept-Language": "zh-CN,zh;q=0.9",
+          "Cookie": "buvid3=infoc;",
+        },
+        signal: AbortSignal.timeout(10000),
+      });
 
-  const results = (data.data?.result || []).slice(0, count);
+      if (!res.ok) continue;
 
-  return results.map((item: any) => ({
-    bvid: item.bvid,
-    aid: item.aid,
-    title: stripHtml(item.title),
-    description: item.description || "",
-    pic: item.pic?.startsWith("//") ? `https:${item.pic}` : item.pic,
-    duration: item.duration || "0:00",
-    author: item.author || "",
-    play: item.play || 0,
-  }));
+      const text = await res.text();
+      try {
+        const data = JSON.parse(text);
+        if (data.code !== 0) continue;
+
+        const results = (data.data?.result || []).slice(0, count);
+
+        return results.map((item: any) => ({
+          bvid: item.bvid,
+          aid: item.aid,
+          title: stripHtml(item.title),
+          description: item.description || "",
+          pic: item.pic?.startsWith("//") ? `https:${item.pic}` : item.pic,
+          duration: item.duration || "0:00",
+          author: item.author || "",
+          play: item.play || 0,
+        }));
+      } catch {
+        // Bilibili rate-limited — returned HTML instead of JSON, retry
+        if (text.startsWith("<")) continue;
+        return [];
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return [];
 }
 
 /**

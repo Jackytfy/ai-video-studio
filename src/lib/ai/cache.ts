@@ -2,18 +2,12 @@ import { createHash } from "crypto";
 import { prisma } from "@/lib/db";
 
 /**
- * AI Response Cache - avoids duplicate LLM calls for the same input.
- * Uses SQLite via Prisma for persistence.
- * Cache key = hash(input + operation + config).
+ * AI Response Cache — avoids duplicate LLM calls for the same input.
+ * Backed by the `AICache` Prisma model (properly migrated via `prisma migrate`).
+ * No more `$queryRawUnsafe` or `CREATE TABLE IF NOT EXISTS` self-bootstrapping.
+ *
+ * Cache key = SHA256(operation + ...parts)[:32]
  */
-
-interface CacheEntry {
-  id: string;
-  cacheKey: string;
-  operation: string;
-  result: string;
-  createdAt: Date;
-}
 
 function makeCacheKey(operation: string, ...parts: string[]): string {
   const raw = [operation, ...parts].join("|");
@@ -31,32 +25,24 @@ export async function getCachedResult<T>(
   const cacheKey = makeCacheKey(operation, ...parts);
 
   try {
-    // Use raw query since we don't have a dedicated cache model
-    const rows = await prisma.$queryRawUnsafe<Array<{ id: string; cacheKey: string; result: string; createdAt: string }>>(
-      `SELECT id, cacheKey, result, createdAt FROM ai_cache WHERE cacheKey = ? LIMIT 1`,
-      cacheKey
-    );
+    const entry = await prisma.aICache.findUnique({ where: { cacheKey } });
+    if (!entry) return null;
 
-    if (rows.length === 0) return null;
-
-    const entry = rows[0];
-    const age = Date.now() - new Date(entry.createdAt).getTime();
-
+    const age = Date.now() - entry.createdAt.getTime();
     if (age > maxAgeMs) {
-      // Expired, delete
-      await prisma.$executeRawUnsafe(`DELETE FROM ai_cache WHERE id = ?`, entry.id);
+      await prisma.aICache.delete({ where: { id: entry.id } });
       return null;
     }
 
     return JSON.parse(entry.result) as T;
   } catch {
-    // Table might not exist yet
+    // AICache table might not exist yet (run `npx prisma db push`)
     return null;
   }
 }
 
 /**
- * Store an AI result in cache.
+ * Store an AI result in cache. Uses upsert to handle key conflicts.
  */
 export async function setCachedResult<T>(
   operation: string,
@@ -64,54 +50,45 @@ export async function setCachedResult<T>(
   result: T
 ): Promise<void> {
   const cacheKey = makeCacheKey(operation, ...parts);
+  const now = new Date();
 
   try {
-    await prisma.$executeRawUnsafe(
-      `INSERT OR REPLACE INTO ai_cache (id, cacheKey, operation, result, createdAt) VALUES (?, ?, ?, ?, ?)`,
-      cacheKey,
-      cacheKey,
-      operation,
-      JSON.stringify(result),
-      new Date().toISOString()
-    );
-  } catch {
-    // Table might not exist yet — try creating it
-    try {
-      await prisma.$executeRawUnsafe(`
-        CREATE TABLE IF NOT EXISTS ai_cache (
-          id TEXT PRIMARY KEY,
-          cacheKey TEXT UNIQUE NOT NULL,
-          operation TEXT NOT NULL,
-          result TEXT NOT NULL,
-          createdAt TEXT NOT NULL
-        )
-      `);
-      await prisma.$executeRawUnsafe(
-        `INSERT OR REPLACE INTO ai_cache (id, cacheKey, operation, result, createdAt) VALUES (?, ?, ?, ?, ?)`,
-        cacheKey,
+    await prisma.aICache.upsert({
+      where: { cacheKey },
+      create: {
         cacheKey,
         operation,
-        JSON.stringify(result),
-        new Date().toISOString()
-      );
-    } catch {
-      // Silently fail — caching is optional
-    }
+        result: JSON.stringify(result),
+        createdAt: now,
+      },
+      update: {
+        operation,
+        result: JSON.stringify(result),
+        createdAt: now,
+      },
+    });
+  } catch {
+    // Silently fail — caching is optional. Run `npx prisma db push` if the
+    // AICache table is missing.
   }
 }
 
 /**
- * Clear expired cache entries. Call periodically.
+ * Clear expired cache entries. Call periodically (e.g. cron job).
  */
-export async function clearExpiredCache(maxAgeMs: number = 7 * 24 * 60 * 60 * 1000): Promise<number> {
+export async function clearExpiredCache(
+  maxAgeMs: number = 7 * 24 * 60 * 60 * 1000
+): Promise<number> {
   try {
-    const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
-    const result = await prisma.$executeRawUnsafe(
-      `DELETE FROM ai_cache WHERE createdAt < ?`,
-      cutoff
-    );
-    return result;
+    const cutoff = new Date(Date.now() - maxAgeMs);
+    const { count } = await prisma.aICache.deleteMany({
+      where: { createdAt: { lt: cutoff } },
+    });
+    return count;
   } catch {
     return 0;
   }
 }
+
+// Export for direct Prisma access in migration scripts if needed
+export { prisma };

@@ -2,14 +2,30 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { requireSession, unauthorized } from "@/lib/auth/session";
 import { renderProjectInline } from "@/lib/render/pipeline";
+import { applyRateLimit, RENDER_LIMIT } from "@/lib/utils/rate-limit";
+import { transitionProject } from "@/lib/state-machine";
+import { submitRenderTask, getPendingTaskCount } from "@/lib/queue/task-runner";
 
+/**
+ * POST /api/projects/[id]/render
+ *
+ * Submits a render task to the DB-backed queue (async by default).
+ * The worker process picks it up and executes the full pipeline.
+ *
+ * Query param `?sync=true` uses the legacy inline render (for environments
+ * where no worker is running).
+ */
 export async function POST(
-  _req: Request,
+  req: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
     const session = await requireSession();
     if (!session) return unauthorized();
+
+    // Rate limit: max 10 renders per user per hour
+    const limitResponse = applyRateLimit(req, session.user.id, RENDER_LIMIT);
+    if (limitResponse) return limitResponse;
 
     const { id } = await params;
     const project = await prisma.project.findFirst({
@@ -28,30 +44,11 @@ export async function POST(
       );
     }
 
-    // Atomic claim: only one request can transition a project into RENDERING.
-    // The previous read-then-write check had a TOCTOU race: two parallel
-    // requests could both observe status != RENDERING and both kick off a
-    // render, producing duplicate RenderJob rows and corrupted output files.
-    //
-    // `updateMany` returns `{ count }` — if 0, someone else won the race.
-    const claim = await prisma.project.updateMany({
-      where: {
-        id,
-        // Only allow the transition from these source states. RENDERING is
-        // intentionally excluded so a second concurrent request is rejected.
-        status: { in: ["STORYBOARD_READY", "COMPLETED", "FAILED", "DRAFT"] },
-      },
-      data: { status: "RENDERING" },
-    });
+    // Use the centralized state machine for an atomic, TOCTOU-safe transition.
+    const transition = await transitionProject(id, session.user.id, "RENDERING");
 
-    if (claim.count === 0) {
-      // The project is either already rendering, or in a state we don't
-      // accept transitions from. Re-read to give a precise error.
-      const fresh = await prisma.project.findUnique({
-        where: { id },
-        select: { status: true },
-      });
-      const status = fresh?.status ?? "UNKNOWN";
+    if (!transition.success) {
+      const status = transition.from ?? "UNKNOWN";
       if (status === "RENDERING") {
         return NextResponse.json(
           { error: "项目正在渲染中，请稍候" },
@@ -64,16 +61,32 @@ export async function POST(
       );
     }
 
-    // Inline render - no Redis needed. If this throws, the project will be
-    // stuck in RENDERING — pipeline.ts sets FAILED itself, but if it crashes
-    // before that, a future request will be rejected by the gate above. The
-    // caller can then use the "reset failed project" admin action.
-    const result = await renderProjectInline(id, session.user.id);
+    // Check if caller explicitly wants sync (legacy inline mode)
+    const url = new URL(req.url);
+    const sync = url.searchParams.get("sync") === "true";
+
+    if (sync) {
+      // Legacy inline render — blocks until complete
+      const result = await renderProjectInline(id, session.user.id);
+      return NextResponse.json({
+        mode: "sync",
+        success: true,
+        outputUrl: result.outputUrl,
+        duration: result.duration,
+      });
+    }
+
+    // Async mode — submit to DB task queue, return immediately.
+    // A worker process picks up the task and executes the pipeline.
+    const { taskId } = await submitRenderTask(id, session.user.id);
+    const pendingCount = await getPendingTaskCount();
 
     return NextResponse.json({
+      mode: "async",
       success: true,
-      outputUrl: result.outputUrl,
-      duration: result.duration,
+      taskId,
+      message: "渲染任务已提交，将通过 SSE 推送进度",
+      queueSize: pendingCount,
     });
   } catch (error) {
     console.error("Render error:", error);

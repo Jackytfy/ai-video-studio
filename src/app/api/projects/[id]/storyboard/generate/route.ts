@@ -31,12 +31,19 @@ export async function POST(
       return NextResponse.json({ error: "项目不存在" }, { status: 404 });
     }
 
-    // Auto-calculate scene count based on text length if not provided
-    // Target ~60-80 Chinese characters per scene for detailed storyboards
+    // Auto-calculate scene count based on text length if not provided.
+    // CHARS_PER_SCENE controls how many Chinese characters map to one scene.
+    // Lower = more scenes = shorter per scene (better for fast-paced content).
+    // Higher = fewer scenes = longer per scene (better for documentary/narrative).
+    // Default 80 chars/scene — increases from the old 70 to reduce pipeline latency
+    // (fewer scenes = fewer B站 searches + downloads + renders).
+    const CHARS_PER_SCENE = 80;
+    const MIN_SCENES = 3;
+    const MAX_SCENES = 30;
     const chineseChars = (project.sourceText.match(/[\u4e00-\u9fff]/g) || []).length;
-    const autoSceneCount = Math.max(5, Math.min(30, Math.round(chineseChars / 70)));
+    const autoSceneCount = Math.max(MIN_SCENES, Math.min(MAX_SCENES, Math.round(chineseChars / CHARS_PER_SCENE)));
     const sceneCount = parsed.sceneCount || autoSceneCount;
-    console.log(`[Storyboard] Text has ${chineseChars} chars, auto sceneCount=${autoSceneCount}, using=${sceneCount}`);
+    console.log(`[Storyboard] Text has ${chineseChars} chars, divisor=${CHARS_PER_SCENE}, auto=${autoSceneCount}, using=${sceneCount}`);
 
     await prisma.project.update({
       where: { id },

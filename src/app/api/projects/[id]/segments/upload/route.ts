@@ -6,6 +6,7 @@ import { join } from "path";
 import { randomUUID } from "crypto";
 import { execFile } from "child_process";
 import { promisify } from "util";
+import { applyRateLimit, UPLOAD_LIMIT } from "@/lib/utils/rate-limit";
 
 const execFileAsync = promisify(execFile);
 
@@ -25,6 +26,10 @@ export async function POST(
   if (!session?.user?.id) {
     return unauthorized();
   }
+
+  // Rate limit: max 20 uploads per user per hour
+  const limitResponse = applyRateLimit(req, session.user.id, UPLOAD_LIMIT);
+  if (limitResponse) return limitResponse;
 
   const { id: projectId } = await params;
 
