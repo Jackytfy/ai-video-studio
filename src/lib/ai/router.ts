@@ -3,6 +3,7 @@ import { OpenAIProvider } from "./openai";
 import { AIProvider, AIProviderName, AnalysisResult, StoryboardResult, AIStreamOptions } from "./types";
 import { getCachedResult, setCachedResult } from "./cache";
 import { CHAT_SYSTEM_PROMPT } from "./prompts/system";
+import { decryptSecret } from "@/lib/utils/crypto";
 
 export interface ProviderConfig {
   provider: string;
@@ -146,13 +147,16 @@ export function buildProviderConfig(user: {
 }): ProviderConfig {
   let provider = user.aiProvider || "claude";
 
+  // API keys are stored encrypted in the DB; decrypt before handing off to the SDK.
+  const decryptedKey = decryptSecret(user.aiApiKey) || undefined;
+
   // Auto-fallback when no API key available for the selected provider
-  if (!user.aiApiKey) {
+  if (!decryptedKey) {
     if (provider === "claude" && !process.env.ANTHROPIC_API_KEY) {
       if (process.env.MIMO_API_KEY) {
         return {
           provider: "openai",
-          model: "mimo-v2.5-pro",
+          model: "mimo-v2.5",
           baseUrl: "https://token-plan-cn.xiaomimimo.com/v1",
           apiKey: "unused",
           defaultHeaders: { "api-key": process.env.MIMO_API_KEY },
@@ -169,7 +173,7 @@ export function buildProviderConfig(user: {
       if (isMiMo && process.env.MIMO_API_KEY) {
         return {
           provider: "openai",
-          model: user.aiModel || "mimo-v2.5-pro",
+          model: user.aiModel || "mimo-v2.5",
           baseUrl: user.aiBaseUrl || "https://token-plan-cn.xiaomimimo.com/v1",
           apiKey: "unused",
           defaultHeaders: { "api-key": process.env.MIMO_API_KEY },
@@ -178,7 +182,7 @@ export function buildProviderConfig(user: {
       if (process.env.MIMO_API_KEY) {
         return {
           provider: "openai",
-          model: "mimo-v2.5-pro",
+          model: "mimo-v2.5",
           baseUrl: "https://token-plan-cn.xiaomimimo.com/v1",
           apiKey: "unused",
           defaultHeaders: { "api-key": process.env.MIMO_API_KEY },
@@ -194,7 +198,7 @@ export function buildProviderConfig(user: {
     provider,
     model: user.aiModel || undefined,
     baseUrl: user.aiBaseUrl || undefined,
-    apiKey: user.aiApiKey || undefined,
+    apiKey: decryptedKey,
   };
 }
 
@@ -212,7 +216,7 @@ export function buildFallbackChain(
   if (!seen.has("openai") && process.env.MIMO_API_KEY) {
     chain.push({
       provider: "openai",
-      model: "mimo-v2.5-pro",
+      model: "mimo-v2.5",
       baseUrl: "https://token-plan-cn.xiaomimimo.com/v1",
       apiKey: "unused",
       defaultHeaders: { "api-key": process.env.MIMO_API_KEY },

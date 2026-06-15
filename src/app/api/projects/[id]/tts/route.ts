@@ -5,6 +5,8 @@ import { requireSession, unauthorized } from "@/lib/auth/session";
 import { generateTTS } from "@/lib/tts/edge-tts";
 import { generateMiMoTTS } from "@/lib/tts/mimo-tts";
 import { uploadBuffer } from "@/lib/storage/s3";
+import { estimateAudioDuration } from "@/lib/render/subtitle";
+import { decryptSecret } from "@/lib/utils/crypto";
 
 const ttsSchema = z.object({
   sceneId: z.string(),
@@ -70,7 +72,7 @@ export async function POST(
       ttsVoice: user?.ttsVoice,
       aiProvider: user?.aiProvider,
       aiBaseUrl: user?.aiBaseUrl ?? undefined,
-      aiApiKey: user?.aiApiKey ?? undefined,
+      aiApiKey: decryptSecret(user?.aiApiKey) ?? undefined,
     });
     const contentType = user?.ttsProvider === "mimo" ? "audio/wav" : "audio/mpeg";
     const { url } = await uploadBuffer(audioBuffer, contentType, "tts");
@@ -79,11 +81,11 @@ export async function POST(
       where: { id: sceneId },
       data: {
         audioUrl: url,
-        audioDuration: scene.voiceoverText.length / 4,
+        audioDuration: estimateAudioDuration(scene.voiceoverText),
       },
     });
 
-    return NextResponse.json({ audioUrl: url, duration: scene.voiceoverText.length / 4 });
+    return NextResponse.json({ audioUrl: url, duration: estimateAudioDuration(scene.voiceoverText) });
   } catch (error) {
     if (error instanceof z.ZodError) {
       return NextResponse.json({ error: "参数错误" }, { status: 400 });

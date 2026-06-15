@@ -28,23 +28,46 @@ export async function POST(
       );
     }
 
-    // Allow re-render if project was previously failed
-    if (project.status === "RENDERING") {
+    // Atomic claim: only one request can transition a project into RENDERING.
+    // The previous read-then-write check had a TOCTOU race: two parallel
+    // requests could both observe status != RENDERING and both kick off a
+    // render, producing duplicate RenderJob rows and corrupted output files.
+    //
+    // `updateMany` returns `{ count }` — if 0, someone else won the race.
+    const claim = await prisma.project.updateMany({
+      where: {
+        id,
+        // Only allow the transition from these source states. RENDERING is
+        // intentionally excluded so a second concurrent request is rejected.
+        status: { in: ["STORYBOARD_READY", "COMPLETED", "FAILED", "DRAFT"] },
+      },
+      data: { status: "RENDERING" },
+    });
+
+    if (claim.count === 0) {
+      // The project is either already rendering, or in a state we don't
+      // accept transitions from. Re-read to give a precise error.
+      const fresh = await prisma.project.findUnique({
+        where: { id },
+        select: { status: true },
+      });
+      const status = fresh?.status ?? "UNKNOWN";
+      if (status === "RENDERING") {
+        return NextResponse.json(
+          { error: "项目正在渲染中，请稍候" },
+          { status: 409 }
+        );
+      }
       return NextResponse.json(
-        { error: "项目正在渲染中，请稍候" },
+        { error: `当前项目状态(${status})不允许渲染` },
         { status: 409 }
       );
     }
 
-    // Reset project status if previously failed
-    if (project.status === "FAILED") {
-      await prisma.project.update({
-        where: { id },
-        data: { status: "STORYBOARD_READY" },
-      });
-    }
-
-    // Inline render - no Redis needed
+    // Inline render - no Redis needed. If this throws, the project will be
+    // stuck in RENDERING — pipeline.ts sets FAILED itself, but if it crashes
+    // before that, a future request will be rejected by the gate above. The
+    // caller can then use the "reset failed project" admin action.
     const result = await renderProjectInline(id, session.user.id);
 
     return NextResponse.json({

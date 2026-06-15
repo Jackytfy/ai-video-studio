@@ -9,6 +9,14 @@ import { promisify } from "util";
 
 const execFileAsync = promisify(execFile);
 
+// Hard cap for user-supplied video uploads. `next.config.ts` only enforces
+// this on Server Actions — for App Router POST handlers Next streams the
+// body straight to `req.formData()` with no built-in cap, so a 4 GB file
+// would end up fully in memory (Buffer.from(file.arrayBuffer())) before
+// we ever saw a chance to reject it. 200 MB matches what 1080p hand-shot
+// video typically tops out at after our editor's transcode step.
+const MAX_UPLOAD_BYTES = 200 * 1024 * 1024;
+
 export async function POST(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -27,6 +35,19 @@ export async function POST(
     return NextResponse.json({ error: "项目不存在" }, { status: 404 });
   }
 
+  // Reject oversized requests before reading the body. Browsers and the
+  // `fetch` API always send a Content-Length, so this is the cheap path.
+  // Chunked / missing-length uploads (curl --data-binary, some proxies)
+  // are caught by the post-parse size check below — we still let them
+  // through the Content-Length gate to avoid breaking legitimate clients.
+  const contentLength = req.headers.get("content-length");
+  if (contentLength && Number(contentLength) > MAX_UPLOAD_BYTES) {
+    return NextResponse.json(
+      { error: `视频文件超过 ${MAX_UPLOAD_BYTES / 1024 / 1024}MB 限制` },
+      { status: 413 },
+    );
+  }
+
   try {
     const formData = await req.formData();
     const file = formData.get("video") as File;
@@ -34,6 +55,13 @@ export async function POST(
 
     if (!file) {
       return NextResponse.json({ error: "未提供视频文件" }, { status: 400 });
+    }
+
+    if (file.size > MAX_UPLOAD_BYTES) {
+      return NextResponse.json(
+        { error: `视频文件超过 ${MAX_UPLOAD_BYTES / 1024 / 1024}MB 限制` },
+        { status: 413 },
+      );
     }
 
     // Save file to disk

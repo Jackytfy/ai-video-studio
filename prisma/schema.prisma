@@ -192,6 +192,9 @@ model Scene {
   thumbnailUrl  String?
   renderedUrl   String?
 
+  // Non-fatal issues encountered during render (e.g. TTS fell back to silence)
+  renderWarning String?
+
   transition TransitionType @default(CROSS_DISSOLVE)
 
   createdAt DateTime @default(now())

@@ -13,6 +13,7 @@ import { MusicSelector } from "@/components/editor/MusicSelector";
 import { AutoMatchPanel } from "@/components/editor/AutoMatchPanel";
 import { SubtitleOverlay, type SubtitleChunk } from "@/components/editor/SubtitleOverlay";
 import { WatermarkOverlay, detectWatermarkRegions } from "@/components/editor/WatermarkOverlay";
+import { estimateAudioDuration } from "@/lib/render/subtitle";
 import {
   Plus,
   Wand2,
@@ -145,13 +146,6 @@ export default function VideoEditorPage() {
     }
     return chunks;
   }, [storyboard]);
-
-  function estimateAudioDuration(text: string): number {
-    if (!text) return 1;
-    const chineseChars = (text.match(/[\u4e00-\u9fff]/g) || []).length;
-    const nonChinese = text.replace(/[\u4e00-\u9fff]/g, "").replace(/[，。！？、；：,;!?\s\n"'「」『』【】（）()\[\]·《》—\-—]/g, "").length;
-    return Math.max(1, chineseChars / 3.5 + nonChinese / 5);
-  }
 
   // Calculate total duration
   const totalDuration = segments.reduce((sum, seg) => {

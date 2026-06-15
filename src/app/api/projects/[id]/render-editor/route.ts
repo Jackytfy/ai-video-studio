@@ -37,6 +37,11 @@ export async function POST(
     return NextResponse.json({ error: "没有视频片段" }, { status: 400 });
   }
 
+  // Declared outside the `try` so the unconditional `finally` cleanup can
+  // always see it — even on the very first failure, before we created the
+  // dir (the `rm` is no-op-safe via `force: true`).
+  const workDir = join(tmpdir(), `editor-render-${projectId}-${randomUUID()}`);
+
   try {
     // Update project status
     await prisma.project.update({
@@ -44,7 +49,11 @@ export async function POST(
       data: { status: "RENDERING" },
     });
 
-    const workDir = join(tmpdir(), `editor-render-${projectId}`);
+    // Append a random suffix so two concurrent editor-renders of the same
+    // project cannot clobber each other's intermediate segments. Cleanup
+    // runs unconditionally via `finally` below — the previous implementation
+    // only cleaned up on the success path, so a render that threw or timed
+    // out leaked the entire tmpdir full of segment files.
     await mkdir(workDir, { recursive: true });
 
     // Determine output dimensions based on first segment
@@ -254,9 +263,6 @@ export async function POST(
       },
     });
 
-    // Cleanup
-    await rm(workDir, { recursive: true, force: true }).catch(() => {});
-
     return NextResponse.json({
       success: true,
       outputUrl: `/api/uploads/${projectId}/output/${outputFileName}`,
@@ -273,6 +279,12 @@ export async function POST(
     });
 
     return NextResponse.json({ error: "渲染失败" }, { status: 500 });
+  } finally {
+    // Always clean up the scratch dir, regardless of success / failure /
+    // timeout. Best-effort: a leftover tmpdir from a Node crash will be
+    // picked up by the next process start's tmp-cleanup pass (or, on most
+    // OSes, by tmpfs reaping on reboot).
+    await rm(workDir, { recursive: true, force: true }).catch(() => {});
   }
 }
 

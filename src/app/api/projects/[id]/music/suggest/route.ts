@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { requireSession, unauthorized } from "@/lib/auth/session";
 import { prisma } from "@/lib/db";
 import { generateAI } from "@/lib/ai/router";
+import { decryptSecret } from "@/lib/utils/crypto";
 
 export async function POST(
   req: NextRequest,
@@ -49,7 +50,7 @@ ${script}
       provider: (user?.aiProvider as any) || "claude",
       model: user?.aiModel,
       baseUrl: user?.aiBaseUrl || undefined,
-      apiKey: user?.aiApiKey || undefined,
+      apiKey: decryptSecret(user?.aiApiKey) || undefined,
       messages: [{ role: "user", content: prompt }],
       maxTokens: 1000,
     });

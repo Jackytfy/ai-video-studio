@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireSession, unauthorized } from "@/lib/auth/session";
 import { prisma } from "@/lib/db";
+import { estimateAudioDuration } from "@/lib/render/subtitle";
 
 interface MatchResult {
   sceneId: string;
@@ -63,7 +64,7 @@ export async function POST(
           visualDesc: match.suggestedMaterial,
           materialQuery: match.keywords.join(" "),
           wordCount: match.voiceoverText.length,
-          estimatedDuration: match.voiceoverText.length / 4,
+          estimatedDuration: estimateAudioDuration(match.voiceoverText),
           transition: "CROSS_DISSOLVE",
         },
       });
@@ -79,7 +80,7 @@ export async function POST(
           0
         ),
         totalDuration: matches.reduce(
-          (sum, m) => sum + m.voiceoverText.length / 4,
+          (sum, m) => sum + estimateAudioDuration(m.voiceoverText),
           0
         ),
       },

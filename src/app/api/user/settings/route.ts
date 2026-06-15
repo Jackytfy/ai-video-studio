@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { prisma } from "@/lib/db";
 import { requireSession, unauthorized } from "@/lib/auth/session";
+import { encryptSecret, maskSecret } from "@/lib/utils/crypto";
 
 const updateSettingsSchema = z.object({
   name: z.string().optional(),
@@ -33,7 +34,14 @@ export async function GET() {
       },
     });
 
-    return NextResponse.json(user);
+    if (!user) return unauthorized();
+
+    // SECURITY: never return plaintext API keys — return a short mask only.
+    return NextResponse.json({
+      ...user,
+      aiApiKey: maskSecret(user.aiApiKey),
+      aiApiKeyConfigured: Boolean(user.aiApiKey),
+    });
   } catch (error) {
     console.error("Settings GET error:", error);
     return NextResponse.json({ error: "获取设置失败" }, { status: 500 });
@@ -48,15 +56,21 @@ export async function PATCH(req: Request) {
     const body = await req.json();
     const data = updateSettingsSchema.parse(body);
 
-    const normalized = {
-      ...data,
-      aiBaseUrl: data.aiBaseUrl || null,
-      aiApiKey: data.aiApiKey || null,
-    };
+    // Encrypt the API key before persisting. Empty string → null.
+    const encryptedKey =
+      data.aiApiKey === undefined
+        ? undefined
+        : data.aiApiKey == null || data.aiApiKey === ""
+          ? null
+          : encryptSecret(data.aiApiKey);
 
     const user = await prisma.user.update({
       where: { id: session.user.id },
-      data: normalized,
+      data: {
+        ...data,
+        aiBaseUrl: data.aiBaseUrl || null,
+        aiApiKey: encryptedKey,
+      },
       select: {
         id: true,
         name: true,
@@ -70,7 +84,11 @@ export async function PATCH(req: Request) {
       },
     });
 
-    return NextResponse.json(user);
+    return NextResponse.json({
+      ...user,
+      aiApiKey: maskSecret(user.aiApiKey),
+      aiApiKeyConfigured: Boolean(user.aiApiKey),
+    });
   } catch (error) {
     if (error instanceof z.ZodError) {
       return NextResponse.json({ error: "参数错误" }, { status: 400 });

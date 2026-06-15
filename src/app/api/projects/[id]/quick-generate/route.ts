@@ -1,9 +1,8 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { requireSession, unauthorized } from "@/lib/auth/session";
-import { generateAI, buildProviderConfig } from "@/lib/ai/router";
-
-const CHARS_PER_SECOND = 3.5;
+import { generateAI, buildProviderConfig, type ProviderConfig } from "@/lib/ai/router";
+import { estimateAudioDuration } from "@/lib/render/subtitle";
 
 interface SceneData {
   sceneNumber: number;
@@ -26,6 +25,7 @@ interface SceneData {
 async function generateDetailedStoryboard(
   rawText: string,
   plan: "A" | "B",
+  aiConfig: ProviderConfig,
   materialRequirements?: {
     contentSummary?: string;
     referenceStyle?: string;
@@ -150,11 +150,10 @@ ${planDescription}
   "estimatedDuration": 180
 }`;
 
-  const aiConfig = buildProviderConfig({
-    aiProvider: "claude",
-    aiModel: "mimo-v2.5-pro",
-  });
-
+  // aiConfig is injected by the caller (route handler) so we respect the
+  // user's own provider/model/key. We must not hardcode a model here —
+  // doing so silently overrode the user's settings for every quick-generate
+  // request and broke users on OpenAI / custom providers.
   const result = await generateAI({
     provider: aiConfig.provider,
     model: aiConfig.model,
@@ -192,7 +191,7 @@ ${planDescription}
     sourceVideos: s.sourceVideos || [],
     scripts: s.scripts || [],
     wordCount: (s.voiceoverText || "").length,
-    estimatedDuration: Math.round((s.voiceoverText || "").length / CHARS_PER_SECOND),
+    estimatedDuration: Math.round(estimateAudioDuration(s.voiceoverText || "")),
   }));
 }
 
@@ -242,7 +241,7 @@ function fallbackSplit(rawText: string): SceneData[] {
             sourceVideos: [],
             scripts: [currentText.trim()],
             wordCount: currentText.trim().length,
-            estimatedDuration: Math.round(currentText.trim().length / CHARS_PER_SECOND),
+            estimatedDuration: Math.round(estimateAudioDuration(currentText.trim())),
           });
           currentText = "";
         }
@@ -259,7 +258,7 @@ function fallbackSplit(rawText: string): SceneData[] {
           sourceVideos: [],
           scripts: [currentText.trim()],
           wordCount: currentText.trim().length,
-          estimatedDuration: Math.round(currentText.trim().length / CHARS_PER_SECOND),
+          estimatedDuration: Math.round(estimateAudioDuration(currentText.trim())),
         });
       }
     } else {
@@ -274,7 +273,7 @@ function fallbackSplit(rawText: string): SceneData[] {
         sourceVideos: [],
         scripts: [para],
         wordCount: para.length,
-        estimatedDuration: Math.round(para.length / CHARS_PER_SECOND),
+        estimatedDuration: Math.round(estimateAudioDuration(para)),
       });
     }
   }
@@ -308,6 +307,13 @@ export async function POST(
     });
 
     const rawText = project.sourceText;
+    if (!rawText || rawText.trim().length === 0) {
+      await prisma.project.update({
+        where: { id },
+        data: { status: "FAILED" },
+      }).catch(() => {});
+      return NextResponse.json({ error: "文稿内容为空，请先输入视频脚本" }, { status: 400 });
+    }
 
     // Parse material requirements from project
     let materialReqs: any = null;
@@ -318,16 +324,52 @@ export async function POST(
     // ----- Step 1: Generate detailed storyboard via AI -----
     let scenes: SceneData[];
     let usedAI = false;
+
+    // Resolve the user's own AI provider/model/key. We previously hardcoded
+    // claude + mimo-v2.5 here, which silently ignored user settings and
+    // routed every request through a single provider. `buildProviderConfig`
+    // already handles decryption and the env-key fallback chain, so we just
+    // hand it whatever is in the user row.
+    const userRow = await prisma.user.findUnique({
+      where: { id: session.user.id },
+      select: { aiProvider: true, aiModel: true, aiBaseUrl: true, aiApiKey: true },
+    });
+    const aiConfig = buildProviderConfig({
+      aiProvider: userRow?.aiProvider || undefined,
+      aiModel: userRow?.aiModel || undefined,
+      aiBaseUrl: userRow?.aiBaseUrl || undefined,
+      aiApiKey: userRow?.aiApiKey || undefined,
+    });
+
     try {
-      scenes = await generateDetailedStoryboard(rawText, "A", materialReqs);
+      scenes = await generateDetailedStoryboard(rawText, "A", aiConfig, materialReqs);
       usedAI = true;
     } catch (err) {
-      console.warn("[quick-generate] AI generation failed, using fallback:", err);
-      scenes = fallbackSplit(rawText);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.warn("[quick-generate] AI generation failed:", errMsg);
+      try {
+        scenes = fallbackSplit(rawText);
+      } catch (fallbackErr) {
+        console.error("[quick-generate] Fallback split also failed:", fallbackErr instanceof Error ? fallbackErr.message : fallbackErr);
+        await prisma.project.update({
+          where: { id },
+          data: { status: "FAILED" },
+        }).catch(() => {});
+        return NextResponse.json({ error: "分镜生成失败，请检查文稿内容" }, { status: 500 });
+      }
     }
 
-    const totalChars = scenes.reduce((sum, s) => sum + s.wordCount, 0);
-    const totalDuration = Math.round(totalChars / CHARS_PER_SECOND);
+    const totalDuration = Math.round(
+      scenes.reduce((sum, s) => sum + estimateAudioDuration(s.voiceoverText || ""), 0)
+    );
+
+    if (scenes.length === 0) {
+      await prisma.project.update({
+        where: { id },
+        data: { status: "FAILED" },
+      }).catch(() => {});
+      return NextResponse.json({ error: "未能生成有效场景，请调整文稿内容后重试" }, { status: 400 });
+    }
 
     // Build productionMeta for each scene (used by render pipeline)
     const sceneCreates = scenes.map((s) => ({

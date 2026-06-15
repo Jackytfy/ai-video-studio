@@ -1,5 +1,5 @@
+import { spawn, execFile } from "child_process";
 import { prisma } from "@/lib/db";
-import { execFile, exec } from "child_process";
 import { promisify } from "util";
 import { readFile, writeFile, unlink, mkdir, rm } from "fs/promises";
 import { createWriteStream } from "fs";
@@ -7,6 +7,7 @@ import { join } from "path";
 import { probeDimensions, detectWatermarkRegions } from "@/lib/materials/watermark";
 import { randomUUID } from "crypto";
 import { tmpdir } from "os";
+import { decryptSecret } from "@/lib/utils/crypto";
 import {
   generateSubtitleChunks,
   buildSubtitleFilterChain,
@@ -17,7 +18,43 @@ import { mapConcurrent } from "@/lib/utils/concurrent";
 import { withRetry, isFFmpegRetryableError, isNetworkError } from "@/lib/utils/retry";
 
 const execFileAsync = promisify(execFile);
-const execAsync = promisify(exec);
+
+/**
+ * Run edge_tts via spawn with array args (NO shell, NO string interpolation).
+ * Prevents command injection from untrusted voiceoverText.
+ */
+function runEdgeTTS(
+  pythonCmd: string,
+  text: string,
+  voice: string,
+  outputFile: string,
+  timeoutMs: number
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      pythonCmd,
+      ["-m", "edge_tts", "--voice", voice, "--rate", "+0%", "--text", text, "--write-media", outputFile],
+      { stdio: ["ignore", "ignore", "pipe"], windowsHide: true }
+    );
+
+    let stderrBuf = "";
+    child.stderr?.on("data", (b) => (stderrBuf += b.toString()));
+
+    const killTimer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch {}
+    }, timeoutMs);
+
+    child.on("error", (err) => {
+      clearTimeout(killTimer);
+      reject(err);
+    });
+    child.on("close", (code) => {
+      clearTimeout(killTimer);
+      if (code === 0) resolve();
+      else reject(new Error(`edge_tts exited ${code}: ${stderrBuf.slice(0, 500)}`));
+    });
+  });
+}
 
 /**
  * Determine if a scene is suitable for MG (Motion Graphics) animation display.
@@ -368,33 +405,42 @@ function buildMGTableDrawText(
   return filters.join(",");
 }
 
-/** Try multiple Python paths for edge_tts, using shell for PATH resolution */
-async function generateTTS(text: string, voice: string, outputFile: string): Promise<boolean> {
+/** Result of a TTS attempt — non-fatal errors are reported as `ok:false` with a reason. */
+interface TtsResult {
+  ok: boolean;
+  reason?: string;
+}
+
+/**
+ * Try multiple Python paths for edge_tts. The actual subprocess is run via
+ * `runEdgeTTS` (spawn with array args), so the user-controlled `text` is
+ * never interpolated into a shell command — this is the fix for the
+ * command-injection issue.
+ *
+ * Returns `{ ok: true }` only when the output file exists and is non-empty.
+ * Otherwise returns `{ ok: false, reason }` so the caller can fall back to
+ * a silent-track without aborting the whole render.
+ */
+async function generateTTS(text: string, voice: string, outputFile: string): Promise<TtsResult> {
   const pythonPaths = ["python", "python3"];
+  const errors: string[] = [];
+
   for (const py of pythonPaths) {
     try {
-      await execAsync(
-        `${py} -m edge_tts --voice "${voice}" --rate "+0%" --text "${text.replace(/"/g, '\\"')}" --write-media "${outputFile}"`,
-        { timeout: 60000, maxBuffer: 1024 * 1024 }
-      );
-      // Verify file was created and has content
+      await runEdgeTTS(py, text, voice, outputFile, 60000);
       try {
         const stat = await import("fs/promises").then(m => m.stat(outputFile));
-        if (stat.size > 100) return true;
-      } catch {}
-    } catch {
+        if (stat.size > 100) return { ok: true };
+        errors.push(`${py}: file too small (${stat.size}B)`);
+      } catch (statErr: any) {
+        errors.push(`${py}: ${statErr?.message || "no output file"}`);
+      }
+    } catch (err: any) {
+      errors.push(`${py}: ${err?.message?.slice(0, 120) || "unknown"}`);
       continue;
     }
   }
-  // Fallback: try with spawn + shell as last resort
-  try {
-    await execAsync(
-      `python -m edge_tts --voice "${voice}" --rate "+0%" --text "${text.replace(/"/g, '\\"')}" --write-media "${outputFile}"`,
-      { timeout: 60000, shell: "powershell.exe", maxBuffer: 1024 * 1024 }
-    );
-    try { const stat = await import("fs/promises").then(m => m.stat(outputFile)); if (stat.size > 100) return true; } catch {}
-  } catch {}
-  return false;
+  return { ok: false, reason: errors.join(" | ") || "edge_tts produced no audio" };
 }
 
 async function getAudioDuration(filePath: string): Promise<number> {
@@ -470,7 +516,11 @@ export async function renderProjectInline(
       data: { status: "RENDERING" },
     });
 
-    const workDir = join(tmpdir(), `render-${projectId}`);
+    // Append a random suffix so simultaneous renders of the same project
+    // (e.g. a retry triggered while a previous run is still cleaning up,
+    // or multiple worker replicas) cannot clobber each other's working
+    // files. The directory is still scoped to the project for debuggability.
+    const workDir = join(tmpdir(), `render-${projectId}-${randomUUID()}`);
     await mkdir(workDir, { recursive: true });
 
     // TTS stage
@@ -485,6 +535,9 @@ export async function renderProjectInline(
 
     // TTS with concurrency (5 parallel TTS calls for speed)
     const TTS_CONCURRENCY = 5;
+    // Collect non-fatal warnings so we can persist them on RenderJob.errorMessage
+    // and the affected Scene.renderWarning. We do NOT abort the whole render.
+    const ttsWarnings: string[] = [];
     const ttsResults = await mapConcurrent(scenes, TTS_CONCURRENCY, async (scene, i) => {
       const audioFile = join(workDir, `tts-${i}.mp3`);
 
@@ -506,7 +559,11 @@ export async function renderProjectInline(
       if (isMiMo) {
         // MiMo TTS
         const mimoVoice = user?.ttsVoice || "冰糖";
-        const mimoApiKey = user?.aiApiKey || process.env.MIMO_API_KEY || "";
+        // The stored value may be encrypted; fall back to env if decryption fails.
+        const mimoApiKey =
+          decryptSecret(user?.aiApiKey) ||
+          process.env.MIMO_API_KEY ||
+          "";
         const mimoBaseUrl = user?.aiBaseUrl || "https://token-plan-cn.xiaomimimo.com/v1";
         const res = await fetch(`${mimoBaseUrl}/chat/completions`, {
           method: "POST",
@@ -527,7 +584,15 @@ export async function renderProjectInline(
           }
         }
         if (!mimoOk) {
-          console.warn(`[Render] MiMo TTS failed for scene ${i}, using silent audio (${estimatedDuration.toFixed(1)}s)`);
+          const warnMsg = `MiMo TTS failed for scene ${i} — using silent audio (${estimatedDuration.toFixed(1)}s)`;
+          console.warn(`[Render] ${warnMsg}`);
+          ttsWarnings.push(`Scene #${scene.sceneNumber}: ${warnMsg}`);
+          try {
+            await prisma.scene.update({
+              where: { id: scene.id },
+              data: { renderWarning: "TTS generation failed — silent audio inserted as fallback" },
+            }).catch(() => {});
+          } catch {}
           try {
             await execFileAsync("ffmpeg", [
               "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
@@ -557,9 +622,17 @@ export async function renderProjectInline(
         }
       } else {
         // Edge TTS with shell-based Python detection
-        const ttsOk = await generateTTS(scene.voiceoverText, edgeVoice, audioFile);
-        if (!ttsOk) {
-          console.warn(`[Render] TTS failed for scene ${i}, using silent audio (${estimatedDuration.toFixed(1)}s)`);
+        const ttsResult = await generateTTS(scene.voiceoverText, edgeVoice, audioFile);
+        if (!ttsResult.ok) {
+          const warnMsg = `Edge TTS failed for scene ${i} — using silent audio (${estimatedDuration.toFixed(1)}s). Reason: ${ttsResult.reason}`;
+          console.warn(`[Render] ${warnMsg}`);
+          ttsWarnings.push(`Scene #${scene.sceneNumber}: ${warnMsg}`);
+          try {
+            await prisma.scene.update({
+              where: { id: scene.id },
+              data: { renderWarning: "TTS generation failed — silent audio inserted as fallback" },
+            }).catch(() => {});
+          } catch {}
           try {
             await execFileAsync("ffmpeg", [
               "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
@@ -631,6 +704,19 @@ export async function renderProjectInline(
     const ttsDurationMap = new Map<number, number>();
     for (const result of ttsResults) {
       if (result) ttsDurationMap.set(result.index, result.duration);
+    }
+
+    // Persist TTS warnings to RenderJob so users can see them in the UI
+    // (the render still completes — these are non-fatal — but no longer silent).
+    if (ttsWarnings.length > 0) {
+      try {
+        await prisma.renderJob.update({
+          where: { id: renderJob.id },
+          data: { errorMessage: `[TTS warnings — ${ttsWarnings.length} scene(s) fell back to silent audio]\n${ttsWarnings.join("\n")}` },
+        });
+      } catch (err) {
+        console.warn(`[Render] Failed to persist TTS warnings to RenderJob:`, err);
+      }
     }
 
     // Materials stage

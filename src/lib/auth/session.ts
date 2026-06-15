@@ -2,29 +2,25 @@ import { getServerSession } from "next-auth";
 import { authOptions } from "./config";
 import { NextResponse } from "next/server";
 
-// Default user for unauthenticated access
-const DEFAULT_USER = {
-  id: "cmp3v2aqa0000k8ulak8r79d5",
-  email: "user@ai-video.local",
-  name: "默认用户",
-  aiProvider: "openai" as string,
-  aiModel: "mimo-v2.5-pro" as string,
-  aiBaseUrl: "https://token-plan-cn.xiaomimimo.com/v1" as string,
-  aiApiKey: "" as string,
-  ttsVoice: "zh-CN-YunxiNeural" as string,
-};
-
 export async function getSession() {
   return getServerSession(authOptions);
 }
 
+/**
+ * Resolve the current session, or return `null` if the user is not logged in.
+ *
+ * SECURITY: callers that need a guaranteed-authenticated user MUST handle
+ * the `null` case (typically by returning `unauthorized()`). The previous
+ * implementation returned a hard-coded "default user" object, which silently
+ * gave every anonymous request a real `userId` and let any visitor read or
+ * mutate other users' projects. The default user has been removed.
+ */
 export async function requireSession() {
   const session = await getSession();
   if (session?.user?.id) {
     return session;
   }
-  // Return default user when not logged in
-  return { user: DEFAULT_USER } as any;
+  return null;
 }
 
 export function unauthorized() {

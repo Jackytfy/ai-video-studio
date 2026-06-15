@@ -92,6 +92,29 @@ interface RenderJobData {
   config: { width: number; height: number; fps: number; format: string };
   scenes: SceneData[];
   music?: MusicData;
+  // Per-job scratch directory. Computed once on the first stage that needs
+  // it (processMaterials) and persisted to job data so the subsequent stage
+  // (processCompose) sees the same dir. The UUID suffix means two concurrent
+  // runs of the same project — e.g. a retry triggered while the previous
+  // one is still cleaning up, or two worker replicas processing the same
+  // job — can never clobber each other's scene-0.mp4 etc.
+  workDir?: string;
+}
+
+/** Compute (or reuse) the per-job scratch dir. Persists it in job.data. */
+async function ensureWorkDir(job: Job<RenderJobData>): Promise<string> {
+  if (job.data.workDir) return job.data.workDir;
+  const dir = join(tmpdir(), `render-${job.data.projectId}-${randomUUID()}`);
+  await mkdir(dir, { recursive: true });
+  job.data.workDir = dir;
+  // BullMQ v5 exposes `updateData` on Job, not the legacy `update`. We need
+  // the dir to be visible to the *next* stage (processCompose) of the same
+  // job run, but in the same worker process `job.data` is already shared in
+  // memory, so the assignment above would be enough. Persisting via
+  // updateData is still cheap and makes the data survive a worker restart
+  // mid-pipeline.
+  await job.updateData(job.data);
+  return dir;
 }
 
 // --- MiMo TTS helper ---
@@ -170,11 +193,10 @@ async function processTTS(job: Job<RenderJobData>) {
 
 // --- Stage: Materials ---
 async function processMaterials(job: Job<RenderJobData>) {
-  const { scenes, jobId, projectId, config } = job.data;
+  const { scenes, jobId, config } = job.data;
   await prisma.renderJob.update({ where: { id: jobId }, data: { status: "MATERIALS_LOADING", currentStage: "materials" } });
 
-  const workDir = join(tmpdir(), `render-${projectId}`);
-  await mkdir(workDir, { recursive: true });
+  const workDir = await ensureWorkDir(job);
 
   for (let i = 0; i < scenes.length; i++) {
     const scene = scenes[i];
@@ -269,7 +291,7 @@ async function processCompose(job: Job<RenderJobData>) {
   const { scenes, config, jobId, projectId, music } = job.data;
   await prisma.renderJob.update({ where: { id: jobId }, data: { status: "COMPOSITING", currentStage: "compose" } });
 
-  const workDir = join(tmpdir(), `render-${projectId}`);
+  const workDir = await ensureWorkDir(job);
   const outputPath = join(workDir, `output.${config.format}`);
 
   const filterParts: string[] = [];

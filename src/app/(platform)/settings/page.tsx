@@ -6,10 +6,10 @@ import { Save, Loader2 } from "lucide-react";
 
 const PROVIDER_PRESETS: Record<string, { label: string; baseUrl: string; model: string }[]> = {
   openai: [
-    { label: "MiMo Pro (小米 Token Plan 中国)", baseUrl: "https://token-plan-cn.xiaomimimo.com/v1", model: "mimo-v2.5-pro" },
-    { label: "MiMo Pro (小米 Token Plan 新加坡)", baseUrl: "https://token-plan-sgp.xiaomimimo.com/v1", model: "mimo-v2.5-pro" },
-    { label: "MiMo Pro (小米 Token Plan 欧洲)", baseUrl: "https://token-plan-ams.xiaomimimo.com/v1", model: "mimo-v2.5-pro" },
-    { label: "MiMo Pro (小米 按量付费)", baseUrl: "https://api.xiaomimimo.com/v1", model: "mimo-v2.5-pro" },
+    { label: "MiMo Pro (小米 Token Plan 中国)", baseUrl: "https://token-plan-cn.xiaomimimo.com/v1", model: "mimo-v2.5" },
+    { label: "MiMo Pro (小米 Token Plan 新加坡)", baseUrl: "https://token-plan-sgp.xiaomimimo.com/v1", model: "mimo-v2.5" },
+    { label: "MiMo Pro (小米 Token Plan 欧洲)", baseUrl: "https://token-plan-ams.xiaomimimo.com/v1", model: "mimo-v2.5" },
+    { label: "MiMo Pro (小米 按量付费)", baseUrl: "https://api.xiaomimimo.com/v1", model: "mimo-v2.5" },
     { label: "DeepSeek", baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat" },
     { label: "Moonshot (Kimi)", baseUrl: "https://api.moonshot.cn/v1", model: "moonshot-v1-8k" },
     { label: "Zhipu (智谱)", baseUrl: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4-flash" },
@@ -41,6 +41,10 @@ export default function SettingsPage() {
   });
 
   const [selectedPreset, setSelectedPreset] = useState("");
+  // The server returns a masked key, e.g. "sk-****-****-****-7Hk2". We must NOT
+  // re-send that as the new value. Track separately so the user can leave it
+  // untouched to keep the existing key, or type a new one to replace it.
+  const [hasStoredApiKey, setHasStoredApiKey] = useState(false);
 
   useEffect(() => {
     if (settings) {
@@ -49,10 +53,14 @@ export default function SettingsPage() {
         aiProvider: settings.aiProvider,
         aiModel: settings.aiModel,
         aiBaseUrl: settings.aiBaseUrl || "",
-        aiApiKey: settings.aiApiKey || "",
+        // Don't pre-populate the input with the masked server value — the user
+        // can't edit "sk-****-****-****-7Hk2" usefully. Leave the field empty
+        // and show a small badge indicating a key is already saved.
+        aiApiKey: "",
         ttsProvider: settings.ttsProvider,
         ttsVoice: settings.ttsVoice,
       });
+      setHasStoredApiKey(Boolean(settings.aiApiKeyConfigured));
     }
   }, [settings]);
 
@@ -67,11 +75,18 @@ export default function SettingsPage() {
 
   const mutation = useMutation({
     mutationFn: async (data: typeof form) => {
-      const body = {
+      const body: any = {
         ...data,
         aiBaseUrl: data.aiProvider === "openai" && data.aiBaseUrl ? data.aiBaseUrl : null,
-        aiApiKey: data.aiProvider === "openai" && data.aiApiKey ? data.aiApiKey : null,
       };
+      // Only send the apiKey field if the user actually typed something.
+      // Empty string → server clears the stored key. Omit the field → server
+      // keeps the existing key unchanged.
+      if (data.aiProvider === "openai") {
+        body.aiApiKey = data.aiApiKey ? data.aiApiKey : null;
+      } else {
+        body.aiApiKey = null;
+      }
       const res = await fetch("/api/user/settings", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
@@ -176,16 +191,25 @@ export default function SettingsPage() {
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm font-medium">API Key</label>
+              <label className="text-sm font-medium flex items-center gap-2">
+                API Key
+                {hasStoredApiKey && (
+                  <span className="text-[10px] uppercase tracking-wide bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 px-2 py-0.5 rounded">
+                    已保存
+                  </span>
+                )}
+              </label>
               <input
                 type="password"
                 value={form.aiApiKey}
                 onChange={(e) => setForm({ ...form, aiApiKey: e.target.value })}
-                placeholder="sk-..."
+                placeholder={hasStoredApiKey ? "留空保持原值，输入新值覆盖" : "sk-..."}
                 className="w-full bg-secondary border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple"
               />
               <p className="text-xs text-muted-foreground">
-                留空则使用环境变量中的 OPENAI_API_KEY
+                {hasStoredApiKey
+                  ? "服务端不会回显明文。留空保留原密钥，输入新值会替换并重新加密。"
+                  : "留空则使用环境变量中的 OPENAI_API_KEY"}
               </p>
             </div>
           </>

@@ -61,3 +61,10 @@ dev.db
 
 # uploads
 /uploads
+
+# per-render temp working directories (created in OS tmpdir or /tmp)
+/render-*
+
+# prisma local sqlite files (the URL points at ./prisma/dev.db by default)
+/prisma/*.db
+/prisma/*.db-journal

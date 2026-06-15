@@ -50,16 +50,18 @@ export const authOptions: NextAuthOptions = {
         token.id = user.id;
       }
 
+      // SECURITY: never store the (encrypted) API key in the JWT — the JWT is
+      // serialised to a cookie and readable by the browser. Server code that
+      // needs the key should fetch the user record and call `decryptSecret`.
       if (!token.aiProvider) {
         const dbUser = await prisma.user.findUnique({
           where: { id: token.id as string },
-          select: { aiProvider: true, aiModel: true, aiBaseUrl: true, aiApiKey: true, ttsVoice: true },
+          select: { aiProvider: true, aiModel: true, aiBaseUrl: true, ttsVoice: true },
         });
         if (dbUser) {
           token.aiProvider = dbUser.aiProvider;
           token.aiModel = dbUser.aiModel;
           token.aiBaseUrl = dbUser.aiBaseUrl ?? undefined;
-          token.aiApiKey = dbUser.aiApiKey ?? undefined;
           token.ttsVoice = dbUser.ttsVoice;
         }
       }
@@ -72,7 +74,6 @@ export const authOptions: NextAuthOptions = {
         session.user.aiProvider = token.aiProvider as string;
         session.user.aiModel = token.aiModel as string;
         session.user.aiBaseUrl = token.aiBaseUrl as string;
-        session.user.aiApiKey = token.aiApiKey as string;
         session.user.ttsVoice = token.ttsVoice as string;
       }
       return session;
