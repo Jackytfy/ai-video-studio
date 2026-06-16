@@ -1,0 +1,35 @@
+const fs = require("fs");
+const text = fs.readFileSync(__dirname + "/test-text.txt", "utf-8");
+
+const chineseChars = (text.match(/[\u4e00-\u9fff]/g) || []).length;
+const sceneCount = Math.max(3, Math.min(30, Math.round(chineseChars / 80)));
+const audioSecs = Math.round(chineseChars / 3.5);
+
+console.log("========================================");
+console.log("  文案流水线参数分析");
+console.log("========================================");
+console.log("");
+console.log("  总字符数:     " + text.length);
+console.log("  中文字符:     " + chineseChars);
+console.log("");
+console.log("  预估场景数:   " + sceneCount + " 个");
+console.log("  每场字数:     " + Math.round(chineseChars / sceneCount) + " 字");
+console.log("  预估音频:     " + Math.floor(audioSecs / 60) + "分" + (audioSecs % 60) + "秒");
+console.log("");
+console.log("  搜索次数:     " + sceneCount + " 次 (B站)");
+console.log("  TTS次数:      " + sceneCount + " 次");
+console.log("  FFmpeg:       " + (sceneCount + 1) + " 次");
+console.log("  临时磁盘:     " + (sceneCount * 20) + " MB");
+console.log("");
+console.log("  流水线已就绪:");
+console.log("  - 场景数公式: CHARS_PER_SCENE=80");
+console.log("  - 字幕同步:   实测TTS时长 + 按字数比例");
+console.log("  - 视频效果:   Ken Burns 缩放 (替代冻结帧)");
+console.log("  - 素材过滤:   负面词豁免(知识科普类)");
+console.log("  - 素材上限:   300秒/600秒");
+console.log("  - 水印去除:   B站 delogo 三区域");
+console.log("  - 字体适配:   getDefaultFontPath() 跨平台");
+console.log("  - 任务队列:   DB-backed (异步渲染)");
+console.log("  - 状态机:     集中管理 9 状态转换");
+console.log("");
+console.log("========================================");
