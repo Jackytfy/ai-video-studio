@@ -185,3 +185,65 @@ export async function startTaskWorker(
   // Start the loop
   void poll();
 }
+
+// ── Default render task processor ───────────────────────────────────
+
+/**
+ * Process a single render task by running the inline render pipeline.
+ *
+ * State contract:
+ *   - On success: marks the task COMPLETED.
+ *   - On failure: throws so the caller (startTaskWorker) can mark it FAILED
+ *     and persist the error message. We deliberately do NOT call failTask
+ *     here to avoid double-writing if the caller also handles errors.
+ *
+ * The Project status transition (RENDERING → COMPLETED/FAILED) is owned by
+ * `renderProjectInline` itself; this function only owns the RenderTask record.
+ *
+ * Note: renderProjectInline is imported lazily (dynamic import) to break a
+ * potential circular dependency at module load time — pipeline.ts pulls in
+ * many heavy modules (ffmpeg, watermark, bilibili) we don't need at queue
+ * boot, and lazy-loading keeps the worker startup snappy.
+ */
+export async function processRenderTask(task: TaskRecord): Promise<void> {
+  console.log(`[TaskWorker] Processing render task ${task.id} (project ${task.projectId})`);
+
+  const { renderProjectInline } = await import("@/lib/render/pipeline");
+  const result = await renderProjectInline(task.projectId, task.userId);
+
+  // Link the created RenderJob back to this task for traceability.
+  // renderProjectInline doesn't return the jobId today, but the most recent
+  // RenderJob for the project is the one it just created/updated.
+  try {
+    const latestJob = await prisma.renderJob.findFirst({
+      where: { projectId: task.projectId },
+      orderBy: { createdAt: "desc" },
+      select: { id: true },
+    });
+    if (latestJob) {
+      await prisma.renderTask.update({
+        where: { id: task.id },
+        data: { renderJobId: latestJob.id },
+      });
+    }
+  } catch (err) {
+    // Non-fatal: linking is for traceability only.
+    console.warn(`[TaskWorker] Failed to link RenderJob to task ${task.id}:`, err);
+  }
+
+  await completeTask(task.id);
+  console.log(
+    `[TaskWorker] Render task ${task.id} completed: ${result.outputUrl} (${result.duration}s)`
+  );
+}
+
+/**
+ * Convenience wrapper: start the task worker with the default render processor.
+ * This is what instrumentation.ts / a bootstrap script should call.
+ *
+ * @param enabled When false (default in some environments), the worker is
+ *   not started. Pass true explicitly to enable.
+ */
+export async function startRenderWorker(): Promise<void> {
+  await startTaskWorker(processRenderTask);
+}

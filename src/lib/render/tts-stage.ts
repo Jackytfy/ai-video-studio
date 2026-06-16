@@ -137,18 +137,32 @@ export async function generateTTSSceneAudio(
       return { index, audioFile, duration: estimatedDuration, warning: "TTS failed — silent fallback" };
     }
 
-    // Edge TTS path
-    try {
-      await runEdgeTTS("python3", voiceoverText, config.ttsVoice || "zh-CN-YunxiNeural", audioFile, 60000);
-      const actualDuration = await getAudioDuration(audioFile);
-      if (actualDuration > 0) return { index, audioFile, duration: actualDuration };
-
-      const warnMsg = `Edge TTS produced invalid output for scene ${index}`;
-      warnings.push(`Scene #${index + 1}: ${warnMsg}`);
-    } catch (err) {
-      const warnMsg = `Edge TTS failed for scene ${index} — using silent audio. Reason: ${err instanceof Error ? err.message : "unknown"}`;
+    // Edge TTS path — try multiple Python paths for cross-platform compat
+    // (Windows typically only has "python", Linux/macOS may have "python3").
+    const pythonPaths = ["python", "python3"];
+    let ttsOk = false;
+    for (const py of pythonPaths) {
+      try {
+        await runEdgeTTS(py, voiceoverText, config.ttsVoice || "zh-CN-YunxiNeural", audioFile, 60000);
+        const actualDuration = await getAudioDuration(audioFile);
+        if (actualDuration > 0) {
+          ttsOk = true;
+          break;
+        }
+        // File exists but invalid — try next Python path
+        const warnMsg = `Edge TTS (via ${py}) produced invalid output for scene ${index}`;
+        warnings.push(`Scene #${index + 1}: ${warnMsg}`);
+      } catch (err) {
+        // This Python path failed — try the next one before giving up
+        continue;
+      }
+    }
+    if (!ttsOk) {
+      const warnMsg = `Edge TTS failed for scene ${index} (tried ${pythonPaths.join(", ")}) — using silent audio`;
       console.warn(`[TTS] ${warnMsg}`);
       warnings.push(`Scene #${index + 1}: ${warnMsg}`);
+    } else {
+      return { index, audioFile, duration: await getAudioDuration(audioFile) };
     }
 
     await generateSilentAudio(audioFile, estimatedDuration);

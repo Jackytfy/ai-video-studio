@@ -516,17 +516,18 @@ export async function renderProjectInline(
     },
   });
 
+  // Declared outside try so catch block can also clean up workDir
+  let workDir = "";
   try {
-    await prisma.project.update({
-      where: { id: projectId },
-      data: { status: "RENDERING" },
-    });
+    // NOTE: The caller (render API route or task-worker) has already
+    // performed the DRAFT → RENDERING state transition via transitionProject().
+    // We deliberately do NOT set status here to avoid bypassing the state machine.
 
     // Append a random suffix so simultaneous renders of the same project
     // (e.g. a retry triggered while a previous run is still cleaning up,
     // or multiple worker replicas) cannot clobber each other's working
     // files. The directory is still scoped to the project for debuggability.
-    const workDir = join(tmpdir(), `render-${projectId}-${randomUUID()}`);
+    workDir = join(tmpdir(), `render-${projectId}-${randomUUID()}`);
     await mkdir(workDir, { recursive: true });
 
     // TTS stage
@@ -540,7 +541,10 @@ export async function renderProjectInline(
     const edgeVoice = user?.ttsVoice || "zh-CN-YunxiNeural";
 
     // TTS with concurrency (5 parallel TTS calls for speed)
-    const TTS_CONCURRENCY = 5;
+    // Windows: edge_tts spawns Python subprocesses which are heavy and
+    // prone to rate-limiting. Keep concurrency low to avoid exit-code-1
+    // failures from concurrent module imports and API throttling.
+    const TTS_CONCURRENCY = process.platform === "win32" ? 2 : 5;
     // Collect non-fatal warnings so we can persist them on RenderJob.errorMessage
     // and the affected Scene.renderWarning. We do NOT abort the whole render.
     const ttsWarnings: string[] = [];
@@ -604,26 +608,38 @@ export async function renderProjectInline(
               "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
               "-t", String(estimatedDuration), "-c:a", "libmp3lame", "-b:a", "128k", audioFile,
             ], { timeout: 10000 });
-          } catch {
-            // Generate WAV silent audio as last resort
+          } catch (ffErr) {
+            console.error(`[Render] Silent audio fallback failed for scene ${i}:`, ffErr);
+            // Last resort: generate WAV silence, then convert to MP3
             const sampleRate = 44100;
+            const channels = 2;
+            const bytesPerSample = 2;
             const numSamples = Math.ceil(estimatedDuration * sampleRate);
-            const dataSize = numSamples * 2 * 2;
+            const dataSize = numSamples * channels * bytesPerSample;
             const wav = Buffer.alloc(44 + dataSize);
             wav.write("RIFF", 0);
             wav.writeUInt32LE(36 + dataSize, 4);
             wav.write("WAVE", 8);
             wav.write("fmt ", 12);
             wav.writeUInt32LE(16, 16);
-            wav.writeUInt16LE(1, 20);
-            wav.writeUInt16LE(2, 22);
-            wav.writeUInt32LE(44100, 24);
-            wav.writeUInt32LE(176400, 28);
-            wav.writeUInt16LE(4, 32);
+            wav.writeUInt16LE(1, 20); // PCM
+            wav.writeUInt16LE(channels, 22);
+            wav.writeUInt32LE(sampleRate, 24);
+            wav.writeUInt32LE(sampleRate * channels * bytesPerSample, 28);
+            wav.writeUInt16LE(channels * bytesPerSample, 32);
             wav.writeUInt16LE(16, 34);
             wav.write("data", 36);
             wav.writeUInt32LE(dataSize, 40);
-            await writeFile(audioFile, wav).catch(() => {});
+            const wavFile = audioFile.replace(/\.mp3$/, ".wav");
+            await writeFile(wavFile, wav).catch(() => {});
+            try {
+              await execFileAsync("ffmpeg", [
+                "-y", "-i", wavFile, "-c:a", "libmp3lame", "-b:a", "128k", audioFile,
+              ], { timeout: 10000 });
+            } catch {
+              // If MP3 conversion fails, use WAV directly — rename input
+              await writeFile(audioFile, wav).catch(() => {});
+            }
           }
         }
       } else {
@@ -818,10 +834,23 @@ export async function renderProjectInline(
           // Instead: "长安十二时辰 片段" or "唐招提寺 空镜"
           const searchQueries: { query: string; label: string; requireTitleMatch?: string }[] = [];
 
+          // ── Extract keywords from materialQuery FIRST ──
+          // materialQuery is the AI's distilled search term — extract its parts
+          // for use in both visual keyword scoring and search query construction.
+          const mqKeywords: string[] = [];
+          if (materialQuery) {
+            const parts = materialQuery.split(/[\s,，、]+/).filter((p: string) => p.length >= 2 && p.length <= 8);
+            mqKeywords.push(...parts.slice(0, 3));
+          }
+
           // ── Extract core visual keywords from visualDesc ──
           // This is the MOST IMPORTANT step for matching footage to scene descriptions.
           // We extract concrete, searchable terms from the visual description.
+          // Keywords are categorized as: subject (人物), scene (场景), action (动作)
+          // for better search query construction and later relevance scoring.
           const visualKeywords: string[] = [];
+          // All unique keywords from visualDesc — used for relevance scoring in Step 2
+          const allVisualKeywords: string[] = [];
           if (visualDesc) {
             // Pattern 1: Scene/location nouns (most searchable)
             const locationNouns = visualDesc.match(/(?:紫禁城|太和殿|朝堂|宫殿|宫门|龙椅|金銮殿|御书房|后宫|考场|城墙|战场|军营|书房|大殿|殿内|殿外|金銮|太庙|天坛|颐和园|圆明园|长城|运河|科举考场|港口|码头|海面|江面|船队|战船|帆船|寺庙|佛寺|古寺|宫殿|皇城|城门|城楼|城墙|街道|集市|朝堂|宫殿|大殿|龙椅|御花园|庭院|和室|茶室|书院|学堂|战场|军营|营地|阵前|城下|护城河|运河|河道|港口|码头|船厂|船坞|海面|江面|湖面|河面|大海|大洋|海峡|海湾|山崖|山顶|山间|山路|平原|草原|沙漠|戈壁|森林|竹林|花园|园林|楼阁|亭台|塔|桥|牌坊|坊门|朱雀门|朱雀大街|棋盘式|东西市|坊|市|平城京|奈良|长安|洛阳|开封|临安|北京|南京)/g) as string[] | null;
@@ -831,6 +860,12 @@ export async function renderProjectInline(
             // Extract concrete visual actions like "遣唐使渡海", "朝堂议事", "跪拜", "吟诗"
             const actionPatterns = visualDesc.match(/[\u4e00-\u9fff]{2,4}(?:渡海|出海|航行|登船|跪拜|叩首|跪坐|端坐|站立|行走|奔跑|冲锋|厮杀|战斗|交战|对峙|跪奏|上书|奏请|吟诵|诵读|书写|挥毫|执笔|翻阅|展开|捧着|手持|身披|身穿|头戴|端坐|盘坐|俯瞰|仰望|远眺|眺望|注视|凝视|怒视|俯视|环视|巡视)/g) as string[] | null;
             if (actionPatterns) visualKeywords.push(...[...new Set(actionPatterns)].slice(0, 3));
+
+            // Pattern 2.5: Character appearance keywords — extract subject descriptions
+            // like "金色铠甲武士", "白衣少女", "身着龙袍的皇帝"
+            // These help find footage where the character's appearance matches visualDesc.
+            const appearancePatterns = visualDesc.match(/(?:[\u4e00-\u9fff]+铠甲|[\u4e00-\u9fff]+长袍|[\u4e00-\u9fff]+龙袍|[\u4e00-\u9fff]+冕旒|[\u4e00-\u9fff]+朝服|[\u4e00-\u9fff]+盔甲|[\u4e00-\u9fff]+僧袍|[\u4e00-\u9fff]+战甲|[\u4e00-\u9fff]+锦衣)/g) as string[] | null;
+            if (appearancePatterns) visualKeywords.push(...[...new Set(appearancePatterns)].slice(0, 2));
 
             // Pattern 3: Proper nouns from user requirements that appear in visualDesc
             for (const pn of properNouns) {
@@ -869,14 +904,26 @@ export async function renderProjectInline(
                 visualKeywords.push(...filtered);
               }
             }
-          }
 
-          // Also extract keywords from materialQuery (but keep it short!)
-          const mqKeywords: string[] = [];
-          if (materialQuery) {
-            // Split materialQuery into short phrases, take the most concrete ones
-            const parts = materialQuery.split(/[\s,，、]+/).filter((p: string) => p.length >= 2 && p.length <= 8);
-            mqKeywords.push(...parts.slice(0, 3));
+            // Build allVisualKeywords: merge all extracted keywords (deduplicated)
+            // for later relevance scoring against candidate video titles.
+            const rawKeywords = visualDesc.match(/[\u4e00-\u9fff]{2,4}/g) || [];
+            const stopWordsAll = new Set([
+              "一个", "可以", "他们", "我们", "这个", "那个", "什么", "怎么",
+              "不是", "没有", "还是", "但是", "因为", "所以", "如果", "虽然",
+              "这里", "那里", "前面", "后面", "上面", "下面", "里面", "外面",
+              "之前", "之后", "已经", "正在", "一直", "非常", "比较", "更加",
+              "镜头", "画面", "缓缓", "慢慢", "逐渐", "开始", "结束",
+              "大全景", "特写", "近景", "远景", "俯瞰", "全景", "半身",
+              "阴云", "密布", "逆光", "剪影", "光影", "色调", "氛围",
+            ]);
+            allVisualKeywords.push(
+              ...[...new Set(rawKeywords as string[])]
+                .filter((k: string) => !stopWordsAll.has(k) && k.length >= 2)
+                .slice(0, 12)
+            );
+            // Also include materialQuery keywords for scoring
+            allVisualKeywords.push(...mqKeywords);
           }
 
           // ── Phase 0: Required sources (user-specified, MUST appear) ──
@@ -901,24 +948,38 @@ export async function renderProjectInline(
           }
 
           // ── Phase 1: AI-recommended sourceVideos (high precision) ──
-          // KEY: Search show name ALONE first, then with ONE keyword
+          // KEY: Search show name with visualDesc core keywords FIRST,
+          // then fallback to generic "剧名 片段".
+          // This ensures we search for specific scenes described in visualDesc
+          // rather than any random clip from the show.
           for (const sv of effectiveSources.slice(0, 3)) {
             if (projectMaterialReqs?.requiredSources?.includes(sv)) continue;
-            // "剧名 片段" — simplest, most effective search
+            // "剧名 + visualDesc核心画面词" — targeted search for the specific scene
+            // Pick the most distinctive visual keyword (appearance > location > action)
+            const appearanceKw = visualKeywords.find(kw =>
+              /铠甲|长袍|龙袍|冕旒|朝服|盔甲|僧袍|战甲|锦衣/.test(kw)
+            );
+            const locationKw = visualKeywords.find(kw =>
+              /城|殿|宫|门|堂|院|寺|营|场|港|海|江|河|山|原|漠|林/.test(kw) && kw.length >= 2 && kw.length <= 6
+            );
+            const actionKw = visualKeywords.find(kw =>
+              /渡海|出海|航行|跪拜|叩首|跪坐|端坐|冲锋|厮杀|战斗|交战|对峙|吟诵|诵读|书写|挥毫/.test(kw)
+            );
+            // Priority: appearance > location > action > mqKeyword
+            const sceneKw = appearanceKw || locationKw || actionKw || mqKeywords[0];
+            if (sceneKw && sceneKw.length <= 6 && !sv.includes(sceneKw)) {
+              searchQueries.push({
+                query: `${sv} ${sceneKw}`,
+                label: "剧名+核心画面词",
+                requireTitleMatch: sv,
+              });
+            }
+            // "剧名 片段" — broader fallback
             searchQueries.push({
               query: `${sv} 片段`,
               label: "剧名+片段",
               requireTitleMatch: sv,
             });
-            // "剧名 + 1 visual keyword" — more targeted
-            const topVkw = visualKeywords[0] || mqKeywords[0];
-            if (topVkw && topVkw.length <= 6 && !sv.includes(topVkw)) {
-              searchQueries.push({
-                query: `${sv} ${topVkw}`,
-                label: "剧名+画面词",
-                requireTitleMatch: sv,
-              });
-            }
           }
 
           // ── Phase 1.5: Preferred sources ──
@@ -951,6 +1012,23 @@ export async function renderProjectInline(
               searchQueries.push({
                 query: `${vkw} 空镜`,
                 label: `画面词+空镜`,
+              });
+            }
+          }
+
+          // ── Phase 2.3: AI-generated materialQuery (elevated priority) ──
+          // materialQuery is the AI's distilled search term from visualDesc —
+          // it should be tried BEFORE fallback voiceover keywords because
+          // it's purpose-built for this exact scene's visual content.
+          if (materialQuery) {
+            searchQueries.push({
+              query: materialQuery,
+              label: "检索词",
+            });
+            if (mqKeywords.length > 0) {
+              searchQueries.push({
+                query: `${mqKeywords[0]} 电视剧`,
+                label: "检索词核心+电视剧",
               });
             }
           }
@@ -991,23 +1069,7 @@ export async function renderProjectInline(
             }
           }
 
-          // ── Phase 3: materialQuery (short version only) ──
-          if (materialQuery) {
-            // Use the FULL materialQuery as-is (it should be short per prompt)
-            searchQueries.push({
-              query: materialQuery,
-              label: "检索词",
-            });
-            // Also try first keyword + "电视剧"
-            if (mqKeywords.length > 0) {
-              searchQueries.push({
-                query: `${mqKeywords[0]} 电视剧`,
-                label: "检索词核心+电视剧",
-              });
-            }
-          }
-
-          // ── Phase 4: Fallback — voiceover text keywords ──
+          // ── Phase 3: Fallback — voiceover text keywords ──
           {
             const voiceText = scene.voiceoverText || scene.title || "";
             // Extract concrete nouns (2-4 chars) from voiceover
@@ -1101,13 +1163,14 @@ export async function renderProjectInline(
           // Strategy: collect valid candidates, then pick the best one.
           // Title matching sourceVideos is a BONUS (preferred), not mandatory.
           // All candidates must pass the negative keyword filter.
-          let candidates: { bvid: string; streamUrl: string; title: string; pic: string; durSec: number; usedQuery: string; label: string; titleMatched: boolean }[] = [];
+          let candidates: { bvid: string; streamUrl: string; title: string; pic: string; durSec: number; usedQuery: string; label: string; titleMatched: boolean; relevanceScore: number; searchPhase: number }[] = [];
 
-          for (const sq of searchQueries) {
+          for (let sqIdx = 0; sqIdx < searchQueries.length; sqIdx++) {
+            const sq = searchQueries[sqIdx];
             // Stop early if we already have a title-matched candidate from a higher-priority query
-            if (candidates.some(c => c.titleMatched)) break;
+            if (candidates.some(c => c.titleMatched && c.relevanceScore >= 0.6)) break;
             // Limit total candidates to avoid excessive API calls
-            if (candidates.length >= 3) break;
+            if (candidates.length >= 5) break;
 
             const results = await bilibiliSearch(sq.query);
             console.log(`[Render] Scene ${i} Q[${sq.label}] "${sq.query}" → ${results.length} results`);
@@ -1186,7 +1249,7 @@ export async function renderProjectInline(
               // documentary titles often contain 讲解/解读/教学/知识点/解说.
               // We still block 中小学/课时/语文/数学/etc (already above) which are
               // clearly school-course material unsuitable for knowledge videos.
-              if (project.contentStyle !== "KNOWLEDGE") {
+              if (project!.contentStyle !== "KNOWLEDGE") {
                 negativeKeywords.push(
                   "解说", "讲解", "教学", "教程", "攻略",
                   "指南", "入门", "知识点", "解读",
@@ -1254,27 +1317,73 @@ export async function renderProjectInline(
               }
 
               const pic = video.pic?.startsWith("//") ? `https:${video.pic}` : (video.pic || "");
-              candidates.push({ bvid, streamUrl, title, pic, durSec, usedQuery: sq.query, label: sq.label, titleMatched });
-              console.log(`[Render] Scene ${i} candidate [${sq.label}] ${titleMatched ? "✅" : "⚠️"} ${title.slice(0, 40)} (${durSec}s)`);
+
+              // ── Compute semantic relevance score ──
+              // Score = titleMatched bonus + visualDesc keyword coverage + search phase penalty
+              // Range: 0.0 - 1.0
+              const titleClean = title.replace(/[\s【】\[\]「」『』《》]/g, "");
+              const uniqueAllKws = [...new Set(allVisualKeywords)];
+              const matchedKwCount = uniqueAllKws.filter(kw => titleClean.includes(kw)).length;
+              const kwCoverage = uniqueAllKws.length > 0 ? matchedKwCount / uniqueAllKws.length : 0;
+              // Phase penalty: higher phases (broader searches) get lower base scores
+              const phasePenalty = Math.min(sqIdx * 0.05, 0.2);
+              // Base score from keyword coverage (0-0.5) + title match bonus (0.3)
+              let relScore = Math.min(kwCoverage * 1.5, 0.5) + (titleMatched ? 0.3 : 0) - phasePenalty;
+              // Bonus: if title contains materialQuery keywords (AI-curated search terms)
+              const mqHitCount = mqKeywords.filter(kw => titleClean.includes(kw)).length;
+              if (mqHitCount > 0) relScore += 0.1;
+              relScore = Math.max(0.1, Math.min(relScore, 1.0));
+
+              candidates.push({ bvid, streamUrl, title, pic, durSec, usedQuery: sq.query, label: sq.label, titleMatched, relevanceScore: Math.round(relScore * 100) / 100, searchPhase: sqIdx });
+              console.log(`[Render] Scene ${i} candidate [${sq.label}] ${titleMatched ? "✅" : "⚠️"} ${title.slice(0, 40)} (${durSec}s) rel=${relScore.toFixed(2)} kw=${matchedKwCount}/${uniqueAllKws.length}`);
             }
           }
 
           // ── Pick the best candidate ──
-          // Priority: titleMatched > longer duration
-          let matchedVideo: { bvid: string; streamUrl: string; title: string; pic: string; durSec: number; usedQuery: string } | null = null;
+          // Priority: relevanceScore (semantic) > titleMatched > longer duration
+          let matchedVideo: { bvid: string; streamUrl: string; title: string; pic: string; durSec: number; usedQuery: string; relevanceScore: number } | null = null;
           if (candidates.length > 0) {
-            // Sort: titleMatched first, then by duration descending
+            // Sort: relevanceScore descending, then titleMatched, then duration
             candidates.sort((a, b) => {
+              if (Math.abs(a.relevanceScore - b.relevanceScore) > 0.05) return b.relevanceScore - a.relevanceScore;
               if (a.titleMatched !== b.titleMatched) return a.titleMatched ? -1 : 1;
               return b.durSec - a.durSec;
             });
             const best = candidates[0];
-            matchedVideo = { bvid: best.bvid, streamUrl: best.streamUrl, title: best.title, pic: best.pic, durSec: best.durSec, usedQuery: best.usedQuery };
-            console.log(`[Render] Scene ${i} selected [${best.label}] ${best.titleMatched ? "✅" : "⚠️"} ${best.title.slice(0, 40)} (${best.durSec}s) from ${candidates.length} candidates`);
+            matchedVideo = { bvid: best.bvid, streamUrl: best.streamUrl, title: best.title, pic: best.pic, durSec: best.durSec, usedQuery: best.usedQuery, relevanceScore: best.relevanceScore };
+            console.log(`[Render] Scene ${i} selected [${best.label}] ${best.titleMatched ? "✅" : "⚠️"} ${best.title.slice(0, 40)} (${best.durSec}s) rel=${best.relevanceScore.toFixed(2)} from ${candidates.length} candidates`);
           }
 
           // Save matched material to DB
           if (matchedVideo) {
+            // ── Consistency checkpoint: verify visualDesc key entities ──
+            // Check if the selected video's title/description contains any key
+            // entities from visualDesc (location, character, action).
+            // Low match → WARN log + lower matchScore for frontend visibility.
+            const titleClean = matchedVideo.title.replace(/[\s【】\[\]「」『』《》]/g, "");
+            const keyEntitiesHit = [...new Set(allVisualKeywords)].filter(kw => titleClean.includes(kw));
+            const keyEntitiesTotal = [...new Set(allVisualKeywords)].length;
+            const consistencyRatio = keyEntitiesTotal > 0 ? keyEntitiesHit.length / keyEntitiesTotal : 0;
+
+            if (consistencyRatio < 0.1 && keyEntitiesTotal > 0) {
+              console.warn(`[Render] Scene ${i} ⚠️ LOW CONSISTENCY: selected video "${matchedVideo.title.slice(0, 40)}" matches 0/${keyEntitiesTotal} visualDesc keywords. visualDesc: "${(visualDesc || "").slice(0, 60)}"`);
+              // Downgrade matchScore to reflect low consistency
+              matchedVideo.relevanceScore = Math.min(matchedVideo.relevanceScore, 0.3);
+              // Accumulate warning in renderJob for frontend visibility
+              const warnMsg = `场景${i + 1}素材匹配度低: "${matchedVideo.title.slice(0, 30)}" 与画面描述一致性不足`;
+              try {
+                const existing = renderJob.errorMessage || "";
+                await prisma.renderJob.update({
+                  where: { id: renderJob.id },
+                  data: { errorMessage: existing ? `${existing}\n${warnMsg}` : warnMsg },
+                });
+              } catch {}
+            } else if (consistencyRatio < 0.25 && keyEntitiesTotal > 2) {
+              console.warn(`[Render] Scene ${i} ⚠️ MODERATE CONSISTENCY: ${keyEntitiesHit.length}/${keyEntitiesTotal} visualDesc keywords matched in "${matchedVideo.title.slice(0, 40)}"`);
+            } else {
+              console.log(`[Render] Scene ${i} consistency check: ${keyEntitiesHit.length}/${keyEntitiesTotal} visualDesc keywords matched`);
+            }
+
             const material = await prisma.material.create({
               data: {
                 projectId, name: matchedVideo.title.slice(0, 80),
@@ -1282,7 +1391,7 @@ export async function renderProjectInline(
                 fileUrl: matchedVideo.streamUrl, thumbnailUrl: matchedVideo.pic,
                 width: 1920, height: 1080, duration: matchedVideo.durSec,
                 externalId: `bilibili-${matchedVideo.bvid}`, externalSource: "bilibili",
-                searchQuery: matchedVideo.usedQuery, matchScore: 0.8,
+                searchQuery: matchedVideo.usedQuery, matchScore: matchedVideo.relevanceScore,
               },
             });
             await prisma.scene.update({ where: { id: scene.id }, data: { materialId: material.id } });
@@ -1852,19 +1961,40 @@ export async function renderProjectInline(
       );
 
       const audioDurStr = audioDuration.toFixed(3);
+
+      // Probe material duration to decide filter approach.
+      // If the material is shorter than the audio, use Ken Burns zoom
+      // to smoothly fill the extra time. If it's already long enough,
+      // skip zoompan — it only wastes CPU and can cause timing drift
+      // when fps differs between the material (often 25fps from B站)
+      // and config.fps (30fps).
+      let materialDuration = 0;
+      try {
+        const { stdout } = await execFileAsync("ffprobe", [
+          "-v", "error", "-show_entries", "format=duration",
+          "-of", "default=noprint_wrappers=1:nokey=1", materialFile,
+        ], { timeout: 5000 });
+        materialDuration = parseFloat(stdout.trim()) || 0;
+      } catch {}
+
+      const needsExtension = materialDuration > 0 && materialDuration < audioDuration * 0.85;
       const totalFrames = Math.ceil(audioDuration * config.fps);
 
-      // Build filter for this single scene.
-      // When material is shorter than audio, use a Ken Burns-style slow zoom
-      // instead of the old tpad=clone (which froze the last frame and looked
-      // broken). The zoompan creates a gentle 5% zoom-in over the entire clip,
-      // making short materials feel intentional rather than broken.
-      const kenBurnsFilter = `zoompan=z='min(zoom+0.0005,1.05)':d=${totalFrames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${config.width}x${config.height}:fps=${config.fps}`;
-
+      // Build filter chain for this scene
       const sceneFilters: string[] = [];
-      sceneFilters.push(
-        `[0:v]scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,${kenBurnsFilter},fade=in:st=0:d=0.3,trim=duration=${audioDurStr},setpts=PTS-STARTPTS[v0]`
-      );
+      if (needsExtension) {
+        // Material is too short → Ken Burns slow zoom to fill audio
+        const kenBurnsFilter = `zoompan=z='min(zoom+0.0005,1.05)':d=${totalFrames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${config.width}x${config.height}:fps=${config.fps}`;
+        sceneFilters.push(
+          `[0:v]scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,${kenBurnsFilter},fade=in:st=0:d=0.3,trim=duration=${audioDurStr},setpts=PTS-STARTPTS[v0]`
+        );
+        console.log(`[Render] Compose scene ${i}: Ken Burns (material ${materialDuration.toFixed(1)}s < audio ${audioDuration.toFixed(1)}s)`);
+      } else {
+        // Material long enough → simple scale+trim, no effects needed
+        sceneFilters.push(
+          `[0:v]scale=${config.width}:${config.height}:force_original_aspect_ratio=decrease,pad=${config.width}:${config.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,trim=duration=${audioDurStr},setpts=PTS-STARTPTS[v0]`
+        );
+      }
 
       // Build subtitle filter chain
       const { filterParts: subFilters, outputLabel: subLabel } = buildSubtitleFilterChain(
@@ -1988,7 +2118,13 @@ export async function renderProjectInline(
     } catch {}
 
     const outputUrl = `/api/uploads/${projectId}/output/${outputName}`;
-    const videoBuffer = await readFile(outputPath);
+
+    // Get output file size without loading the entire video into memory
+    let outputSize = 0;
+    try {
+      const outputStat = await import("fs/promises").then(m => m.stat(outputPath));
+      outputSize = outputStat.size;
+    } catch {}
 
     // ── Material coverage verification ──
     // Check if requiredSources from materialRequirements were actually used
@@ -2021,7 +2157,7 @@ export async function renderProjectInline(
         status: "COMPLETED",
         outputUrl,
         outputFormat: config.format,
-        outputSize: videoBuffer.length,
+        outputSize,
         outputDuration: duration,
         completedAt: new Date(),
         progress: 100,

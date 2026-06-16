@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { requireSession, unauthorized } from "@/lib/auth/session";
+import { transitionProject } from "@/lib/state-machine";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import { readFile, writeFile, unlink, mkdir, rm } from "fs/promises";
@@ -43,11 +44,18 @@ export async function POST(
   const workDir = join(tmpdir(), `editor-render-${projectId}-${randomUUID()}`);
 
   try {
-    // Update project status
-    await prisma.project.update({
-      where: { id: projectId },
-      data: { status: "RENDERING" },
-    });
+    // Use the centralized state machine for an atomic, validated transition
+    const transition = await transitionProject(projectId, session.user.id, "RENDERING");
+    if (!transition.success) {
+      const status = transition.from ?? "UNKNOWN";
+      if (status === "RENDERING") {
+        return NextResponse.json({ error: "项目正在渲染中，请稍候" }, { status: 409 });
+      }
+      return NextResponse.json(
+        { error: `当前项目状态(${status})不允许渲染` },
+        { status: 409 }
+      );
+    }
 
     // Append a random suffix so two concurrent editor-renders of the same
     // project cannot clobber each other's intermediate segments. Cleanup
@@ -255,13 +263,11 @@ export async function POST(
       await writeFile(thumbPath, thumbBuffer);
     } catch {}
 
-    // Update project
-    await prisma.project.update({
-      where: { id: projectId },
-      data: {
-        status: "COMPLETED",
-      },
-    });
+    // Use state machine for validated transition to COMPLETED
+    const doneTransition = await transitionProject(projectId, session.user.id, "COMPLETED");
+    if (!doneTransition.success) {
+      console.warn(`[RenderEditor] State transition to COMPLETED failed: ${doneTransition.error}`);
+    }
 
     return NextResponse.json({
       success: true,
@@ -273,10 +279,12 @@ export async function POST(
   } catch (error) {
     console.error("Render editor error:", error);
 
-    await prisma.project.update({
-      where: { id: projectId },
-      data: { status: "FAILED" },
-    });
+    // Use state machine for validated transition to FAILED
+    try {
+      await transitionProject(projectId, session.user.id, "FAILED");
+    } catch (stateErr) {
+      console.warn("[RenderEditor] Failed to transition to FAILED:", stateErr);
+    }
 
     return NextResponse.json({ error: "渲染失败" }, { status: 500 });
   } finally {

@@ -38,8 +38,13 @@ export function ProjectCard({ project, onDelete }: ProjectCardProps) {
   const status = statusMap[project.status] || statusMap.DRAFT;
   const timeAgo = getTimeAgo(project.updatedAt);
   const isCompleted = project.status === "COMPLETED";
+  const isStoryboardReady = project.status === "STORYBOARD_READY";
   const [deleting, setDeleting] = useState(false);
-  const href = isCompleted ? `/projects/${project.id}` : `/projects/${project.id}/chat`;
+  const href = isCompleted
+    ? `/projects/${project.id}`
+    : isStoryboardReady
+      ? `/projects/${project.id}/storyboard`
+      : `/projects/${project.id}/chat`;
 
   const handleDelete = async (e: React.MouseEvent) => {
     e.preventDefault();
@@ -63,7 +68,9 @@ export function ProjectCard({ project, onDelete }: ProjectCardProps) {
         className={`block border rounded-xl p-5 transition-all hover:shadow-lg ${
           isCompleted
             ? "bg-card border-green-400/30 hover:border-green-400/60 hover:shadow-green-400/10"
-            : "bg-card border-border hover:border-purple/30 hover:shadow-purple/5"
+            : isStoryboardReady
+              ? "bg-card border-blue-400/30 hover:border-blue-400/60 hover:shadow-blue-400/10"
+              : "bg-card border-border hover:border-purple/30 hover:shadow-purple/5"
         }`}
       >
         <div className="flex items-start justify-between mb-3">
@@ -98,6 +105,12 @@ export function ProjectCard({ project, onDelete }: ProjectCardProps) {
               <span className="flex items-center gap-1 text-green-400">
                 <Play className="w-3 h-3" />
                 查看视频
+              </span>
+            )}
+            {isStoryboardReady && (
+              <span className="flex items-center gap-1 text-blue-400">
+                <Play className="w-3 h-3" />
+                查看分镜
               </span>
             )}
           </div>
