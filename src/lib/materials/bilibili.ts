@@ -29,8 +29,62 @@ function parseDuration(dur: string): number {
 }
 
 /**
+ * Negative keywords: block non-drama/documentary content at the Bilibili search source.
+ * Every caller of searchBilibiliVideos is automatically protected.
+ */
+const NEGATIVE_KEYWORDS = [
+  // User-generated / fan content
+  "混剪", "踩点", "二创", "reaction", "Reaction",
+  "吐槽", "影评", "观后感", "观后", "推荐", "安利",
+  "UP主", "博主", "up主", "整活", "恶搞", "鬼畜",
+  "弹幕", "翻唱", "cos", "Cos", "COS",
+  "测评", "评测", "开箱", "拆包",
+  // Short dramas / romance (low quality)
+  "短剧", "言情", "大女主", "重生", "穿越", "甜宠",
+  "霸总", "逆袭", "爽剧", "微短剧", "竖屏短剧",
+  // Lifestyle / entertainment
+  "试吃", "吃播", "美食", "做饭", "探店",
+  "比亚迪", "汽车", "手机", "直播", "带货",
+  "搞笑", "段子", "相亲", "综艺",
+  // Games — comprehensive list
+  "游戏", "我的世界", "Minecraft", "minecraft",
+  "王者荣耀", "原神", "和平精英", "英雄联盟", "LOL",
+  "绝地求生", "PUBG", "pubg", "三国杀", "率土之滨",
+  "真三国无双", "全面战争", "三国志战略版",
+  "三国群英传", "文明", "Red Alert", "魔兽",
+  "永劫无间", "崩坏", "鸣潮", "第五人格",
+  "实况", "主播", "攻略",
+  // Toys / models
+  "乐高", "积木", "手办", "模型",
+  // School courses
+  "中小学", "初中", "高中", "小学", "课时",
+  "文言文", "语文", "数学", "英语", "考试",
+  "习题", "考点",
+  // Anime / 2D (not real footage)
+  "动漫", "动画", "番剧", "二次元", "国漫",
+  // Other
+  "VLOG", "vlog", "日常", "记录",
+];
+
+/**
+ * Filter Bilibili results by negative keywords in title.
+ * Request extra results from API to compensate for filtered-out items.
+ */
+function filterByNegativeKeywords<T extends { title: string }>(
+  items: T[],
+  requestedCount: number
+): T[] {
+  const filtered = items.filter(item => {
+    const titleLower = item.title.toLowerCase();
+    return !NEGATIVE_KEYWORDS.some(nk => titleLower.includes(nk.toLowerCase()));
+  });
+  return filtered.slice(0, requestedCount);
+}
+
+/**
  * Search Bilibili for videos matching a query.
  * Returns video metadata (no download URLs — use getVideoStream for that).
+ * Automatically filters out gaming, fan-made, and other non-official content.
  *
  * Supports retry with exponential backoff and handles Bilibili rate-limit
  * responses (HTML instead of JSON) gracefully.
@@ -41,13 +95,16 @@ export async function searchBilibiliVideos(
 ): Promise<BilibiliVideo[]> {
   if (!query) return [];
 
+  // Request extra results to compensate for negative keyword filtering
+  const fetchCount = count * 3;
+
   for (let attempt = 0; attempt <= 1; attempt++) {
     try {
       if (attempt > 0) {
         await new Promise((r) => setTimeout(r, 800 + Math.random() * 1000));
       }
 
-      const url = `https://api.bilibili.com/x/web-interface/search/type?search_type=video&keyword=${encodeURIComponent(query)}&page=1&page_size=${count}&order=totalrank`;
+      const url = `https://api.bilibili.com/x/web-interface/search/type?search_type=video&keyword=${encodeURIComponent(query)}&page=1&page_size=${fetchCount}&order=totalrank`;
 
       const res = await fetch(url, {
         headers: {
@@ -68,9 +125,9 @@ export async function searchBilibiliVideos(
         const data = JSON.parse(text);
         if (data.code !== 0) continue;
 
-        const results = (data.data?.result || []).slice(0, count);
+        const results = (data.data?.result || []);
 
-        return results.map((item: any) => ({
+        const mapped = results.map((item: any) => ({
           bvid: item.bvid,
           aid: item.aid,
           title: stripHtml(item.title),
@@ -80,6 +137,9 @@ export async function searchBilibiliVideos(
           author: item.author || "",
           play: item.play || 0,
         }));
+
+        // Filter out gaming, fan-made, and other non-official content at source
+        return filterByNegativeKeywords(mapped, count);
       } catch {
         // Bilibili rate-limited — returned HTML instead of JSON, retry
         if (text.startsWith("<")) continue;
@@ -162,6 +222,8 @@ export async function searchBilibiliMaterials(
   searchQuery: string;
   platform: "bilibili";
   needsWatermarkRemoval: true;
+  title: string;
+  description: string;
 }>> {
   const videos = await searchBilibiliVideos(query, count);
   const results = [];
@@ -190,6 +252,8 @@ export async function searchBilibiliMaterials(
       searchQuery: query,
       platform: "bilibili" as const,
       needsWatermarkRemoval: true as const,
+      title: stripHtml(video.title),
+      description: stripHtml(video.description),
     });
   }
 

@@ -1,8 +1,65 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { requireSession, unauthorized } from "@/lib/auth/session";
-import { searchMaterialsForScene, type SceneSearchContext } from "@/lib/materials/search-engine";
+import { searchMaterialsForScene, extractVisualDescKeywords, type MaterialResult, type SceneSearchContext } from "@/lib/materials/search-engine";
 import { renderProjectInline } from "@/lib/render/pipeline";
+
+/**
+ * Re-rank material results by visualDesc semantic relevance.
+ * Prioritizes sourceVideos title match + visualDesc keyword coverage.
+ */
+function rerankByVisualDesc(
+  results: MaterialResult[],
+  visualDesc: string,
+  materialQuery: string,
+  sourceVideos: string[]
+): MaterialResult[] {
+  if (!visualDesc || results.length <= 1) return results;
+
+  const visKeywords = extractVisualDescKeywords(visualDesc);
+
+  const scored = results.map(r => {
+    const title = (r.title || "").replace(/[\s　、。，；《》「」『』""''【】]/g, "");
+    const searchTarget = title + " " + (r.description || "") + " " + (r.searchQuery || "");
+
+    let bonus = 0;
+
+    // SourceVideos title match bonus (+0.3)
+    for (const sv of sourceVideos) {
+      const svClean = sv.replace(/[\s　、。，；《》「」『』""''【】]/g, "");
+      if (title.includes(svClean)) {
+        bonus += 0.3;
+        break;
+      }
+      // Abbreviation match
+      const half = svClean.slice(0, Math.ceil(svClean.length / 2));
+      if (half.length >= 2 && title.includes(half)) {
+        bonus += 0.2;
+        break;
+      }
+    }
+
+    // visualDesc keyword coverage bonus (max +0.4)
+    let kwHits = 0;
+    for (const kw of visKeywords) {
+      if (searchTarget.includes(kw)) kwHits++;
+    }
+    if (visKeywords.length > 0) {
+      bonus += (kwHits / visKeywords.length) * 0.4;
+    }
+
+    // materialQuery exact match bonus (+0.1)
+    const mqClean = materialQuery.replace(/[\s,，、]+/g, "");
+    if (mqClean && searchTarget.includes(mqClean)) {
+      bonus += 0.1;
+    }
+
+    return { result: r, finalScore: Math.min(1, (r.matchScore || 0.5) + bonus) };
+  });
+
+  scored.sort((a, b) => b.finalScore - a.finalScore);
+  return scored.map(s => s.result);
+}
 
 export async function POST(
   _req: Request,
@@ -85,13 +142,21 @@ export async function POST(
           continue;
         }
 
-        const best = results[0];
-        console.log(`[Confirm] Scene ${scene.sceneNumber}: found material from ${best.platform} (${best.type}, ${best.width}x${best.height}, score=${best.matchScore})`);
+        const reranked = rerankByVisualDesc(
+          results,
+          scene.visualDesc || "",
+          scene.materialQuery || "",
+          sourceVideos || []
+        );
+        const best = reranked[0];
+        console.log(`[Confirm] Scene ${scene.sceneNumber}: found material from ${best.platform} (${best.type}, ${best.width}x${best.height}, score=${best.matchScore})${best.title ? ` title="${best.title.slice(0, 40)}"` : ""}`);
 
         const material = await prisma.material.create({
           data: {
             projectId: id,
-            name: `Scene ${scene.sceneNumber} - ${scene.materialQuery}`,
+            name: best.title
+              ? `Scene ${scene.sceneNumber} - ${best.title.slice(0, 60)}`
+              : `Scene ${scene.sceneNumber} - ${scene.materialQuery}`,
             type: best.type,
             source: "STOCK_FOOTAGE",
             fileUrl: best.fileUrl,

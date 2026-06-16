@@ -15,6 +15,8 @@ export interface MaterialResult {
   searchQuery: string;
   platform: "pexels" | "pixabay" | "bilibili" | "douyin";
   needsWatermarkRemoval?: boolean;
+  title?: string;
+  description?: string;
 }
 
 export interface SceneSearchContext {
@@ -26,94 +28,130 @@ export interface SceneSearchContext {
 }
 
 /**
- * Extract concrete 2-4 char keywords from visualDesc for Bilibili search.
- * Filters out abstract words, incomplete phrases, and non-searchable terms.
+ * Extract concrete keywords from visualDesc for Bilibili search.
+ * Filters out non-searchable terms. Returns up to 10 keywords.
+ * Exported for use by confirm route re-ranking.
  */
-function extractVisualDescKeywords(text: string): string[] {
+export function extractVisualDescKeywords(text: string): string[] {
   if (!text) return [];
-  const abstractWords = new Set([
+  const nonSearchable = new Set([
     "画面", "描述", "展现", "展示", "呈现", "表现", "体现", "反映",
     "风格", "色调", "氛围", "镜头", "光影", "构图", "采用", "运用",
     "使用", "适合", "需要", "可以", "强烈", "突出", "营造",
-    "冷硬", "惨烈", "阴森", "压抑", "悲壮", "辉煌", "宏伟",
-    "戏剧", "冲突", "悲剧", "色彩", "恐怖", "紧张", "庄严",
     "例如", "视频", "片段", "该部", "这部", "中的", "聚焦", "注重",
-    "整体", "相关", "经典", "场景", "缓缓", "慢慢", "快速", "逐渐",
+    "整体", "相关", "经典", "缓缓", "慢慢", "快速", "逐渐",
     "最终", "开始", "结束", "显示", "映照", "笼罩", "充满", "转为",
     "变为", "化为", "定格", "切换", "这是", "那是", "他的", "她的",
     "我的", "这个", "那个", "这些", "那些", "最后", "首先", "然后",
     "接着", "同时", "此时", "近景", "远景", "全景", "特写",
   ]);
-  const nonSearchable = new Set([
-    "这是", "那是", "他的", "她的", "我的", "这个", "那个", "这些", "那些",
-    "最后", "首先", "然后", "接着", "同时", "此时", "画面", "镜头", "切换",
-    "缓缓", "慢慢", "快速", "逐渐", "最终", "开始", "结束", "显示", "展示",
-    "映照", "笼罩", "充满", "转为", "变为", "化为", "定格", "聚焦",
-  ]);
 
   const keywords: string[] = [];
-  const shortWords = text.match(/[\u4e00-\u9fff]{2,4}/g) || [];
   const seen = new Set<string>();
-  for (const w of shortWords) {
-    if (seen.has(w)) continue;
-    if (abstractWords.has(w) || nonSearchable.has(w)) continue;
-    if (/^[一二三四五六七八九十百千万亿]+$/.test(w)) continue;
-    if (/[在的了着过和与及把被从向往]$/.test(w)) continue;
-    keywords.push(w);
-    seen.add(w);
-    if (keywords.length >= 6) break;
+  const usedChars = new Set<number>(); // track character positions used by Pass 1
+
+  // Pass 1: Segment by punctuation, extract 4-8 char content phrases
+  const phrases = text.split(/[，,。；;！!？?、：:\s]+/).filter(p => p.length >= 4);
+  for (const phrase of phrases) {
+    const segments = phrase.match(/[一-鿿]{4,8}/g) || [];
+    for (const seg of segments) {
+      if (nonSearchable.has(seg) || seen.has(seg)) continue;
+      keywords.push(seg);
+      seen.add(seg);
+      // Mark character positions as used
+      const idx = text.indexOf(seg);
+      if (idx >= 0) {
+        for (let i = idx; i < idx + seg.length; i++) usedChars.add(i);
+      }
+      if (keywords.length >= 10) break;
+    }
+    if (keywords.length >= 10) break;
   }
+
+  // Pass 2: 2-3 char keywords from uncovered positions only
+  if (keywords.length < 10) {
+    const shortWords = text.match(/[一-鿿]{2,3}/g) || [];
+    for (const w of shortWords) {
+      if (seen.has(w)) continue;
+      if (nonSearchable.has(w)) continue;
+      if (/^[一二三四五六七八九十百千万亿]+$/.test(w)) continue;
+      if (/[在的了着过和与及把被从向往]$/.test(w)) continue;
+      // Skip if all characters already covered by Pass 1
+      const idx = text.indexOf(w);
+      if (idx >= 0) {
+        const covered = Array.from({ length: w.length }, (_, i) => usedChars.has(idx + i)).every(Boolean);
+        if (covered) continue;
+      }
+      keywords.push(w);
+      seen.add(w);
+      if (keywords.length >= 10) break;
+    }
+  }
+
   return keywords;
 }
 
 /**
  * Build prioritized search queries for a scene.
  * Returns an array of {query, label} sorted by priority (most precise first).
+ *
+ * Strategy: visualDesc is primary search guide. sourceVideos provide
+ * exact show/documentary names. materialQuery is fallback keywords.
  */
 function buildSearchQueries(ctx: SceneSearchContext): { query: string; label: string }[] {
   const queries: { query: string; label: string }[] = [];
   const sourceVideos = ctx.sourceVideos || [];
   const materialKeywords = ctx.materialQuery || "";
   const visualKeywords = extractVisualDescKeywords(ctx.visualDesc || "");
+  const added = new Set<string>(); // dedupe queries
 
-  // Q1: sourceVideos + visualDesc keywords (MOST PRECISE)
-  if (sourceVideos.length > 0 && visualKeywords.length > 0) {
-    queries.push({
-      query: `${sourceVideos[0]} ${visualKeywords.slice(0, 3).join(" ")}`,
-      label: "剧名+画面关键词",
-    });
+  const addQuery = (query: string, label: string) => {
+    const key = query.trim().toLowerCase();
+    if (key.length < 2 || added.has(key)) return;
+    added.add(key);
+    queries.push({ query: query.trim(), label });
+  };
+
+  // --- Phase 1: sourceVideos + visual keywords (MOST PRECISE) ---
+  // Use ALL sourceVideos, not just the first one.
+  // Each sourceVideo combined with visual keywords = separate query.
+  for (const sv of sourceVideos.slice(0, 3)) {
+    if (visualKeywords.length > 0) {
+      addQuery(
+        `${sv} ${visualKeywords.slice(0, 4).join(" ")}`,
+        "来源+画面关键词"
+      );
+    }
   }
-  // Q2: sourceVideos + materialQuery
-  if (sourceVideos.length > 0 && materialKeywords) {
-    queries.push({
-      query: `${sourceVideos[0]} ${materialKeywords}`,
-      label: "剧名+检索词",
-    });
+
+  // --- Phase 2: sourceVideos + materialQuery ---
+  for (const sv of sourceVideos.slice(0, 2)) {
+    if (materialKeywords) {
+      addQuery(`${sv} ${materialKeywords}`, "来源+检索词");
+    }
   }
-  // Q3: sourceVideos alone (if no other keywords)
-  if (sourceVideos.length > 0 && visualKeywords.length === 0 && !materialKeywords) {
-    queries.push({
-      query: sourceVideos[0],
-      label: "剧名",
-    });
+
+  // --- Phase 3: sourceVideos alone (as separate queries) ---
+  for (const sv of sourceVideos.slice(0, 3)) {
+    addQuery(sv, "来源");
   }
-  // Q4: visualDesc keywords + 电视剧/纪录片
+
+  // --- Phase 4: visualDesc keywords as main query ---
   if (visualKeywords.length > 0) {
-    queries.push({
-      query: `${visualKeywords.join(" ")} 电视剧`,
-      label: "画面关键词+电视剧",
-    });
-    queries.push({
-      query: `${visualKeywords.join(" ")} 纪录片`,
-      label: "画面关键词+纪录片",
-    });
+    addQuery(visualKeywords.join(" "), "画面关键词");
   }
-  // Q5: materialQuery alone
+
+  // --- Phase 5: materialQueryEn + visual keywords (English + Chinese hybrid) ---
+  if (ctx.materialQueryEn && visualKeywords.length > 0) {
+    addQuery(
+      `${ctx.materialQueryEn} ${visualKeywords.slice(0, 2).join(" ")}`,
+      "英文检索词+画面关键词"
+    );
+  }
+
+  // --- Phase 6: materialQuery alone (fallback) ---
   if (materialKeywords) {
-    queries.push({
-      query: materialKeywords,
-      label: "检索词",
-    });
+    addQuery(materialKeywords, "检索词");
   }
 
   return queries;
@@ -221,20 +259,43 @@ function extractSearchKeywords(ctx: SceneSearchContext): string[] {
 }
 
 /**
- * Score a material result based on relevance.
+ * Score a material result based on resolution, duration, AND semantic relevance.
+ * Semantic relevance (visualDesc keyword match) is the dominant factor.
  */
 function scoreMaterial(
-  material: { width: number; height: number; duration?: number },
-  _ctx: SceneSearchContext
+  material: { width: number; height: number; duration?: number; title?: string; description?: string; searchQuery?: string },
+  ctx: SceneSearchContext
 ): number {
-  let score = 0.5;
+  let score = 0.3; // Lower base — most points earned through relevance
 
-  if (material.width >= 1920 || material.height >= 1080) score += 0.2;
-  else if (material.width >= 1280 || material.height >= 720) score += 0.1;
+  // Resolution bonus (max 0.15)
+  if (material.width >= 1920 || material.height >= 1080) score += 0.15;
+  else if (material.width >= 1280 || material.height >= 720) score += 0.08;
 
+  // Duration bonus (max 0.15)
   if (material.duration) {
-    if (material.duration >= 5 && material.duration <= 30) score += 0.2;
-    else if (material.duration >= 3 && material.duration <= 60) score += 0.1;
+    if (material.duration >= 5 && material.duration <= 30) score += 0.15;
+    else if (material.duration >= 3 && material.duration <= 60) score += 0.08;
+  }
+
+  // Semantic relevance bonus (max 0.55) — THE KEY ADDITION
+  if (ctx.visualDesc) {
+    const visKeywords = extractVisualDescKeywords(ctx.visualDesc);
+    const searchText = ((material.title || "") + " " + (material.description || "") + " " + (material.searchQuery || "")).replace(/[\s　、。，；《》「」『』“”‘’【】]/g, "");
+
+    let matchedCount = 0;
+    for (const kw of visKeywords) {
+      if (searchText.includes(kw)) matchedCount++;
+    }
+    const keywordCoverage = visKeywords.length > 0 ? matchedCount / visKeywords.length : 0;
+    // Keyword coverage maps to 0-0.4
+    score += Math.min(keywordCoverage * 0.8, 0.4);
+
+    // Bonus: materialQuery exact match (the AI's curated search term)
+    const mqClean = (ctx.materialQuery || "").replace(/[\s,，、]+/g, "");
+    if (mqClean && searchText.includes(mqClean)) {
+      score += 0.15;
+    }
   }
 
   return Math.min(1, score);
@@ -269,9 +330,10 @@ async function searchPexelsSource(
         width: bestFile.width,
         height: bestFile.height,
         duration: video.duration,
-        matchScore: scoreMaterial({ width: bestFile.width, height: bestFile.height, duration: video.duration }, ctx),
+        matchScore: scoreMaterial({ width: bestFile.width, height: bestFile.height, duration: video.duration, description: keywords, searchQuery: keywords }, ctx),
         searchQuery: keywords,
         platform: "pexels",
+        description: keywords,
       });
     }
   } catch (err) {
@@ -289,9 +351,10 @@ async function searchPexelsSource(
         thumbnailUrl: img.src.medium,
         width: img.width,
         height: img.height,
-        matchScore: scoreMaterial({ width: img.width, height: img.height }, ctx) * 0.8,
+        matchScore: scoreMaterial({ width: img.width, height: img.height, description: keywords, searchQuery: keywords }, ctx) * 0.8,
         searchQuery: keywords,
         platform: "pexels",
+        description: keywords,
       });
     }
   } catch (err) {
@@ -326,9 +389,10 @@ async function searchPixabaySource(
         width: bestFile.width,
         height: bestFile.height,
         duration: video.duration,
-        matchScore: scoreMaterial({ width: bestFile.width, height: bestFile.height, duration: video.duration }, ctx),
+        matchScore: scoreMaterial({ width: bestFile.width, height: bestFile.height, duration: video.duration, description: video.tags, searchQuery: keywords }, ctx),
         searchQuery: keywords,
         platform: "pixabay",
+        description: video.tags,
       });
     }
   } catch (err) {
@@ -349,9 +413,10 @@ async function searchPixabaySource(
         thumbnailUrl: img.webformatURL,
         width: img.imageWidth,
         height: img.imageHeight,
-        matchScore: scoreMaterial({ width: img.imageWidth, height: img.imageHeight }, ctx) * 0.8,
+        matchScore: scoreMaterial({ width: img.imageWidth, height: img.imageHeight, description: img.tags, searchQuery: keywords }, ctx) * 0.8,
         searchQuery: keywords,
         platform: "pixabay",
+        description: img.tags,
       });
     }
   } catch (err) {
@@ -364,6 +429,59 @@ async function searchPixabaySource(
 }
 
 /**
+ * Negative keywords: block non-drama/documentary content from Bilibili results.
+ * Shared list for both search-engine and render pipeline.
+ */
+const BILIBILI_NEGATIVE_KEYWORDS = [
+  // User-generated / fan content
+  "混剪", "踩点", "二创", "reaction", "Reaction",
+  "吐槽", "影评", "观后感", "观后", "推荐", "安利",
+  "UP主", "博主", "up主", "整活", "恶搞", "鬼畜",
+  "弹幕", "翻唱", "cos", "Cos", "COS",
+  "测评", "评测", "开箱", "拆包",
+  // Short dramas / romance (low quality)
+  "短剧", "言情", "大女主", "重生", "穿越", "甜宠",
+  "霸总", "逆袭", "爽剧", "微短剧", "竖屏短剧",
+  // Lifestyle / entertainment
+  "试吃", "吃播", "美食", "做饭", "探店",
+  "比亚迪", "汽车", "手机", "直播", "带货",
+  "搞笑", "段子", "相亲", "综艺",
+  // Games (block all game-related content)
+  "游戏", "我的世界", "Minecraft", "minecraft",
+  "王者荣耀", "原神", "和平精英", "英雄联盟", "LOL",
+  "绝地求生", "PUBG", "pubg", "三国杀", "率土之滨",
+  "真三国无双", "全面战争", "三国志战略版",
+  "三国群英传", "文明", "Red Alert", "魔兽",
+  "永劫无间", "崩坏", "鸣潮", "第五人格",
+  "实况", "主播", "攻略",
+  // Toys / models
+  "乐高", "积木", "手办", "模型",
+  // School courses
+  "中小学", "初中", "高中", "小学", "课时",
+  "文言文", "语文", "数学", "英语", "考试",
+  "习题", "考点",
+  // Anime / 2D (not real footage)
+  "动漫", "动画", "番剧", "二次元", "国漫",
+  // Other
+  "VLOG", "vlog", "日常", "记录",
+];
+
+/**
+ * Filter out Bilibili results that contain negative keywords in title.
+ * Returns only results whose title does NOT match any negative keyword.
+ */
+function filterNegativeKeywords(results: MaterialResult[]): MaterialResult[] {
+  return results.filter(r => {
+    const title = (r.title || "").toLowerCase();
+    const isNegative = BILIBILI_NEGATIVE_KEYWORDS.some(nk => title.includes(nk.toLowerCase()));
+    if (isNegative) {
+      console.log(`[search] filtered out: "${(r.title || "").slice(0, 40)}" (negative keyword)`);
+    }
+    return !isNegative;
+  });
+}
+
+/**
  * Search Bilibili for Chinese content videos.
  * Bilibili results have watermarks and lower match score.
  */
@@ -373,8 +491,10 @@ async function searchBilibiliSource(
 ): Promise<MaterialResult[]> {
   try {
     const results = await searchBilibiliMaterials(keywords, count);
+    // Filter out gaming, fan-made, and other non-official content
+    const filtered = filterNegativeKeywords(results);
     // Bilibili gets higher base score since it's the preferred source for Chinese content
-    return results.map((r) => ({ ...r, matchScore: Math.min(1, r.matchScore + 0.2) }));
+    return filtered.map((r) => ({ ...r, matchScore: Math.min(1, r.matchScore + 0.2) }));
   } catch (err) {
     console.warn(`Bilibili search failed for "${keywords}":`, err instanceof Error ? err.message : err);
     return [];

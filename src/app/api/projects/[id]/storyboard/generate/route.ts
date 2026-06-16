@@ -57,6 +57,37 @@ export async function POST(
       buildProviderConfig(session.user)
     );
 
+    // Post-generation consistency validation: check visualDesc ↔ materialQuery ↔ sourceVideos
+    const consistencyWarnings: string[] = [];
+    for (const scene of result.scenes) {
+      const visualDesc = (scene.visualDesc || "").toLowerCase();
+      const materialQuery = (scene.materialQuery || "").toLowerCase();
+      const sourceVideos = scene.sourceVideos || [];
+
+      // Check 1: materialQuery shares no keywords with visualDesc
+      const mqParts = materialQuery.split(/[\s,，、]+/).filter((p: string) => p.length >= 2);
+      const mqOrphanParts = mqParts.filter((p: string) => !visualDesc.includes(p));
+      if (mqParts.length > 0 && mqOrphanParts.length === mqParts.length) {
+        consistencyWarnings.push(
+          `Scene ${scene.sceneNumber}: materialQuery "${scene.materialQuery}" shares no keywords with visualDesc`
+        );
+      }
+
+      // Check 2: sourceVideos empty
+      if (sourceVideos.length === 0) {
+        consistencyWarnings.push(`Scene ${scene.sceneNumber}: sourceVideos is empty`);
+      }
+
+      // Check 3: visualDesc too short
+      if (visualDesc.length < 30) {
+        consistencyWarnings.push(`Scene ${scene.sceneNumber}: visualDesc only ${visualDesc.length} chars (expected 50+)`);
+      }
+    }
+    if (consistencyWarnings.length > 0) {
+      console.warn(`[Storyboard] Consistency warnings for ${consistencyWarnings.length}/${result.scenes.length} scenes:`);
+      consistencyWarnings.forEach(w => console.warn(`  ${w}`));
+    }
+
     // Delete existing storyboard if any (allows regeneration)
     const existing = await prisma.storyboard.findFirst({ where: { projectId: id } });
     if (existing) {

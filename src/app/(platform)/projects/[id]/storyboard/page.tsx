@@ -5,7 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Check, Loader2, Play, X, Sparkles, Film, Mic,
-  Clock, Layers, FileText, Settings, Video
+  Clock, Layers, FileText, Settings, Video, RefreshCw
 } from "lucide-react";
 import { SceneCard } from "@/components/storyboard/SceneCard";
 import { SceneEditor } from "@/components/storyboard/SceneEditor";
@@ -444,13 +444,27 @@ export default function StoryboardPage() {
               重新渲染
             </button>
           ) : projectStatus === "COMPLETED" && lastJob?.outputUrl ? (
-            <button
-              onClick={() => router.push(`/projects/${projectId}`)}
-              className="flex items-center gap-2 bg-gradient-to-r from-green-500 to-emerald-400 text-white px-8 py-2.5 rounded-full font-medium hover:opacity-90 transition-opacity shadow-lg shadow-green/20"
-            >
-              <Video className="w-4 h-4" />
-              查看视频
-            </button>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={() => renderMutation.mutate()}
+                disabled={renderMutation.isPending}
+                className="flex items-center gap-2 bg-gradient-to-r from-orange-500 to-red-400 text-white px-6 py-2.5 rounded-full font-medium hover:opacity-90 transition-opacity disabled:opacity-50 shadow-lg shadow-orange/20"
+              >
+                {renderMutation.isPending ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <RefreshCw className="w-4 h-4" />
+                )}
+                {renderMutation.isPending ? "重新生成中..." : "重新生成"}
+              </button>
+              <button
+                onClick={() => router.push(`/projects/${projectId}`)}
+                className="flex items-center gap-2 bg-gradient-to-r from-green-500 to-emerald-400 text-white px-8 py-2.5 rounded-full font-medium hover:opacity-90 transition-opacity shadow-lg shadow-green/20"
+              >
+                <Video className="w-4 h-4" />
+                查看视频
+              </button>
+            </div>
           ) : !isConfirmed ? (
             <button
               onClick={() => confirmMutation.mutate()}
