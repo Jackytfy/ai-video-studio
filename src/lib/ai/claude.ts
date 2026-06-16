@@ -40,9 +40,10 @@ export class ClaudeProvider implements AIProvider {
     text: string,
     plan: "A" | "B",
     sceneCount: number,
-    options?: AIStreamOptions
+    options?: AIStreamOptions,
+    renderMode?: string
   ): Promise<StoryboardResult> {
-    const prompt = getStoryboardPrompt(text, plan, sceneCount);
+    const prompt = getStoryboardPrompt(text, plan, sceneCount, renderMode);
 
     const response = await this.client.messages.create({
       model: "claude-sonnet-4-20250514",

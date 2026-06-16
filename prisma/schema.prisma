@@ -61,6 +61,9 @@ model Project {
   //         properNouns[], landmarkScenes[], stylePreference, timeLimit, regionLimit, avoidKeywords[] }
   materialRequirements String?
 
+  // Render mode: "stock" = 搜索影视素材, "ai_video" = AI生成视频
+  renderMode String @default("stock")
+
   storyboard  Storyboard?
   messages    ChatMessage[]
   materials   Material[]

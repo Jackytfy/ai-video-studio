@@ -4,14 +4,28 @@ const nextConfig: NextConfig = {
   output: "standalone",
   serverExternalPackages: [
     "better-sqlite3",
+    "bindings",
+    "file-uri-to-path",
     "@prisma/adapter-better-sqlite3",
     "@prisma/client",
     ".prisma/client",
+    "puppeteer-core",
   ],
+  webpack: (config, { isServer }) => {
+    if (!isServer) {
+      config.resolve.fallback = {
+        ...config.resolve.fallback,
+        child_process: false,
+        fs: false,
+        path: false,
+        os: false,
+        crypto: false,
+        stream: false,
+      };
+    }
+    return config;
+  },
   experimental: {
-    // `bodySizeLimit` applies ONLY to Server Actions (useFormState etc.).
-    // It does NOT affect App Router Route Handlers — those must enforce
-    // their own Content-Length / stream-size checks (e.g. upload route).
     serverActions: {
       bodySizeLimit: "100mb",
     },

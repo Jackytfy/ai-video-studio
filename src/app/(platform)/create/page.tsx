@@ -14,6 +14,7 @@ export default function CreatePage() {
   const [aspectRatio, setAspectRatio] = useState("16:9");
   const [voice, setVoice] = useState("yunxi");
   const [contentStyle, setContentStyle] = useState("knowledge");
+  const [renderMode, setRenderMode] = useState("stock");
 
   const [statusText, setStatusText] = useState("");
 
@@ -31,6 +32,7 @@ export default function CreatePage() {
           aspectRatio,
           voice,
           contentStyle,
+          renderMode,
           materialRequirements: materialReqs,
         }),
       });
@@ -74,6 +76,8 @@ export default function CreatePage() {
             onAspectRatioChange={setAspectRatio}
             voice={voice}
             onVoiceChange={setVoice}
+            renderMode={renderMode}
+            onRenderModeChange={setRenderMode}
           />
 
           <TextInputArea onSubmit={handleSubmit} isLoading={isLoading} />

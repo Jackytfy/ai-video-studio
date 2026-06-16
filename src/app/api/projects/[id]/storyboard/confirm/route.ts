@@ -113,6 +113,11 @@ export async function POST(
         console.warn(`[Confirm] Scene ${scene.sceneNumber}: no materialQuery or visualDesc, skipping`);
         continue;
       }
+      // AI-generated scenes: skip stock search, pipeline handles generation during render
+      if (scene.sceneType === "AI_GENERATED") {
+        console.log(`[Confirm] Scene ${scene.sceneNumber}: AI_GENERATED, deferred to render pipeline`);
+        continue;
+      }
 
       try {
         // Parse productionMeta to get English keywords and sourceVideos

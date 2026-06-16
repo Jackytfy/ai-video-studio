@@ -13,6 +13,7 @@ import { searchBilibiliVideos } from "@/lib/materials/bilibili";
 import { randomUUID } from "crypto";
 import { tmpdir } from "os";
 import { decryptSecret } from "@/lib/utils/crypto";
+import { generateVideoFromScene } from "@/lib/video-gen";
 import {
   generateSubtitleChunks,
   buildSubtitleFilterChain,
@@ -1469,6 +1470,59 @@ export async function renderProjectInline(
           console.warn(`[Render] Scene ${i} Bilibili search failed:`, err instanceof Error ? err.message : err);
         }
         return false;
+      }
+
+      // ── Step 0: AI-generated video (Agnes Video V2.0) ──
+      if (scene.sceneType === "AI_GENERATED" && !materialLoaded && !scene.materialId) {
+        const agnesApiKey = process.env.AGNES_API_KEY;
+        if (agnesApiKey) {
+          try {
+            await prisma.renderJob.update({
+              where: { id: renderJob.id },
+              data: { stageProgress: JSON.stringify({ sceneIndex: i, stage: "ai_generation", sceneNumber: scene.sceneNumber }) },
+            }).catch(() => {});
+
+            console.log(`[Render] Scene ${i}: AI_GENERATED — starting Agnes video generation`);
+            const genResult = await generateVideoFromScene(
+              {
+                visualDesc,
+                voiceoverText: scene.voiceoverText,
+                materialQuery,
+                materialQueryEn,
+                sceneNumber: scene.sceneNumber,
+              },
+              workDir,
+              { width: config.width || 1920, height: config.height || 1080, fps: config.fps || 24 },
+              (status) => {
+                console.log(`[Render] Scene ${i} AI generation: ${status}`);
+              }
+            );
+
+            if (genResult && genResult.filePath) {
+              // Scale AI-generated video to target resolution (no watermark removal needed)
+              const targetW = config.width || 1920;
+              const targetH = config.height || 1080;
+              const scaleFilter = `scale=${targetW}:${targetH}:force_original_aspect_ratio=decrease,pad=${targetW}:${targetH}:(ow-iw)/2:(oh-ih)/2:black`;
+
+              try {
+                await execFileAsync("ffmpeg", [
+                  "-y", "-i", genResult.filePath,
+                  "-vf", scaleFilter,
+                  "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                  "-an", materialFile,
+                ], { timeout: 30000 });
+                materialLoaded = true;
+                console.log(`[Render] Scene ${i}: AI-generated video ready (${genResult.duration}s)`);
+              } catch (scaleErr) {
+                console.warn(`[Render] Scene ${i}: AI-generated video scale failed:`, scaleErr instanceof Error ? scaleErr.message : scaleErr);
+              }
+            }
+          } catch (err) {
+            console.warn(`[Render] Scene ${i}: AI generation failed, falling back to stock footage:`, err instanceof Error ? err.message : err);
+          }
+        } else {
+          console.warn(`[Render] Scene ${i}: AI_GENERATED but AGNES_API_KEY not set, falling back to stock footage`);
+        }
       }
 
       // Step 1: Auto-search if no material attached

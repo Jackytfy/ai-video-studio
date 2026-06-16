@@ -80,15 +80,16 @@ export async function generateStoryboard(
   text: string,
   plan: "A" | "B",
   sceneCount: number,
-  config: string | ProviderConfig = "claude"
+  config: string | ProviderConfig = "claude",
+  renderMode?: string
 ): Promise<StoryboardResult> {
   // Check cache first
-  const cacheKey = [text.slice(0, 500), plan, String(sceneCount), typeof config === "string" ? config : `${config.provider}:${config.model}`];
+  const cacheKey = [text.slice(0, 500), plan, String(sceneCount), typeof config === "string" ? config : `${config.provider}:${config.model}`, renderMode || "stock"];
   const cached = await getCachedResult<StoryboardResult>("storyboard", cacheKey);
   if (cached) return cached;
 
   const ai = getAIProvider(config);
-  const result = await ai.generateStoryboard(text, plan, sceneCount);
+  const result = await ai.generateStoryboard(text, plan, sceneCount, undefined, renderMode);
 
   // Store in cache
   await setCachedResult("storyboard", cacheKey, result);

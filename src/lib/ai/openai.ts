@@ -48,9 +48,10 @@ export class OpenAIProvider implements AIProvider {
     text: string,
     plan: "A" | "B",
     sceneCount: number,
-    options?: AIStreamOptions
+    options?: AIStreamOptions,
+    renderMode?: string
   ): Promise<StoryboardResult> {
-    const prompt = getStoryboardPrompt(text, plan, sceneCount);
+    const prompt = getStoryboardPrompt(text, plan, sceneCount, renderMode);
 
     const response = await this.client.chat.completions.create({
       model: this.model,

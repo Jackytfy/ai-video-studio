@@ -54,7 +54,8 @@ export async function POST(
       project.sourceText,
       plan,
       sceneCount,
-      buildProviderConfig(session.user)
+      buildProviderConfig(session.user),
+      project.renderMode
     );
 
     // Post-generation consistency validation: check visualDesc ↔ materialQuery ↔ sourceVideos
@@ -113,7 +114,7 @@ export async function POST(
             return {
               sceneNumber: s.sceneNumber,
               title: s.title,
-              sceneType: s.sceneType === "ANIMATION" ? "ANIMATION" : "REAL_FOOTAGE",
+              sceneType: s.sceneType === "ANIMATION" ? "ANIMATION" : s.sceneType === "AI_GENERATED" ? "AI_GENERATED" : "REAL_FOOTAGE",
               voiceoverText: s.voiceoverText,
               visualDesc: s.visualDesc,
               materialQuery: s.materialQuery,

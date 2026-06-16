@@ -9,6 +9,7 @@ const createProjectSchema = z.object({
   aspectRatio: z.enum(["16:9", "9:16", "1:1"]).default("16:9"),
   voice: z.string().default("yunxi"),
   contentStyle: z.enum(["knowledge", "culture", "classic", "custom"]).default("knowledge"),
+  renderMode: z.enum(["stock", "ai_video"]).default("stock"),
   // Structured material requirements
   materialRequirements: z.object({
     contentSummary: z.string().optional(),            // 内容摘要 (e.g., "从清宫剧衰落与明史剧复兴现象切入...")
@@ -64,6 +65,7 @@ export async function POST(req: Request) {
         aspectRatio: data.aspectRatio === "9:16" ? "W_9_16" : data.aspectRatio === "1:1" ? "W_1_1" : "W_16_9",
         contentStyle: data.contentStyle === "culture" ? "CULTURE" : data.contentStyle === "classic" ? "CLASSIC_HISTORY" : data.contentStyle === "custom" ? "CUSTOM" : "KNOWLEDGE",
         materialRequirements: data.materialRequirements ? JSON.stringify(data.materialRequirements) : null,
+        renderMode: data.renderMode,
         userId: session.user.id,
       },
     });

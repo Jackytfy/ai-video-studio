@@ -13,6 +13,8 @@ interface StyleSelectorProps {
   onAspectRatioChange: (value: string) => void;
   voice: string;
   onVoiceChange: (value: string) => void;
+  renderMode: string;
+  onRenderModeChange: (value: string) => void;
 }
 
 const ASPECT_RATIOS = [
@@ -28,11 +30,18 @@ const VOICES = [
   { value: "xiaoyi", label: "晓艺（女声）" },
 ];
 
+const RENDER_MODES = [
+  { value: "stock", label: "影视素材" },
+  { value: "ai_video", label: "AI 生成" },
+];
+
 export function StyleSelector({
   aspectRatio,
   onAspectRatioChange,
   voice,
   onVoiceChange,
+  renderMode,
+  onRenderModeChange,
 }: StyleSelectorProps) {
   return (
     <div className="flex gap-3 flex-wrap justify-center">
@@ -63,6 +72,22 @@ export function StyleSelector({
           {VOICES.map((v) => (
             <SelectItem key={v.value} value={v.value}>
               {v.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+
+      <Select
+        value={renderMode}
+        onValueChange={(v) => v && onRenderModeChange(v)}
+      >
+        <SelectTrigger className="w-[140px] bg-secondary/50 border-border">
+          <SelectValue placeholder="场景" />
+        </SelectTrigger>
+        <SelectContent>
+          {RENDER_MODES.map((m) => (
+            <SelectItem key={m.value} value={m.value}>
+              {m.label}
             </SelectItem>
           ))}
         </SelectContent>

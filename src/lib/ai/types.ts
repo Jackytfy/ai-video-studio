@@ -7,7 +7,7 @@ export interface AIStreamOptions {
 
 export interface AIProvider {
   analyzeContent(text: string, style: string, materialReqs?: any | null, options?: AIStreamOptions): Promise<AnalysisResult>;
-  generateStoryboard(text: string, plan: "A" | "B", sceneCount: number, options?: AIStreamOptions): Promise<StoryboardResult>;
+  generateStoryboard(text: string, plan: "A" | "B", sceneCount: number, options?: AIStreamOptions, renderMode?: string): Promise<StoryboardResult>;
   chatStream(messages: Array<{ role: "user" | "assistant"; content: string }>, systemPrompt: string, options?: AIStreamOptions): AsyncGenerator<string>;
 }
 
@@ -30,7 +30,7 @@ export interface AnalysisResult {
 export interface SceneInput {
   sceneNumber: number;
   title: string;
-  sceneType: "REAL_FOOTAGE" | "ANIMATION";
+  sceneType: "REAL_FOOTAGE" | "ANIMATION" | "AI_GENERATED";
   voiceoverText: string;
   visualDesc: string;
   materialQuery: string;

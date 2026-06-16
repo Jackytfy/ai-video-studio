@@ -26,6 +26,7 @@ async function generateDetailedStoryboard(
     regionLimit?: string;
     avoidKeywords?: string[];
   } | null,
+  renderMode?: string,
 ): Promise<SceneData[]> {
   const chineseChars = (rawText.match(/[\u4e00-\u9fff]/g) || []).length;
   const sceneCount = Math.max(5, Math.min(30, Math.round(chineseChars / 70)));
@@ -35,6 +36,15 @@ async function generateDetailedStoryboard(
     plan === "A"
       ? "素材剪辑成片：使用实拍素材（历史影像、纪录片片段、实景拍摄）进行剪辑"
       : "素材+MG动画：混合使用实拍素材和MG动画（图形动画、数据可视化、概念动画）";
+
+  // SceneType instruction varies by renderMode
+  const isAiVideo = renderMode === "ai_video";
+  const sceneTypeInstruction = isAiVideo
+    ? `2. **画面类型** (sceneType): 所有场景默认使用 AI_GENERATED（AI生成视频），仅当visualDesc描述的画面在影视作品中有非常明确的对应片段时才使用 REAL_FOOTAGE
+   - AI_GENERATED（默认）: 使用AI生成视频来呈现画面，适合大部分场景
+   - REAL_FOOTAGE: 仅当有明确的历史影像、纪录片片段可用时使用（如著名历史事件的真实影像）
+   - ANIMATION: 抽象概念、数据可视化、MG动画`
+    : `2. **画面类型** (sceneType): REAL_FOOTAGE（实拍素材）或 ANIMATION（动画素材）`;
 
   // Build material requirements section for prompt
   let materialReqSection = "";
@@ -95,7 +105,7 @@ ${planDescription}
 每个场景包含以下字段：
 
 1. **场景标题** (title): 简短描述场景主题（5-10字）
-2. **画面类型** (sceneType): REAL_FOOTAGE（实拍素材）或 ANIMATION（动画素材）
+2. **画面类型** (sceneType): ${isAiVideo ? "AI_GENERATED（AI生成视频）或 REAL_FOOTAGE（实拍素材）" : "REAL_FOOTAGE（实拍素材）或 ANIMATION（动画素材）"}
 3. **口播脚本** (voiceoverText): 该场景的完整配音文案，自然流畅的口语化表达，${wordsPerScene}字左右（40-100字）
 4. **画面描述** (visualDesc): 只描述观众在屏幕上看到的画面内容。必须包含以下要素：
    - 人物：外观、服饰、动作、表情（如"身穿金色铠甲的将军"）
@@ -114,7 +124,7 @@ ${planDescription}
 - **画面与素材一致性**：sourceVideos推荐的影视作品必须在Bilibili上真实可搜到，且其中确实包含visualDesc描述的画面内容
 - **一个画面一个场景**：如果口播内容跨越多个不同画面，必须拆分为多个场景
 - 场景之间要有逻辑连贯性
-- 优先使用实拍素材，动画仅用于抽象概念解释
+${isAiVideo ? "- **AI生成视频模式**：大多数场景应使用AI_GENERATED。visualDesc必须详细描述AI需要生成的画面内容，因为AI将根据此描述直接生成视频。仅当有明确的历史真实影像可用时才使用REAL_FOOTAGE" : "- 优先使用实拍素材，动画仅用于抽象概念解释"}
 
 ## 输出格式
 请严格按以下JSON格式输出：
@@ -124,7 +134,7 @@ ${planDescription}
     {
       "sceneNumber": 1,
       "title": "场景标题",
-      "sceneType": "REAL_FOOTAGE",
+      "sceneType": "${isAiVideo ? "AI_GENERATED" : "REAL_FOOTAGE"}",
       "voiceoverText": "完整的口播文案，自然连贯...",
       "visualDesc": "详细的画面描述，包含人物、环境、镜头运动、光影效果，至少50字...",
       "materialQuery": "中文素材检索条件，15字以内",
@@ -242,7 +252,7 @@ export async function POST(
     });
 
     try {
-      scenes = await generateDetailedStoryboard(rawText, "A", aiConfig, materialReqs);
+      scenes = await generateDetailedStoryboard(rawText, "A", aiConfig, materialReqs, project.renderMode);
       usedAI = true;
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);

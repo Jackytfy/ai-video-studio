@@ -110,12 +110,15 @@ ${styleDescription}
 export function getStoryboardPrompt(
   text: string,
   plan: "A" | "B",
-  sceneCount: number
+  sceneCount: number,
+  renderMode?: string
 ): string {
   const planDescription =
     plan === "A"
       ? "素材剪辑成片：使用实拍素材（历史影像、纪录片片段、实景拍摄）进行剪辑"
       : "素材+MG动画：混合使用实拍素材和MG动画（图形动画、数据可视化、概念动画）";
+
+  const isAiVideo = renderMode === "ai_video";
 
   // Calculate optimal words per scene based on total text length
   const chineseChars = (text.match(/[\u4e00-\u9fff]/g) || []).length;
@@ -137,7 +140,8 @@ ${planDescription}
 每个场景包含以下字段：
 
 1. **场景标题** (title): 简短描述场景主题（5-10字）
-2. **画面类型** (sceneType): REAL_FOOTAGE（实拍素材）或 ANIMATION（动画素材）
+2. **画面类型** (sceneType): ${isAiVideo ? "AI_GENERATED（AI生成视频）或 REAL_FOOTAGE（实拍素材）" : "REAL_FOOTAGE（实拍素材）、ANIMATION（动画素材）或 AI_GENERATED（AI生成视频）"}
+   ${isAiVideo ? "- AI_GENERATED（默认）: 使用AI生成视频来呈现画面，适合大部分场景\n   - REAL_FOOTAGE: 仅当有明确的历史影像、纪录片片段可用时使用（如著名历史事件的真实影像）\n   - ANIMATION: 抽象概念、数据可视化、MG动画" : "- REAL_FOOTAGE: 有明确的历史影像、纪录片片段可用（默认选择）\n   - ANIMATION: 抽象概念、数据可视化、MG动画\n   - AI_GENERATED: visualDesc描述的画面高度具体但影视作品中极难找到对应片段（如奇幻场景、超现实画面、特定历史时期无法考证的场景）。仅在确实无法通过素材搜索匹配时使用"}
 3. **口播脚本** (voiceoverText): 该场景的完整配音文案，自然流畅的口语化表达，${wordsPerScene}字左右（40-100字）
 4. **画面描述** (visualDesc): 只描述观众在屏幕上看到的画面内容。必须包含以下要素：
    - 人物：外观、服饰、动作、表情（如"身穿金色铠甲的将军"）
@@ -156,7 +160,7 @@ ${planDescription}
 - **画面与素材一致性**：sourceVideos推荐的影视作品必须在Bilibili上真实可搜到，且其中确实包含visualDesc描述的画面内容。materialQuery必须精确描述visualDesc的核心画面主体，而非笼统的主题词。三者（visualDesc、materialQuery、sourceVideos）必须指向同一个具体画面
 - **一个画面一个场景**：如果口播内容跨越多个不同画面，必须拆分为多个场景
 - 场景之间要有逻辑连贯性
-- 优先使用实拍素材，动画仅用于抽象概念解释
+${isAiVideo ? "- **AI生成视频模式**：大多数场景应使用AI_GENERATED。visualDesc必须详细描述AI需要生成的画面内容，因为AI将根据此描述直接生成视频。仅当有明确的历史真实影像可用时才使用REAL_FOOTAGE\n- 使用AI_GENERATED时，visualDesc仍需详细描述画面内容" : "- 优先使用实拍素材，动画仅用于抽象概念解释\n- **AI生成视频(AI_GENERATED)的使用原则**：仅用于确实无法找到影视素材的场景（如奇幻/超现实画面、无影像记录的远古场景）。大多数场景应优先使用REAL_FOOTAGE。使用AI_GENERATED时，visualDesc仍需详细描述画面内容"}
 
 ## 输出格式
 请严格按以下JSON格式输出：
@@ -166,7 +170,7 @@ ${planDescription}
     {
       "sceneNumber": 1,
       "title": "场景标题",
-      "sceneType": "REAL_FOOTAGE",
+      "sceneType": "${isAiVideo ? "AI_GENERATED" : "REAL_FOOTAGE"}",
       "voiceoverText": "完整的口播文案，自然连贯...",
       "visualDesc": "详细的画面描述，包含人物、环境、镜头运动、光影效果，至少50字...",
       "materialQuery": "中文素材检索条件，15字以内",
