@@ -114,7 +114,17 @@ export async function POST(
             return {
               sceneNumber: s.sceneNumber,
               title: s.title,
-              sceneType: s.sceneType === "ANIMATION" ? "ANIMATION" : s.sceneType === "AI_GENERATED" ? "AI_GENERATED" : "REAL_FOOTAGE",
+              sceneType: (() => {
+                // Normalize AI-returned sceneType (case-insensitive)
+                let st = (s.sceneType || "").toUpperCase().replace(/[\s-]/g, "_");
+                if (st === "AI_GENERATED" || st === "AI_GENERATED_VIDEO") st = "AI_GENERATED";
+                else if (st === "REAL_FOOTAGE" || st === "REALFOOTAGE") st = "REAL_FOOTAGE";
+                else if (st === "ANIMATION" || st === "MG_ANIMATION") st = "ANIMATION";
+                else st = project.renderMode === "ai_video" ? "AI_GENERATED" : "REAL_FOOTAGE";
+                // renderMode=ai_video: keep REAL_FOOTAGE only if AI explicitly chose it
+                if (project.renderMode === "ai_video" && st !== "REAL_FOOTAGE") st = "AI_GENERATED";
+                return st as "REAL_FOOTAGE" | "ANIMATION" | "AI_GENERATED" | "CUSTOM";
+              })(),
               voiceoverText: s.voiceoverText,
               visualDesc: s.visualDesc,
               materialQuery: s.materialQuery,

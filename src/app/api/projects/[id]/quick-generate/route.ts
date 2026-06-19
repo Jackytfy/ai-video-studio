@@ -113,10 +113,10 @@ ${planDescription}
    - 镜头：景别和运动（如"从大全景缓缓推近至面部特写"）
    - 至少50字，必须具体到可以在影视作品中找到对应片段的程度
    - ❌"古代战争场面，气氛紧张" → ✅"金色铠甲武士骑马立于古城墙上，城下旌旗密布、千军万马列阵。镜头从大全景缓缓推近至武士面部特写，逆光剪影，天空阴云密布"
-5. **素材检索词** (materialQuery): 用于在Bilibili等视频平台搜索素材的关键词，必须是简洁的搜索词组。格式："核心画面内容 + 时代/风格"，控制在15字以内。例如："明朝朝堂议事 电视剧片段"、"古代战场骑兵冲锋"、"紫禁城太和殿 空镜"。禁止写成描述性段落
+5. **素材检索词** (materialQuery): 用于在Bilibili等视频平台搜索素材的关键词。**必须简短**，2-4个词，控制在10字以内。格式："核心画面词 + 类型"。**关键规则：materialQuery必须精确描述visualDesc的核心画面主体**——即观众在画面中看到的最具辨识度的视觉元素。例如：visualDesc为"金色铠甲武士骑马立于古城墙上"→ materialQuery应为"铠甲武士 电视剧"（而非笼统的"古代战争 电视剧"）。❌"日本大化改新 朝堂议事 电视剧"（太长）→ ✅"朝堂议事 电视剧"。禁止写成描述性段落，禁止超过10字
 6. **口播分段** (scripts): 将口播脚本按语义拆分为2-4个自然段落，每段15-40字。这是字幕显示的依据，必须与voiceoverText完全一致（scripts拼接后必须等于voiceoverText），用于分段展示字幕
 7. **英文检索词** (materialQueryEn): materialQuery对应的英文关键词，用于Pexels搜索，2-4个具体英文单词。例如："ancient battle cavalry charge"、"forbidden city aerial"
-8. **素材来源** (sourceVideos): 推荐1-3个具体的电视剧、电影或纪录片名称，作为Bilibili素材搜索的优先来源。必须选择画面质量高、与场景内容高度匹配的影视作品。优先选择知名历史剧、纪录片。例如：["大明王朝1566", "大明风华"]、["河西走廊"]、["觉醒年代"]、["大秦帝国"]、["三国演义"]、["贞观之治"]、["走向共和"]。禁止返回空数组[]——每个场景都应推荐至少1个影视来源
+8. **素材来源** (sourceVideos): 推荐1-3个具体的电视剧、电影或纪录片名称，作为Bilibili素材搜索的优先来源。**关键规则：推荐的影视作品必须确实包含visualDesc描述的具体画面**。例如：visualDesc为"朝堂上皇帝端坐龙椅，群臣跪拜"→ sourceVideos应推荐有朝堂场景的剧（如["大明王朝1566"]），而非只有战争场面的剧。禁止推荐与visualDesc画面无关的影视作品。优先选择知名历史剧、纪录片。例如：["大明王朝1566", "大明风华"]、["河西走廊"]、["觉醒年代"]。禁止返回空数组[]——每个场景都应推荐至少1个影视来源。**只写剧名，不要加括号注释**
 
 ## 关键规则
 - **口播分段(scripts)必须与voiceoverText严格一致**：scripts数组中所有段落拼接后必须等于voiceoverText，不能多字少字或改写。这是字幕同步的核心！
@@ -177,10 +177,32 @@ ${isAiVideo ? "- **AI生成视频模式**：大多数场景应使用AI_GENERATED
 
   console.log(`[quick-generate] AI generated ${parsed.scenes.length} scenes (target: ${sceneCount})`);
 
-  return parsed.scenes.map((s: any) => ({
-    sceneNumber: s.sceneNumber || 1,
+  // Normalize sceneType: AI models frequently ignore or mis-format this field.
+  // When renderMode=ai_video, force AI_GENERATED unless the AI explicitly chose
+  // REAL_FOOTAGE (which only makes sense for well-known historical footage).
+  const validSceneTypes = ["REAL_FOOTAGE", "ANIMATION", "AI_GENERATED"] as const;
+  return parsed.scenes.map((s: any, idx: number) => {
+    let sceneType: string = s.sceneType || "";
+    // Normalize case-insensitive match (e.g. "ai_generated", "Ai Generated")
+    if (!validSceneTypes.includes(sceneType as any)) {
+      const upper = sceneType.toUpperCase().replace(/[\s-]/g, "_");
+      if (upper === "AI_GENERATED" || upper === "AI_GENERATED_VIDEO") sceneType = "AI_GENERATED";
+      else if (upper === "REAL_FOOTAGE" || upper === "REALFOOTAGE") sceneType = "REAL_FOOTAGE";
+      else if (upper === "ANIMATION" || upper === "MG_ANIMATION") sceneType = "ANIMATION";
+      else sceneType = ""; // unrecognised — will be overridden below
+    }
+    // renderMode=ai_video: default to AI_GENERATED, only keep REAL_FOOTAGE if AI chose it
+    if (renderMode === "ai_video" && sceneType !== "REAL_FOOTAGE") {
+      sceneType = "AI_GENERATED";
+    }
+    // renderMode=stock: default to REAL_FOOTAGE (don't force, allow AI to choose ANIMATION)
+    if (renderMode !== "ai_video" && !sceneType) {
+      sceneType = "REAL_FOOTAGE";
+    }
+    return {
+    sceneNumber: s.sceneNumber || idx + 1,
     title: s.title || "",
-    sceneType: s.sceneType || "REAL_FOOTAGE",
+    sceneType,
     voiceoverText: s.voiceoverText || "",
     visualDesc: s.visualDesc || "",
     materialQuery: s.materialQuery || "",
@@ -189,7 +211,8 @@ ${isAiVideo ? "- **AI生成视频模式**：大多数场景应使用AI_GENERATED
     scripts: s.scripts || [],
     wordCount: (s.voiceoverText || "").length,
     estimatedDuration: Math.round(estimateAudioDuration(s.voiceoverText || "")),
-  }));
+  };
+  });
 }
 
 // ──────────────────── Main handler ────────────────────

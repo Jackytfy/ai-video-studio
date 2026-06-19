@@ -38,8 +38,27 @@ interface PollResponse {
   progress: number;
   seconds: string;
   size: string;
+  // The Agnes API returns the downloadable URL in `remixed_from_video_id`
+  // despite the misleading name (per docs line 11). Some API versions may
+  // also expose it as `video_url` or `url`, so we check all candidates.
   remixed_from_video_id?: string;
+  video_url?: string;
+  url?: string;
   error?: string | null;
+}
+
+/**
+ * Extract the downloadable video URL from a poll response.
+ * The Agnes API uses `remixed_from_video_id` for the URL (confusingly named),
+ * but we defensively check multiple candidate fields for forward-compat.
+ * Returns null if no valid http(s) URL is found.
+ */
+function extractVideoUrl(data: PollResponse): string | null {
+  const candidates = [data.remixed_from_video_id, data.video_url, data.url];
+  for (const c of candidates) {
+    if (c && /^https?:\/\//i.test(c)) return c;
+  }
+  return null;
 }
 
 function getApiKey(): string {
@@ -120,9 +139,10 @@ export async function pollVideoResult(
       onProgress?.(data.status, data.progress);
 
       if (data.status === "completed") {
+        const videoUrl = extractVideoUrl(data);
         return {
           status: "completed",
-          videoUrl: data.remixed_from_video_id ?? null,
+          videoUrl,
           seconds: parseFloat(data.seconds) || 0,
         };
       }
@@ -149,6 +169,10 @@ export async function downloadVideo(
   videoUrl: string,
   outputPath: string
 ): Promise<void> {
+  if (!/^https?:\/\//i.test(videoUrl)) {
+    throw new Error(`Invalid video URL (must be http(s)): ${videoUrl.slice(0, 80)}`);
+  }
+
   const res = await fetch(videoUrl, {
     signal: AbortSignal.timeout(120_000),
   });

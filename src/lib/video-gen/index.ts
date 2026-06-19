@@ -13,6 +13,7 @@ import {
   downloadVideo,
   type AgnesVideoOptions,
 } from "./agnes";
+import { generateAIVideoPrompt } from "./prompt";
 
 export interface VideoGenScene {
   visualDesc: string;
@@ -38,23 +39,53 @@ export interface VideoGenResult {
 }
 
 /**
- * Calculate optimal num_frames for Agnes based on target duration.
- * Must follow 8n+1 rule, max 441.
+ * Calculate optimal num_frames for Agnes based on target duration and resolution.
+ * Agnes API limits: 1080p max 169 frames, 720p max 409, 480p max 961.
+ * Must follow 8n+1 rule.
  */
-function calcNumFrames(targetSeconds: number, frameRate: number): number {
+function calcNumFrames(targetSeconds: number, frameRate: number, width: number): number {
+  // Determine max frames based on resolution
+  const maxFrames = width >= 1920 ? 169 : width >= 1280 ? 409 : 961;
   const raw = Math.ceil((targetSeconds * frameRate) / 8) * 8 + 1;
-  return Math.min(441, Math.max(81, raw));
+  return Math.min(maxFrames, Math.max(81, raw));
 }
 
 /**
  * Build an English prompt for Agnes Video from scene data.
  *
- * Format: [Subject] + [Action] + [Scene] + [Camera] + [Lighting] + [Style]
- *
- * Uses materialQueryEn if available, otherwise translates key concepts
- * from visualDesc.
+ * Priority:
+ * 1. AI-generated prompt (high quality, understands context)
+ * 2. Keyword translation fallback (fast, no AI dependency)
  */
-export function buildAgnesPrompt(scene: VideoGenScene): string {
+export async function buildAgnesPrompt(
+  scene: VideoGenScene,
+  onProgress?: (status: string) => void
+): Promise<string> {
+  // Try AI-powered prompt generation first
+  if (process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY) {
+    try {
+      onProgress?.("generating prompt via AI");
+      const aiPrompt = await generateAIVideoPrompt(
+        scene.visualDesc,
+        scene.voiceoverText,
+        scene.materialQueryEn
+      );
+      onProgress?.(`AI prompt: ${aiPrompt.slice(0, 80)}...`);
+      return aiPrompt;
+    } catch (err) {
+      console.warn("[VideoGen] AI prompt generation failed, falling back to keyword translation:", err);
+      onProgress?.("AI prompt failed, using keyword fallback");
+    }
+  }
+
+  // Fallback: keyword translation
+  return buildKeywordPrompt(scene);
+}
+
+/**
+ * Build prompt using keyword translation (fallback).
+ */
+function buildKeywordPrompt(scene: VideoGenScene): string {
   const parts: string[] = [];
 
   // Base: use English keywords if available
@@ -196,7 +227,7 @@ export async function generateVideoFromScene(
   onProgress?: (status: string) => void
 ): Promise<VideoGenResult | null> {
   try {
-    const prompt = buildAgnesPrompt(scene);
+    const prompt = await buildAgnesPrompt(scene, onProgress);
     if (!prompt || prompt.length < 5) {
       onProgress?.("skip: prompt too short");
       return null;
@@ -204,16 +235,22 @@ export async function generateVideoFromScene(
 
     // Calculate frame count from voiceover duration
     const estimatedDuration = estimateVoiceoverDuration(scene.voiceoverText);
-    const numFrames = calcNumFrames(estimatedDuration, config.fps);
+
+    // Generate at 720p to get more frames (max 409 vs 169 at 1080p).
+    // Pipeline upscales to target resolution via FFmpeg afterwards.
+    const genWidth = 1280;
+    const genHeight = 720;
+    const numFrames = calcNumFrames(estimatedDuration, config.fps, genWidth);
 
     const options: AgnesVideoOptions = {
-      width: config.width,
-      height: config.height,
+      width: genWidth,
+      height: genHeight,
       numFrames,
       frameRate: config.fps,
     };
 
     onProgress?.("creating task");
+    onProgress?.(`generating at ${genWidth}x${genHeight} (${numFrames} frames, ~${(numFrames / config.fps).toFixed(1)}s)`);
     const { videoId } = await createVideoTask(prompt, options);
 
     onProgress?.("generating");
@@ -222,7 +259,11 @@ export async function generateVideoFromScene(
     });
 
     if (result.status !== "completed" || !result.videoUrl) {
-      onProgress?.(`failed: ${result.status}`);
+      const reason = result.status !== "completed"
+        ? `generation ${result.status}`
+        : "completed but no download URL in response";
+      console.warn(`[VideoGen] Scene ${scene.sceneNumber}: ${reason}, falling back to stock footage`);
+      onProgress?.(`failed: ${reason}`);
       return null;
     }
 
@@ -235,8 +276,8 @@ export async function generateVideoFromScene(
     return {
       filePath,
       duration: result.seconds,
-      width: config.width,
-      height: config.height,
+      width: genWidth,
+      height: genHeight,
       aiPrompt: prompt,
       videoId,
     };

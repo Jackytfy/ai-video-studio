@@ -22,9 +22,55 @@ import {
   type SubtitleConfig,
 } from "./subtitle";
 import { mapConcurrent } from "@/lib/utils/concurrent";
-import { withRetry, isFFmpegRetryableError, isNetworkError } from "@/lib/utils/retry";
+
 
 const execFileAsync = promisify(execFile);
+
+// ── Progress Tracking Helper ────────────────────────────────────────
+/**
+ * Update render job progress with stage-specific details.
+ * Sends granular progress to frontend via SSE polling.
+ */
+async function updateRenderProgress(
+  renderJobId: string,
+  options: {
+    currentStage?: string;
+    progress?: number;           // 0-100 overall
+    sceneIndex?: number;         // Current scene being processed
+    totalScenes?: number;        // Total scenes
+    sceneStage?: string;         // "tts" | "ai_generation" | "materials" | "compose"
+    sceneStatus?: string;        // Status message (e.g., "generating at 30%")
+    estimatedRemaining?: number; // Estimated seconds remaining
+  }
+) {
+  try {
+    const data: Record<string, any> = {
+      updatedAt: new Date().toISOString(),
+    };
+
+    if (options.currentStage !== undefined) data.currentStage = options.currentStage;
+    if (options.progress !== undefined) data.progress = options.progress;
+    if (options.estimatedRemaining !== undefined) data.estimatedDuration = options.estimatedRemaining;
+
+    // Scene-level progress details
+    const sceneProgress: Record<string, any> = {};
+    if (options.sceneIndex !== undefined) sceneProgress.sceneIndex = options.sceneIndex;
+    if (options.totalScenes !== undefined) sceneProgress.totalScenes = options.totalScenes;
+    if (options.sceneStage !== undefined) sceneProgress.stage = options.sceneStage;
+    if (options.sceneStatus !== undefined) sceneProgress.status = options.sceneStatus;
+
+    if (Object.keys(sceneProgress).length > 0) {
+      data.stageProgress = JSON.stringify(sceneProgress);
+    }
+
+    await prisma.renderJob.update({
+      where: { id: renderJobId },
+      data,
+    });
+  } catch {
+    // Non-fatal: progress updates should never block rendering
+  }
+}
 
 /**
  * Run edge_tts via spawn with array args (NO shell, NO string interpolation).
@@ -517,12 +563,31 @@ export async function renderProjectInline(
     },
   });
 
-  // Declared outside try so catch block can also clean up workDir
+  // Declared outside try so catch block so catch block can also clean up workDir
   let workDir = "";
   try {
-    // NOTE: The caller (render API route or task-worker) has already
-    // performed the DRAFT → RENDERING state transition via transitionProject().
-    // We deliberately do NOT set status here to avoid bypassing the state machine.
+    // Ensure project is in a valid state for rendering
+    // The caller (render API route) may have already transitioned to RENDERING,
+    // so we handle both cases: already RENDERING, or needs transition from DRAFT/COMPLETED
+    const projectStatus = await prisma.project.findUnique({
+      where: { id: projectId },
+      select: { status: true },
+    });
+
+    const currentStatus = projectStatus?.status;
+    if (currentStatus === "RENDERING") {
+      console.log(`[Render] Project already in RENDERING state, continuing...`);
+    } else if (currentStatus === "COMPLETED") {
+      // Allow re-rendering from completed state
+      await transitionProject(projectId, userId, "RENDERING");
+      console.log(`[Render] Re-transitioned COMPLETED → RENDERING`);
+    } else if (currentStatus === "DRAFT") {
+      // Normal flow: transition to rendering
+      await transitionProject(projectId, userId, "RENDERING");
+      console.log(`[Render] Transitioned ${currentStatus} → RENDERING`);
+    } else {
+      throw new Error(`Cannot start render: invalid state ${currentStatus}`);
+    }
 
     // Append a random suffix so simultaneous renders of the same project
     // (e.g. a retry triggered while a previous run is still cleaning up,
@@ -541,11 +606,11 @@ export async function renderProjectInline(
     const isMiMo = user?.ttsProvider === "mimo";
     const edgeVoice = user?.ttsVoice || "zh-CN-YunxiNeural";
 
-    // TTS with concurrency (5 parallel TTS calls for speed)
-    // Windows: edge_tts spawns Python subprocesses which are heavy and
-    // prone to rate-limiting. Keep concurrency low to avoid exit-code-1
-    // failures from concurrent module imports and API throttling.
-    const TTS_CONCURRENCY = process.platform === "win32" ? 2 : 5;
+    // TTS with concurrency — higher parallelism for faster generation.
+    // Previous conservative limit (2 on Windows) caused sequential bottlenecks.
+    // Edge TTS is I/O-bound (HTTP API calls), not CPU-bound, so 4-5 concurrent
+    // calls are safe even on Windows. Rate-limiting is handled by edge_tts itself.
+    const TTS_CONCURRENCY = process.platform === "win32" ? 4 : 5;
     // Collect non-fatal warnings so we can persist them on RenderJob.errorMessage
     // and the affected Scene.renderWarning. We do NOT abort the whole render.
     const ttsWarnings: string[] = [];
@@ -751,6 +816,7 @@ export async function renderProjectInline(
     // Materials stage with concurrency (4 parallel material searches for speed)
     const MATERIALS_CONCURRENCY = 4;
     await mapConcurrent(scenes, MATERIALS_CONCURRENCY, async (scene, i) => {
+      console.log(`[Render] Scene ${i}: sceneType=${scene.sceneType || "(none)"}, materialId=${scene.materialId || "(none)"}`);
       const materialFile = join(workDir, `scene-${i}.mp4`);
       let materialLoaded = false;
 
@@ -993,28 +1059,22 @@ export async function renderProjectInline(
           }
 
           // ── Phase 2: Visual keywords (NO show name — broader search) ──
-          // These are the MOST IMPORTANT for matching visual description
+          // These are the MOST IMPORTANT for matching visual description.
+          // Reduced from 4 to 2 keywords × 2 queries each to cut API calls.
           const uniqueVisualKws = [...new Set(visualKeywords)].filter(
             kw => kw.length >= 2 && kw.length <= 8 && !avoidKeywords.some(ak => kw.includes(ak))
           );
-          for (const vkw of uniqueVisualKws.slice(0, 4)) {
+          for (const vkw of uniqueVisualKws.slice(0, 2)) {
+            // "关键词 纪录片" — find documentary footage (best hit rate)
+            searchQueries.push({
+              query: `${vkw} 纪录片`,
+              label: `画面词+纪录片`,
+            });
             // "关键词 电视剧" — find drama footage
             searchQueries.push({
               query: `${vkw} 电视剧`,
               label: `画面词+电视剧`,
             });
-            // "关键词 纪录片" — find documentary footage
-            searchQueries.push({
-              query: `${vkw} 纪录片`,
-              label: `画面词+纪录片`,
-            });
-            // "关键词 空镜" — for location establishing shots
-            if (vkw.length <= 5) {
-              searchQueries.push({
-                query: `${vkw} 空镜`,
-                label: `画面词+空镜`,
-              });
-            }
           }
 
           // ── Phase 2.3: AI-generated materialQuery (elevated priority) ──
@@ -1035,16 +1095,14 @@ export async function renderProjectInline(
           }
 
           // ── Phase 2.5: properNouns from user requirements ──
+          // Reduced from 2→1 noun to cut API calls (early termination usually
+          // finds results before reaching this phase anyway).
           if (properNouns.length > 0) {
             const voiceText = scene.voiceoverText || "";
             const matchedNouns = properNouns.filter(pn =>
               voiceText.includes(pn) || (visualDesc || "").includes(pn)
             );
-            for (const noun of matchedNouns.slice(0, 2)) {
-              searchQueries.push({
-                query: `${noun} 电视剧`,
-                label: `专名+电视剧`,
-              });
+            for (const noun of matchedNouns.slice(0, 1)) {
               searchQueries.push({
                 query: `${noun} 纪录片`,
                 label: `专名+纪录片`,
@@ -1053,16 +1111,13 @@ export async function renderProjectInline(
           }
 
           // ── Phase 2.8: landmarkScenes from user requirements ──
+          // Reduced from 2→1 to cut API calls.
           if (landmarkScenes.length > 0) {
             const voiceText = scene.voiceoverText || "";
             const matchedScenes = landmarkScenes.filter(ls =>
               voiceText.includes(ls) || (visualDesc || "").includes(ls)
             );
-            for (const ls of matchedScenes.slice(0, 2)) {
-              searchQueries.push({
-                query: `${ls} 空镜`,
-                label: `标志场景+空镜`,
-              });
+            for (const ls of matchedScenes.slice(0, 1)) {
               searchQueries.push({
                 query: `${ls} 纪录片`,
                 label: `标志场景+纪录片`,
@@ -1091,25 +1146,11 @@ export async function renderProjectInline(
             }
           }
 
-          // ── Phase 5: properNouns + era fallback ──
-          {
-            const fallbackTerms: string[] = [];
-            if (meta?.properNouns?.length) {
-              const names = meta.properNouns.map((pn: any) => pn.name).filter(Boolean);
-              fallbackTerms.push(...names);
-            }
-            if (meta?.era) {
-              const eraWords = meta.era.match(/[\u4e00-\u9fff]{2,6}/g) || [];
-              fallbackTerms.push(...eraWords);
-            }
-            if (fallbackTerms.length > 0) {
-              const uniqueTerms = [...new Set(fallbackTerms)].slice(0, 3);
-              searchQueries.push({
-                query: uniqueTerms.join(" ") + " 纪录片",
-                label: "专名+时代+纪录片",
-              });
-            }
-          }
+          // ── Phase 5: REMOVED — properNouns + era fallback was the lowest-
+          // priority search and rarely produced useful results. The earlier
+          // phases (0-3) plus the broader Bilibili fallback at the end of
+          // autoSearchBilibili are sufficient. Removing this saves 1 API call
+          // per scene.
 
           console.log(`[Render] Scene ${i} search plan (${searchQueries.length} queries):`);
           searchQueries.forEach((sq, qi) => console.log(`  Q${qi + 1} [${sq.label}]: "${sq.query}"`));
@@ -1168,10 +1209,15 @@ export async function renderProjectInline(
 
           for (let sqIdx = 0; sqIdx < searchQueries.length; sqIdx++) {
             const sq = searchQueries[sqIdx];
-            // Stop early if we already have a title-matched candidate from a higher-priority query
-            if (candidates.some(c => c.titleMatched && c.relevanceScore >= 0.6)) break;
+            // Stop early if we already have a good-enough candidate.
+            // Lowered threshold from 0.6 to 0.4 — a titleMatched candidate
+            // with score ≥0.4 is almost always good enough; continuing to
+            // search just wastes time on API calls.
+            if (candidates.some(c => c.titleMatched && c.relevanceScore >= 0.4)) break;
+            // Stop if we have any candidate with high relevance (even without titleMatch)
+            if (candidates.some(c => c.relevanceScore >= 0.6)) break;
             // Limit total candidates to avoid excessive API calls
-            if (candidates.length >= 5) break;
+            if (candidates.length >= 3) break;
 
             const results = await bilibiliSearch(sq.query);
             console.log(`[Render] Scene ${i} Q[${sq.label}] "${sq.query}" → ${results.length} results`);
@@ -1188,8 +1234,8 @@ export async function renderProjectInline(
               });
             }
 
-            // Only process top 5 results per query (speed optimization)
-            for (const video of results.slice(0, 5)) {
+            // Only process top 3 results per query (speed optimization — reduced from 5)
+            for (const video of results.slice(0, 3)) {
               const bvid = video.bvid;
               if (!bvid) continue;
               // Skip duplicate bvids
@@ -1326,19 +1372,24 @@ export async function renderProjectInline(
               const pic = video.pic?.startsWith("//") ? `https:${video.pic}` : (video.pic || "");
 
               // ── Compute semantic relevance score ──
-              // Score = titleMatched bonus + visualDesc keyword coverage + search phase penalty
+              // Score = titleMatched bonus + keyword match bonus + search phase penalty
               // Range: 0.0 - 1.0
+              // KEY FIX: Use "at least one keyword matches" instead of coverage ratio,
+              // because Bilibili titles are typically very short (1-3 words) while
+              // visualDesc has many specific keywords. Coverage ratio unfairly penalizes
+              // good matches.
               const titleClean = title.replace(/[\s【】\[\]「」『』《》]/g, "");
               const uniqueAllKws = [...new Set(allVisualKeywords)];
               const matchedKwCount = uniqueAllKws.filter(kw => titleClean.includes(kw)).length;
-              const kwCoverage = uniqueAllKws.length > 0 ? matchedKwCount / uniqueAllKws.length : 0;
               // Phase penalty: higher phases (broader searches) get lower base scores
               const phasePenalty = Math.min(sqIdx * 0.05, 0.2);
-              // Base score from keyword coverage (0-0.5) + title match bonus (0.3)
-              let relScore = Math.min(kwCoverage * 1.5, 0.5) + (titleMatched ? 0.3 : 0) - phasePenalty;
+              // Score: titleMatch bonus (0.3) + keyword match bonus (0.1 per keyword, max 0.4) - phase penalty
+              // At least 1 keyword match gives 0.1 bonus, making short titles viable
+              let relScore = (titleMatched ? 0.3 : 0) + Math.min(matchedKwCount * 0.1, 0.4) - phasePenalty;
               // Bonus: if title contains materialQuery keywords (AI-curated search terms)
+              // These are high-value matches since materialQuery is AI's distilled search intent
               const mqHitCount = mqKeywords.filter(kw => titleClean.includes(kw)).length;
-              if (mqHitCount > 0) relScore += 0.1;
+              if (mqHitCount > 0) relScore += 0.15 * mqHitCount;
               relScore = Math.max(0.1, Math.min(relScore, 1.0));
 
               candidates.push({ bvid, streamUrl, title, pic, durSec, usedQuery: sq.query, label: sq.label, titleMatched, relevanceScore: Math.round(relScore * 100) / 100, searchPhase: sqIdx });
@@ -1372,8 +1423,8 @@ export async function renderProjectInline(
             const keyEntitiesTotal = [...new Set(allVisualKeywords)].length;
             const consistencyRatio = keyEntitiesTotal > 0 ? keyEntitiesHit.length / keyEntitiesTotal : 0;
 
-            if (consistencyRatio < 0.1 && keyEntitiesTotal > 0) {
-              console.warn(`[Render] Scene ${i} ⚠️ LOW CONSISTENCY: selected video "${matchedVideo.title.slice(0, 40)}" matches 0/${keyEntitiesTotal} visualDesc keywords. visualDesc: "${(visualDesc || "").slice(0, 60)}"`);
+            if (consistencyRatio < 0.05 && keyEntitiesTotal > 0) {
+              console.warn(`[Render] Scene ${i} ⚠️ LOW CONSISTENCY: selected video "${matchedVideo.title.slice(0, 40)}" matches ${keyEntitiesHit.length}/${keyEntitiesTotal} visualDesc keywords. visualDesc: "${(visualDesc || "").slice(0, 60)}"`);
               // Downgrade matchScore to reflect low consistency
               matchedVideo.relevanceScore = Math.min(matchedVideo.relevanceScore, 0.3);
               // Accumulate warning in renderJob for frontend visibility
@@ -1477,26 +1528,60 @@ export async function renderProjectInline(
         const agnesApiKey = process.env.AGNES_API_KEY;
         if (agnesApiKey) {
           try {
-            await prisma.renderJob.update({
-              where: { id: renderJob.id },
-              data: { stageProgress: JSON.stringify({ sceneIndex: i, stage: "ai_generation", sceneNumber: scene.sceneNumber }) },
-            }).catch(() => {});
+            await updateRenderProgress(renderJob.id, {
+              currentStage: "materials",
+              progress: 10 + (i / scenes.length) * 60, // TTS ~10%, Materials ~60%
+              sceneIndex: i,
+              totalScenes: scenes.length,
+              sceneStage: "ai_generation",
+              sceneStatus: "starting",
+            });
 
             console.log(`[Render] Scene ${i}: AI_GENERATED — starting Agnes video generation`);
-            const genResult = await generateVideoFromScene(
-              {
-                visualDesc,
-                voiceoverText: scene.voiceoverText,
-                materialQuery,
-                materialQueryEn,
-                sceneNumber: scene.sceneNumber,
-              },
-              workDir,
-              { width: config.width || 1920, height: config.height || 1080, fps: config.fps || 24 },
-              (status) => {
-                console.log(`[Render] Scene ${i} AI generation: ${status}`);
-              }
-            );
+
+            // Timeout protection: AI generation should not exceed 8 minutes per scene
+            const AI_GEN_TIMEOUT_MS = 8 * 60 * 1000;
+
+            // Start heartbeat to keep progress alive during long AI generation
+            const heartbeatInterval = setInterval(() => {
+              updateRenderProgress(renderJob.id, {
+                sceneStatus: "generating...",
+                estimatedRemaining: Math.max(0, (estimatedRemaining || 300) - 10),
+              }).catch(() => {});
+            }, 10000); // Every 10 seconds
+
+            let estimatedRemaining = 300; // Start with 5 min estimate
+
+            let genResult: Awaited<ReturnType<typeof import("@/lib/video-gen").generateVideoFromScene>> = null;
+            try {
+              genResult = await Promise.race([
+                generateVideoFromScene(
+                  {
+                    visualDesc,
+                    voiceoverText: scene.voiceoverText,
+                    materialQuery,
+                    materialQueryEn,
+                    sceneNumber: scene.sceneNumber,
+                  },
+                  workDir,
+                  { width: config.width || 1920, height: config.height || 1080, fps: config.fps || 24 },
+                  (status) => {
+                    console.log("[Render] Scene " + i + " AI generation: " + status);
+                    // Update progress on each status change
+                    updateRenderProgress(renderJob.id, {
+                      sceneStatus: status,
+                      estimatedRemaining: 300, // ~5 min estimate for AI gen
+                    }).catch(() => {});
+                  }
+                ),
+                new Promise<null>((_, reject) =>
+                  setTimeout(() => reject(new Error("AI generation timeout (8min)")), AI_GEN_TIMEOUT_MS)
+                )
+              ]);
+            } finally {
+              // Always clear heartbeat — even on timeout reject
+              clearInterval(heartbeatInterval);
+            }
 
             if (genResult && genResult.filePath) {
               // Scale AI-generated video to target resolution (no watermark removal needed)
@@ -1518,15 +1603,17 @@ export async function renderProjectInline(
               }
             }
           } catch (err) {
+            // AI generation failed or timed out - will fall back to stock footage below
             console.warn(`[Render] Scene ${i}: AI generation failed, falling back to stock footage:`, err instanceof Error ? err.message : err);
           }
         } else {
           console.warn(`[Render] Scene ${i}: AI_GENERATED but AGNES_API_KEY not set, falling back to stock footage`);
+
         }
       }
 
-      // Step 1: Auto-search if no material attached
-      if (!scene.materialId) {
+      // Step 1: Auto-search if no material loaded and no material attached
+      if (!scene.materialId && !materialLoaded) {
         await autoSearchBilibili();
       }
 
@@ -1558,8 +1645,12 @@ export async function renderProjectInline(
 
               let fileUrl = material.fileUrl;
 
-              // Bilibili stream URLs expire quickly — always refresh before download
-              if (isBilibili) {
+              // Bilibili stream URLs expire quickly — refresh only on retry
+              // (attempt > 0). The search phase already refreshed the URL when
+              // the material was first found, so the initial download attempt
+              // uses the freshest URL. Only re-refresh if the first attempt
+              // fails (likely due to URL expiry during the search→download gap).
+              if (isBilibili && attempt > 0) {
                 const bvidMatch = material.externalId?.match(/bilibili-(.+)/);
                 const bvid = bvidMatch?.[1];
                 if (bvid) {
@@ -1572,7 +1663,7 @@ export async function renderProjectInline(
                         where: { id: material.id },
                         data: { fileUrl: freshUrl },
                       });
-                      console.log(`[Render] Scene ${i} refreshed Bilibili stream URL`);
+                      console.log(`[Render] Scene ${i} refreshed Bilibili stream URL (retry ${attempt})`);
                     }
                   } catch (refreshErr) {
                     console.warn(`[Render] Scene ${i} failed to refresh stream URL:`, refreshErr instanceof Error ? refreshErr.message : refreshErr);
@@ -1638,7 +1729,7 @@ export async function renderProjectInline(
               }
 
               if (ext === "jpg") {
-                const imgDuration = Math.max(8, Math.ceil(estimateAudioDuration(scenes[i].voiceoverText) * 1.3));
+                const imgDuration = Math.max(8, Math.ceil(estimateAudioDuration(scene.voiceoverText) * 1.3));
                 await execFileAsync("ffmpeg", [
                   "-y", "-loop", "1", "-i", processedPath,
                   "-c:v", "libx264", "-t", String(imgDuration), "-pix_fmt", "yuv420p",
@@ -1659,7 +1750,7 @@ export async function renderProjectInline(
                 } catch {}
 
                 let trimArgs: string[] = [];
-                const neededDuration = Math.ceil(estimateAudioDuration(scenes[i].voiceoverText) * 1.3);
+                const neededDuration = Math.ceil(estimateAudioDuration(scene.voiceoverText) * 1.3);
                 const needsLoop = videoDuration > 0 && videoDuration < neededDuration;
                 if (videoDuration > 10 && !needsLoop) {
                   const clipLength = Math.min(Math.max(videoDuration * 0.15, neededDuration), videoDuration - 2);
@@ -1908,9 +1999,14 @@ export async function renderProjectInline(
     let totalDuration = 0; // accumulated actual audio durations
 
     // ── Step 1: Compose each scene individually (avoids ENAMETOOLONG) ──
-    const composedFiles: string[] = [];
+    // Parallel compose: each scene is independent (different input/output files),
+    // so we can compose multiple scenes concurrently. Limit to 2 concurrent
+    // FFmpeg processes to avoid overwhelming CPU on typical 4-8 core machines.
+    const COMPOSE_CONCURRENCY = 2;
+    const sceneDurations: number[] = new Array(scenes.length).fill(0);
+    const composedFiles: string[] = new Array(scenes.length).fill("");
 
-    for (let i = 0; i < scenes.length; i++) {
+    await mapConcurrent(scenes, COMPOSE_CONCURRENCY, async (scene, i) => {
       const materialFile = join(workDir, `scene-${i}.mp4`);
       const audioFile = join(workDir, `tts-${i}.mp3`);
       const composedFile = join(workDir, `composed-${i}.mp4`);
@@ -1921,8 +2017,8 @@ export async function renderProjectInline(
       if (!hasMaterial) {
         const w = config.width;
         const h = config.height;
-        const voiceText = scenes[i].voiceoverText || "";
-        const shouldUseMG = isMGAnimationScene(scenes[i].sceneType, voiceText);
+        const voiceText = scene.voiceoverText || "";
+        const shouldUseMG = isMGAnimationScene(scene.sceneType, voiceText);
 
         if (shouldUseMG) {
           const fontPath = getDefaultFontPath();
@@ -1962,7 +2058,7 @@ export async function renderProjectInline(
       try { await readFile(audioFile); } catch { hasAudio = false; }
       if (!hasAudio) {
         console.warn(`[Render] Compose: audio missing for scene ${i}, generating fallback`);
-        const estimatedDur = estimateAudioDuration(scenes[i].voiceoverText);
+        const estimatedDur = estimateAudioDuration(scene.voiceoverText);
         try {
           await execFileAsync("ffmpeg", [
             "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
@@ -1994,7 +2090,7 @@ export async function renderProjectInline(
       let audioDuration = ttsDurationMap.get(i) || 0;
       if (audioDuration <= 0) {
         const probedDuration = await getAudioDuration(audioFile);
-        audioDuration = probedDuration > 0 ? probedDuration : estimateAudioDuration(scenes[i].voiceoverText);
+        audioDuration = probedDuration > 0 ? probedDuration : estimateAudioDuration(scene.voiceoverText);
       }
       audioDuration = Math.max(audioDuration, 0.5);
 
@@ -2002,9 +2098,9 @@ export async function renderProjectInline(
 
       // Generate subtitles
       let scripts: string[] | undefined;
-      if (scenes[i].productionMeta) {
+      if (scene.productionMeta) {
         try {
-          const meta = JSON.parse(scenes[i].productionMeta as string);
+          const meta = JSON.parse(scene.productionMeta as string);
           if (meta.scripts?.length) scripts = meta.scripts;
         } catch {}
       }
@@ -2015,7 +2111,7 @@ export async function renderProjectInline(
         audioDuration,
       };
       const subtitleChunks = generateSubtitleChunks(
-        scenes[i].voiceoverText,
+        scene.voiceoverText,
         subtitleConfig,
         scripts
       );
@@ -2076,29 +2172,35 @@ export async function renderProjectInline(
         "-i", audioFile,
         "-filter_complex", sceneFilters.join(";"),
         "-map", `[${subLabel}]`, "-map", "[a0]",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
         "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
         "-r", String(config.fps),
         "-pix_fmt", "yuv420p",
         composedFile,
       ], { timeout: 120000 });
 
-      composedFiles.push(composedFile);
+      composedFiles[i] = composedFile;
 
       // Update scene duration
       await prisma.scene.update({
-        where: { id: scenes[i].id },
+        where: { id: scene.id },
         data: { audioDuration },
       });
 
-      totalDuration += audioDuration;
-    }
+      sceneDurations[i] = audioDuration;
+    });
+
+    // Calculate total duration after all parallel compose tasks complete
+    totalDuration = sceneDurations.reduce((sum, d) => sum + d, 0);
+
+    // Filter out any empty entries (failed compose)
+    const validComposedFiles = composedFiles.filter(f => f !== "");
 
     // ── Step 2: Concatenate all composed scenes using concat demuxer ──
-    if (composedFiles.length === 0) throw new Error("No scenes to compose");
+    if (validComposedFiles.length === 0) throw new Error("No scenes to compose");
 
     const concatListPath = join(workDir, "concat.txt");
-    const concatContent = composedFiles.map(f => `file '${f.replace(/'/g, "'\\''")}'`).join("\n");
+    const concatContent = validComposedFiles.map(f => `file '${f.replace(/'/g, "'\\''")}'`).join("\n");
     await writeFile(concatListPath, concatContent);
 
     // Check for background music
@@ -2225,19 +2327,26 @@ export async function renderProjectInline(
     });
 
     // Use state machine for validated transition
-    await transitionProject(projectId, userId, "COMPLETED");
+    const completedTransition = await transitionProject(projectId, userId, "COMPLETED");
+    if (!completedTransition.success) {
+      console.warn(`[Render] State transition to COMPLETED failed:`, completedTransition.error);
+    }
 
     await rm(workDir, { recursive: true, force: true }).catch(() => {});
 
     return { outputUrl, duration };
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
-    await prisma.renderJob.update({
-      where: { id: renderJob.id },
-      data: { status: "FAILED", errorMessage: message },
-    });
+    console.error("[Render] Pipeline error:", message);
+    // renderJob may not exist if error occurred before its creation
+    if (typeof renderJob !== "undefined" && renderJob?.id) {
+      await prisma.renderJob.update({
+        where: { id: renderJob.id },
+        data: { status: "FAILED", errorMessage: message },
+      }).catch(() => {});
+    }
     // Validate the FAILED transition via state machine
-    await transitionProject(projectId, userId, "FAILED");
+    await transitionProject(projectId, userId, "FAILED").catch(() => {});
     // Clean up temporary files even on failure to prevent disk exhaustion
     await rm(workDir, { recursive: true, force: true }).catch(() => {});
     throw error;
