@@ -20,6 +20,20 @@ export async function requireSession() {
   if (session?.user?.id) {
     return session;
   }
+
+  // DEV MODE: Return default user when no session exists
+  // This allows the app to work without authentication during development
+  if (process.env.NODE_ENV === "development") {
+    return {
+      user: {
+        id: "user_default_dev_001",
+        email: "dev@example.com",
+        name: "Developer",
+      },
+      expires: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+    };
+  }
+
   return null;
 }
 

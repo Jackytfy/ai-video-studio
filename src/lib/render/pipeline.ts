@@ -596,13 +596,19 @@ export async function renderProjectInline(
     workDir = join(tmpdir(), `render-${projectId}-${randomUUID()}`);
     await mkdir(workDir, { recursive: true });
 
-    // TTS stage
+    // TTS stage — for ai_video mode this is merged into the materials pass
+    // so each scene's TTS runs in parallel with its AI generation.
+    const isAiVideoMode = project.renderMode === "ai_video";
+    const ttsWarnings: string[] = [];
+    const ttsDurationMap = new Map<number, number>();
+    const needTtsStage = !isAiVideoMode;
+    const user = await prisma.user.findUnique({ where: { id: userId } });
+    if (needTtsStage) {
     await prisma.renderJob.update({
       where: { id: renderJob.id },
       data: { status: "TTS_GENERATING", currentStage: "tts" },
     });
 
-    const user = await prisma.user.findUnique({ where: { id: userId } });
     const isMiMo = user?.ttsProvider === "mimo";
     const edgeVoice = user?.ttsVoice || "zh-CN-YunxiNeural";
 
@@ -613,7 +619,6 @@ export async function renderProjectInline(
     const TTS_CONCURRENCY = process.platform === "win32" ? 4 : 5;
     // Collect non-fatal warnings so we can persist them on RenderJob.errorMessage
     // and the affected Scene.renderWarning. We do NOT abort the whole render.
-    const ttsWarnings: string[] = [];
     const ttsResults = await mapConcurrent(scenes, TTS_CONCURRENCY, async (scene, i) => {
       const audioFile = join(workDir, `tts-${i}.mp3`);
 
@@ -788,8 +793,7 @@ export async function renderProjectInline(
       return { index: i, audioFile, duration: actualDuration };
     });
 
-    // Build a map of scene index → actual TTS audio duration
-    const ttsDurationMap = new Map<number, number>();
+    // Build per-scene TTS durations (populated by TTS stage or inline AI-mode TTS)
     for (const result of ttsResults) {
       if (result) ttsDurationMap.set(result.index, result.duration);
     }
@@ -806,6 +810,7 @@ export async function renderProjectInline(
         console.warn(`[Render] Failed to persist TTS warnings to RenderJob:`, err);
       }
     }
+    } // end needTtsStage
 
     // Materials stage
     await prisma.renderJob.update({
@@ -813,12 +818,66 @@ export async function renderProjectInline(
       data: { status: "MATERIALS_LOADING", currentStage: "materials" },
     });
 
-    // Materials stage with concurrency (4 parallel material searches for speed)
-    const MATERIALS_CONCURRENCY = 4;
+    // In ai_video mode, clear any stale materialIds from AI_GENERATED scenes
+    // that may have been assigned by a previous stock-mode render. This
+    // ensures AI and stock modes are fully separated — AI scenes never
+    // reference external (B站/Pexels) materials.
+    if (project.renderMode === "ai_video") {
+      const aiSceneIds = scenes
+        .filter(s => s.sceneType === "AI_GENERATED" && s.materialId)
+        .map(s => s.id);
+      if (aiSceneIds.length > 0) {
+        await prisma.scene.updateMany({
+          where: { id: { in: aiSceneIds } },
+          data: { materialId: null },
+        });
+        console.log(`[Render] Cleared ${aiSceneIds.length} stale materialIds from AI_GENERATED scenes`);
+        // Also update the in-memory scene objects
+        for (const s of scenes) {
+          if (s.sceneType === "AI_GENERATED") s.materialId = null;
+        }
+      }
+    }
+
+    // Materials stage with concurrency.
+    // ai_video mode: AI generation is network-bound (waiting on Agnes API),
+    //   so we can safely raise concurrency to parallelize more scenes.
+    // stock mode: Bilibili downloads are bandwidth-bound, keep lower concurrency.
+    // AI generation is pure network I/O with no local CPU contention.
+    // All scenes are independent (different prompts) — fire them all at once,
+    // compose in order at the end. Bilibili stays at 4 to avoid rate-limiting.
+    const MATERIALS_CONCURRENCY = isAiVideoMode ? scenes.length : 4;
+    console.log(`[Render] Materials concurrency: ${MATERIALS_CONCURRENCY} (renderMode=${project.renderMode})`);
     await mapConcurrent(scenes, MATERIALS_CONCURRENCY, async (scene, i) => {
       console.log(`[Render] Scene ${i}: sceneType=${scene.sceneType || "(none)"}, materialId=${scene.materialId || "(none)"}`);
       const materialFile = join(workDir, `scene-${i}.mp4`);
       let materialLoaded = false;
+
+      // Inline TTS for ai_video mode — runs in parallel with AI generation
+      // to eliminate the separate TTS stage overhead (~15s saved per render).
+      const audioFile = join(workDir, `tts-${i}.mp3`);
+      if (isAiVideoMode) {
+        const estimatedDuration = estimateAudioDuration(scene.voiceoverText);
+        const edgeVoice = user?.ttsVoice || "zh-CN-YunxiNeural";
+        try {
+          await execFileAsync("python", [
+            "-m", "edge_tts", "--voice", edgeVoice, "--rate", "+0%",
+            "--text", scene.voiceoverText, "--write-media", audioFile,
+          ], { timeout: 60000 });
+          const dur = await getAudioDuration(audioFile);
+          if (dur > 0) { ttsDurationMap.set(i, dur); }
+        } catch (ttsErr: any) {
+          const warnMsg = `AI-mode TTS failed for scene ${i} (${ttsErr.message?.slice(0, 50)})`;
+          console.warn(`[Render] ${warnMsg}`);
+          ttsWarnings.push(warnMsg);
+          // Generate silent fallback so compose has a valid audio file
+          await execFileAsync("ffmpeg", [
+            "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+            "-t", String(estimatedDuration), "-c:a", "libmp3lame", "-b:a", "128k", audioFile,
+          ], { timeout: 10000 });
+          ttsDurationMap.set(i, estimatedDuration);
+        }
+      }
 
       // Parse production meta (used by both auto-search and download)
       let meta: any = null;
@@ -1548,7 +1607,7 @@ export async function renderProjectInline(
                 sceneStatus: "generating...",
                 estimatedRemaining: Math.max(0, (estimatedRemaining || 300) - 10),
               }).catch(() => {});
-            }, 10000); // Every 10 seconds
+            }, 30000); // Every 30s — enough for progress UX, low DB pressure
 
             let estimatedRemaining = 300; // Start with 5 min estimate
 
@@ -1603,22 +1662,30 @@ export async function renderProjectInline(
               }
             }
           } catch (err) {
-            // AI generation failed or timed out - will fall back to stock footage below
-            console.warn(`[Render] Scene ${i}: AI generation failed, falling back to stock footage:`, err instanceof Error ? err.message : err);
+            // AI generation failed — in ai_video mode we fall back to MG or dark bg,
+            // NEVER to B站 stock footage (to keep AI and stock modes fully separated).
+            console.warn(`[Render] Scene ${i}: AI generation failed, falling back to MG/dark-bg:`, err instanceof Error ? err.message : err);
           }
         } else {
-          console.warn(`[Render] Scene ${i}: AI_GENERATED but AGNES_API_KEY not set, falling back to stock footage`);
+          console.warn(`[Render] Scene ${i}: AI_GENERATED but AGNES_API_KEY not set — will use MG/dark-bg fallback (no B站)`);
 
         }
       }
 
-      // Step 1: Auto-search if no material loaded and no material attached
+      // Step 1: Auto-search if no material loaded and no material attached.
+      // AI_GENERATED scenes in ai_video mode: skip B站/Pexels entirely —
+      // these scenes use AI-only generation to stay visually consistent.
       if (!scene.materialId && !materialLoaded) {
-        await autoSearchBilibili();
+        if (scene.sceneType !== "AI_GENERATED" || !isAiVideoMode) {
+          await autoSearchBilibili();
+        } else {
+          console.log(`[Render] Scene ${i} AI_GENERATED — skipping external material search`);
+        }
       }
 
-      // Step 2: Download existing material (from confirm route or auto-search)
-      if (scene.materialId) {
+      // Step 2: Download existing material (from confirm route or auto-search).
+      // AI_GENERATED scenes: skip external material download — use AI generation only.
+      if (scene.materialId && scene.sceneType !== "AI_GENERATED") {
         const material = await prisma.material.findUnique({
           where: { id: scene.materialId },
         });
@@ -1834,6 +1901,16 @@ export async function renderProjectInline(
               "-an", materialFile,
             ], { timeout: 60000 });
           }
+        } else if (isAiVideoMode && scene.sceneType === "AI_GENERATED") {
+          // ── AI mode: NO external fallback. AI_GENERATED scenes that fail
+          // AI gen get a dark background — never B站/Pexels.
+          console.warn(`[Render] Scene ${i} AI_GENERATED fallback — using dark background`);
+          await execFileAsync("ffmpeg", [
+            "-y",
+            "-f", "lavfi", "-i", `color=c=0x1a1a2e:s=${config.width}x${config.height}:d=30:r=${config.fps}`,
+            "-c:v", "libx264", "-preset", "ultrafast", "-t", "30", "-pix_fmt", "yuv420p",
+            "-an", materialFile,
+          ], { timeout: 30000 });
         } else {
           // ── Non-MG scene: try broader search, then Pexels image + Ken Burns ──
           console.warn(`[Render] Scene ${i} not suitable for MG, trying broader search fallback`);
@@ -2002,7 +2079,9 @@ export async function renderProjectInline(
     // Parallel compose: each scene is independent (different input/output files),
     // so we can compose multiple scenes concurrently. Limit to 2 concurrent
     // FFmpeg processes to avoid overwhelming CPU on typical 4-8 core machines.
-    const COMPOSE_CONCURRENCY = 2;
+    // AI mode: most time is in network I/O, FFmpeg compose is the fast final pass.
+    // Raise to 4 to keep CPU busy while scenes are coming off the AI pipeline.
+    const COMPOSE_CONCURRENCY = isAiVideoMode ? 4 : 2;
     const sceneDurations: number[] = new Array(scenes.length).fill(0);
     const composedFiles: string[] = new Array(scenes.length).fill("");
 

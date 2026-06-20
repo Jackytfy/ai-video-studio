@@ -219,15 +219,20 @@ function translateVisualDesc(visualDesc: string): string {
  * Generate an AI video for a scene using Agnes Video V2.0.
  *
  * Returns null on failure (caller should fall back to stock footage).
+ *
+ * @param prebuiltPrompt - Optional pre-generated prompt. When provided,
+ *   skips the AI prompt generation step (saving 2-10s per scene).
+ *   Use batchPromptGeneration() to pre-generate prompts in parallel.
  */
 export async function generateVideoFromScene(
   scene: VideoGenScene,
   workDir: string,
   config: VideoGenConfig,
-  onProgress?: (status: string) => void
+  onProgress?: (status: string) => void,
+  prebuiltPrompt?: string
 ): Promise<VideoGenResult | null> {
   try {
-    const prompt = await buildAgnesPrompt(scene, onProgress);
+    const prompt = prebuiltPrompt ?? await buildAgnesPrompt(scene, onProgress);
     if (!prompt || prompt.length < 5) {
       onProgress?.("skip: prompt too short");
       return null;

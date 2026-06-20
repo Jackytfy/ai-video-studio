@@ -68,3 +68,8 @@ dev.db
 # prisma local sqlite files (the URL points at ./prisma/dev.db by default)
 /prisma/*.db
 /prisma/*.db-journal
+.tmp
+
+# Windows / temp artifacts (must be ignored — can't be deleted)
+nul
+test-dev.db

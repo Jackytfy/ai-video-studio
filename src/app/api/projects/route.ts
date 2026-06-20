@@ -58,6 +58,26 @@ export async function POST(req: Request) {
     const body = await req.json();
     const data = createProjectSchema.parse(body);
 
+    // Debug: Log the userId being used
+    console.log("[Projects POST] Creating project for user:", session.user.id);
+
+    // Ensure user exists (auto-create for development mode)
+    const existingUser = await prisma.user.findUnique({
+      where: { id: session.user.id },
+      select: { id: true },
+    });
+
+    if (!existingUser) {
+      console.log("[Projects POST] Auto-creating user:", session.user.id);
+      await prisma.user.create({
+        data: {
+          id: session.user.id,
+          email: session.user.email || "dev@example.com",
+          name: session.user.name || "Developer",
+        },
+      });
+    }
+
     const project = await prisma.project.create({
       data: {
         name: data.name,

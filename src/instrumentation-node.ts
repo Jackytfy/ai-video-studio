@@ -1,14 +1,7 @@
-import { prisma } from "@/lib/db";
-import {
-  startTaskWorker,
-  completeTask,
-  failTask,
-  type TaskRecord,
-} from "@/lib/queue/task-runner";
-
 const STALE_TIMEOUT_MS = 30 * 60 * 1000;
 
 async function resetStaleTasks(): Promise<void> {
+  const { prisma } = await import("@/lib/db");
   const staleCount = await prisma.renderTask.count({
     where: {
       status: "PROCESSING",
@@ -33,17 +26,30 @@ async function resetStaleTasks(): Promise<void> {
 
 export async function register(): Promise<void> {
   await resetStaleTasks();
+
+  const { startTaskWorker } = await import("@/lib/queue/task-runner");
   await startTaskWorker(processRenderTask);
   console.log("[Instrumentation] Render task worker started");
 }
 
-async function processRenderTask(task: TaskRecord): Promise<void> {
+async function processRenderTask(task: {
+  id: string;
+  projectId: string;
+  userId: string;
+  status: string;
+  renderJobId: string | null;
+  config: string | null;
+  errorMessage: string | null;
+}): Promise<void> {
   console.log(
     `[TaskWorker] Processing render task ${task.id} (project ${task.projectId})`
   );
 
   const { renderProjectInline } = await import("@/lib/render/pipeline");
   const result = await renderProjectInline(task.projectId, task.userId);
+
+  const { prisma } = await import("@/lib/db");
+  const { completeTask } = await import("@/lib/queue/task-runner");
 
   try {
     const latestJob = await prisma.renderJob.findFirst({

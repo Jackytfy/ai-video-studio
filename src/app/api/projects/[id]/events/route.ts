@@ -91,8 +91,10 @@ export async function GET(
                     status: job.status,
                     progress: job.progress,
                     currentStage: job.currentStage,
-                    errorMessage: job.errorMessage,
+                    errorMessage: job.errorMessage,  // ✅ 修正为正确的字段名
                     outputUrl: job.outputUrl,
+                    stageProgress: job.stageProgress,
+                    estimatedDuration: job.estimatedDuration,
                   }
                 : null,
               sceneProgress: {
